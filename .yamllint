@@ -32,4 +32,7 @@ rules:
 
 ignore:
   - .github/
+  - .venv/
   - molecule/
+  - ansible_collections/ansible/
+  - ansible_collections/*.info/
