@@ -4,6 +4,7 @@ profile: production
 exclude_paths:
   - .github
   - molecule
+  - ansible_collections/ansible
 skip_list:
   - yaml[line-length]
   - meta-no-tags
