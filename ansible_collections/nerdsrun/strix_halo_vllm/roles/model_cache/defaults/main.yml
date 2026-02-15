@@ -1,0 +1,17 @@
+---
+model_prefetch_enabled: true
+model_prefetch_strict: false
+model_prefetch_list_default:
+  - "btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-8bit"
+  - "btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit"
+  - "Qwen/Qwen3-14B-AWQ"
+  - "dazipe/Qwen3-Next-80B-A3B-Instruct-GPTQ-Int4A16"
+model_prefetch_extra: []
+model_prefetch_include_kimi_k25: false
+model_prefetch_kimi_id: "moonshotai/Kimi-K2.5"
+huggingface_cache_dir: "~/.cache/huggingface"
+vllm_cache_dir: "~/.cache/vllm"
+hf_token: ""
+download_accelerator: "aria2"
+model_prefetch_min_free_gb: 200
+strix_halo_target_user: "{{ ansible_user_id }}"

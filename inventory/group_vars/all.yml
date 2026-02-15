@@ -1,0 +1,20 @@
+---
+# inventory/group_vars/all.yml
+#
+# Override any role default here to customize behavior for your environment.
+# Refer to docs/VARIABLES.md for the complete variable reference.
+
+# Deployment mode: "toolbox" | "service" | "both"
+strix_halo_mode: "toolbox"
+
+# Kernel tuning
+strix_halo_kernel_args_enabled: true
+strix_halo_kernel_reboot_allowed: true
+
+# UI & networking
+ui_enabled: true
+firewall_open_ui_port: true
+firewall_open_vllm_port: true
+
+# Force-recreate toolbox on deploy
+strix_halo_toolbox_update: true

@@ -1,0 +1,37 @@
+# {{ ansible_managed }}
+# Podman Quadlet container unit for vLLM on AMD Strix Halo (gfx1151)
+
+[Unit]
+Description=vLLM OpenAI-compatible API Server (Strix Halo gfx1151)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image={{ strix_halo_image }}
+ContainerName={{ vllm_container_name }}
+{% for device in strix_halo_devices %}
+AddDevice={{ device }}
+{% endfor %}
+{% for group in strix_halo_groups %}
+GroupAdd={{ group }}
+{% endfor %}
+{% if strix_halo_security_opt_seccomp_unconfined %}
+SecurityOpt=seccomp=unconfined
+{% endif %}
+{% if strix_halo_rdma_enabled %}
+AddDevice={{ strix_halo_rdma_device_path }}
+{% endif %}
+PublishPort={{ vllm_port }}:8000
+Volume={{ podman_service_hf_cache_expanded }}:/root/.cache/huggingface:Z
+Volume={{ podman_service_vllm_cache_expanded }}:/root/.cache/vllm:Z
+{% if hf_token %}
+Environment=HF_TOKEN={{ hf_token }}
+{% endif %}
+Exec=vllm serve {{ vllm_primary_model }} --host {{ vllm_host }} --port 8000{% if vllm_api_key_enabled %} --api-key {{ vllm_api_key_value }}{% endif %}{% if vllm_extra_args %} {{ vllm_extra_args | join(' ') }}{% endif %}
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

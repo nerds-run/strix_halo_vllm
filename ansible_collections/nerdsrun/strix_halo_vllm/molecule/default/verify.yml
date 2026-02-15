@@ -1,0 +1,47 @@
+---
+- name: Verify
+  hosts: all
+  gather_facts: true
+  tasks:
+    - name: "Verify role task files exist"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ playbook_dir }}/../../roles/host_prereqs/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/kernel_tuning/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/toolbox_mode/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/podman_service/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/model_cache/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/openwebui_ui/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/verify/tasks/main.yml"
+      register: _role_files
+
+    - name: "Assert all role files exist"
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Missing role file: {{ item.item }}"
+      loop: "{{ _role_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: "Verify playbook syntax"
+      ansible.builtin.command:
+        cmd: "ansible-playbook --syntax-check {{ item }}"
+      loop:
+        - "{{ playbook_dir }}/../../playbooks/site.yml"
+        - "{{ playbook_dir }}/../../playbooks/toolbox.yml"
+        - "{{ playbook_dir }}/../../playbooks/service.yml"
+        - "{{ playbook_dir }}/../../playbooks/verify.yml"
+        - "{{ playbook_dir }}/../../playbooks/uninstall.yml"
+        - "{{ playbook_dir }}/../../playbooks/ui.yml"
+      changed_when: false
+      failed_when: false
+      register: _syntax_checks
+
+    - name: "Report syntax check results"
+      ansible.builtin.debug:
+        msg: "{{ item.item | basename }}: {{ 'PASS' if item.rc == 0 else 'FAIL' }}"
+      loop: "{{ _syntax_checks.results }}"
+      loop_control:
+        label: "{{ item.item | basename }}"

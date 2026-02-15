@@ -1,0 +1,9 @@
+---
+- name: "Strix Halo vLLM - Service Mode Deployment"
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: nerdsrun.strix_halo_vllm.host_prereqs
+    - role: nerdsrun.strix_halo_vllm.kernel_tuning
+    - role: nerdsrun.strix_halo_vllm.podman_service
+    - role: nerdsrun.strix_halo_vllm.model_cache

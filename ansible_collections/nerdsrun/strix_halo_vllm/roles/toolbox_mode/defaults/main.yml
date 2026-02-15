@@ -1,0 +1,18 @@
+---
+strix_halo_image: "docker.io/kyuz0/vllm-therock-gfx1151:latest"
+strix_halo_toolbox_name: "vllm"
+strix_halo_target_user: "{{ ansible_user_id }}"
+strix_halo_devices:
+  - /dev/dri
+  - /dev/kfd
+strix_halo_groups:
+  - video
+  - render
+strix_halo_security_opt_seccomp_unconfined: true
+strix_halo_rdma_enabled: false
+strix_halo_rdma_device_path: "/dev/infiniband"
+strix_halo_toolbox_update: false
+huggingface_cache_dir: "~/.cache/huggingface"
+vllm_cache_dir: "~/.cache/vllm"
+vllm_port: 8000
+firewall_open_vllm_port: false

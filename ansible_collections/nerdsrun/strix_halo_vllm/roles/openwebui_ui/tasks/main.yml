@@ -1,0 +1,125 @@
+---
+# ==========================================================================
+# openwebui_ui - Deploy Open WebUI as a chat interface for vLLM
+# ==========================================================================
+
+# ------------------------------------------------------------------
+# UI UP tasks
+# ------------------------------------------------------------------
+- name: Open WebUI deployment block
+  when: ui_enabled | bool
+  become: false
+  tags:
+    - ui
+  block:
+    - name: Pull Open WebUI image
+      ansible.builtin.command:
+        cmd: "podman pull {{ openwebui_image }}"
+      register: openwebui_ui_pull
+      changed_when: "'Writing' in openwebui_ui_pull.stdout or 'Storing' in openwebui_ui_pull.stdout"
+
+    - name: Create data volume if it does not exist
+      ansible.builtin.command:
+        cmd: "podman volume create {{ openwebui_data_volume }}"
+      register: openwebui_ui_vol_create
+      changed_when: openwebui_ui_vol_create.rc == 0
+      failed_when: false
+
+    - name: Check if Open WebUI container already exists
+      ansible.builtin.command:
+        cmd: "podman container exists {{ openwebui_container_name }}"
+      register: openwebui_ui_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Resolve API base URL for container networking
+      ansible.builtin.set_fact:
+        openwebui_ui_resolved_api_url: >-
+          {{ openwebui_openai_api_base_url
+             | regex_replace('(127\.0\.0\.1|localhost)', 'host.containers.internal') }}
+
+    - name: Warn about disabled authentication
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Open WebUI authentication is DISABLED.
+          Anyone with network access to port {{ openwebui_port }} can use the UI.
+      when: not (openwebui_auth_enabled | bool)
+
+    - name: Create and start Open WebUI container
+      ansible.builtin.command:
+        cmd: >-
+          podman run -d
+          --name {{ openwebui_container_name }}
+          -p {{ openwebui_port }}:{{ openwebui_port }}
+          -e PORT={{ openwebui_port }}
+          -v {{ openwebui_data_volume }}:/app/backend/data
+          -e OPENAI_API_BASE_URL={{ openwebui_ui_resolved_api_url }}
+          -e OPENAI_API_KEY={{ openwebui_openai_api_key }}
+          {% if not (openwebui_auth_enabled | bool) %}-e WEBUI_AUTH=False{% endif %}
+          --restart unless-stopped
+          {{ openwebui_image }}
+      when: openwebui_ui_exists.rc != 0
+      changed_when: true
+
+    - name: Open UI port in firewall
+      ansible.posix.firewalld:
+        port: "{{ openwebui_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+      become: true
+      when: firewall_open_ui_port | bool
+
+    - name: Wait for Open WebUI to become reachable
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ openwebui_port }}"
+        method: GET
+        return_content: false
+        status_code: [200, 302]
+        follow_redirects: none
+        timeout: 10
+      register: openwebui_ui_health
+      until: openwebui_ui_health.status is defined and openwebui_ui_health.status in [200, 302]
+      retries: 60
+      delay: 5
+
+    - name: Display Open WebUI access information
+      ansible.builtin.debug:
+        msg: |
+          Open WebUI is running.
+
+          URL        : http://localhost:{{ openwebui_port }}
+          vLLM API   : {{ openwebui_ui_resolved_api_url }}
+          Container  : {{ openwebui_container_name }}
+
+          On first access, create an admin account (local only).
+
+# ------------------------------------------------------------------
+# UI DOWN tasks
+# ------------------------------------------------------------------
+- name: Open WebUI teardown block
+  become: false
+  tags:
+    - ui_down
+    - never
+  block:
+    - name: Stop Open WebUI container
+      ansible.builtin.command:
+        cmd: "podman stop {{ openwebui_container_name }}"
+      register: openwebui_ui_stop
+      changed_when: openwebui_ui_stop.rc == 0
+      failed_when: false
+
+    - name: Remove Open WebUI container
+      ansible.builtin.command:
+        cmd: "podman rm -f {{ openwebui_container_name }}"
+      register: openwebui_ui_rm
+      changed_when: openwebui_ui_rm.rc == 0
+      failed_when: false
+
+    - name: Display teardown confirmation
+      ansible.builtin.debug:
+        msg: >-
+          Open WebUI container removed.
+          Data volume '{{ openwebui_data_volume }}' is preserved.
+          To remove it: podman volume rm {{ openwebui_data_volume }}

@@ -1,0 +1,8 @@
+---
+all:
+  hosts:
+    strix_halo:
+      ansible_host: 192.168.1.100          # IP or hostname of your Strix Halo machine
+      ansible_user: your-username           # SSH user on the target
+      ansible_ssh_private_key_file: "{{ inventory_dir }}/../.ssh/framework_fedora"
+      ansible_ssh_common_args: "-o StrictHostKeyChecking=accept-new"

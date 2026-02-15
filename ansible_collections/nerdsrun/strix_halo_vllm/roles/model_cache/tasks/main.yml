@@ -1,0 +1,129 @@
+---
+# ==========================================================================
+# model_cache - Prefetch model weights from Hugging Face
+# ==========================================================================
+
+- name: Model prefetch block
+  when: model_prefetch_enabled | bool
+  become: false
+  tags:
+    - models
+  block:
+    # ----------------------------------------------------------------
+    # 1. Build combined model list
+    # ----------------------------------------------------------------
+    - name: Build combined model list
+      ansible.builtin.set_fact:
+        model_cache_model_list: >-
+          {{ model_prefetch_list_default
+             + model_prefetch_extra
+             + ((model_prefetch_include_kimi_k25 | bool)
+                | ternary([model_prefetch_kimi_id], []))
+          }}
+
+    - name: Display models to prefetch
+      ansible.builtin.debug:
+        msg: "Models to prefetch: {{ model_cache_model_list | join(', ') }}"
+
+    # ----------------------------------------------------------------
+    # 2. Ensure cache directories exist
+    # ----------------------------------------------------------------
+    - name: Expand cache paths
+      ansible.builtin.set_fact:
+        model_cache_hf_cache: "{{ huggingface_cache_dir | expanduser }}"
+        model_cache_vllm_cache: "{{ vllm_cache_dir | expanduser }}"
+
+    - name: Ensure cache directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ model_cache_hf_cache }}"
+        - "{{ model_cache_vllm_cache }}"
+
+    # ----------------------------------------------------------------
+    # 3. Check available disk space
+    # ----------------------------------------------------------------
+    - name: Check available disk space
+      ansible.builtin.shell:
+        cmd: "set -o pipefail && df --output=avail -BG {{ model_cache_hf_cache }} | tail -1"
+      register: model_cache_disk_space
+      changed_when: false
+
+    - name: Parse available disk space
+      ansible.builtin.set_fact:
+        model_cache_available_gb: "{{ model_cache_disk_space.stdout | trim | regex_replace('G$', '') | int }}"
+
+    - name: Warn if disk space is below minimum
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Only {{ model_cache_available_gb }}GB available, minimum recommended
+          is {{ model_prefetch_min_free_gb }}GB.
+          Kimi-K2.5 alone requires ~400GB+.
+      when: model_cache_available_gb | int < model_prefetch_min_free_gb | int
+
+    # ----------------------------------------------------------------
+    # 4. Install download tools
+    # ----------------------------------------------------------------
+    - name: Install aria2 for accelerated downloads
+      ansible.builtin.package:
+        name: aria2
+        state: present
+      become: true
+      when: download_accelerator == "aria2"
+      failed_when: false
+
+    - name: Ensure pip is installed
+      ansible.builtin.package:
+        name: python3-pip
+        state: present
+      become: true
+
+    - name: Ensure huggingface-hub is available
+      ansible.builtin.pip:
+        name: "huggingface-hub"
+        state: present
+        extra_args: "--user"
+
+    - name: Resolve hf CLI path
+      ansible.builtin.set_fact:
+        model_cache_hf_cli: "{{ ansible_facts['env']['HOME'] }}/.local/bin/hf"
+
+    # ----------------------------------------------------------------
+    # 5. Download each model
+    # ----------------------------------------------------------------
+    - name: Check if model already cached
+      ansible.builtin.shell:
+        cmd: "set -o pipefail && {{ model_cache_hf_cli }} cache --dir {{ model_cache_hf_cache }} | grep -q '{{ item }}'"
+      register: model_cache_model_cached
+      loop: "{{ model_cache_model_list }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Download models not yet cached
+      ansible.builtin.command:
+        cmd: >-
+          {{ model_cache_hf_cli }} download {{ item.item }}
+          {% if hf_token %}--token {{ hf_token }}{% endif %}
+          --cache-dir {{ model_cache_hf_cache }}
+      register: model_cache_download_result
+      loop: "{{ model_cache_model_cached.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc != 0
+      changed_when: true
+      failed_when: model_prefetch_strict | bool and model_cache_download_result.rc != 0
+      ignore_errors: "{{ not (model_prefetch_strict | bool) }}"
+      environment:
+        HF_HUB_CACHE: "{{ model_cache_hf_cache }}"
+
+    - name: Report download results
+      ansible.builtin.debug:
+        msg: >-
+          {{ item.item.item }}:
+          {{ 'already cached' if item.skipped | default(false) else
+             ('downloaded' if item.rc | default(1) == 0 else 'FAILED') }}
+      loop: "{{ model_cache_download_result.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.item | default('unknown') }}"

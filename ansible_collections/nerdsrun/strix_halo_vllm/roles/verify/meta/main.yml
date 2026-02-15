@@ -1,0 +1,22 @@
+---
+galaxy_info:
+  role_name: verify
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Non-interactive verification of the Strix Halo vLLM deployment.
+    Validates devices, permissions, containers, APIs, and produces a summary.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - amd
+    - gpu
+    - vllm
+    - verification
+    - strix_halo
+
+dependencies: []

@@ -1,0 +1,6 @@
+---
+- name: "Strix Halo vLLM - Verification"
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: nerdsrun.strix_halo_vllm.verify

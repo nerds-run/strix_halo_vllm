@@ -1,0 +1,37 @@
+---
+- name: Converge
+  hosts: all
+  gather_facts: true
+  vars:
+    strix_halo_mode: "toolbox"
+    strix_halo_require_devices: false
+    strix_halo_kernel_args_enabled: false
+    model_prefetch_enabled: false
+    ui_enabled: false
+    vllm_enabled: false
+  tasks:
+    - name: "CI/test mode notice"
+      ansible.builtin.debug:
+        msg: >
+          Running in CI/test mode. Hardware-dependent tasks are skipped.
+          Full tests require AMD Strix Halo gfx1151 hardware on Fedora.
+
+    - name: "Test host_prereqs role inclusion"
+      block:
+        - name: "Include host_prereqs"
+          ansible.builtin.include_role:
+            name: nerdsrun.strix_halo_vllm.host_prereqs
+      rescue:
+        - name: "host_prereqs expected CI failure"
+          ansible.builtin.debug:
+            msg: "host_prereqs failed as expected in CI (requires Strix Halo + Fedora)"
+
+    - name: "Test kernel_tuning role inclusion"
+      block:
+        - name: "Include kernel_tuning"
+          ansible.builtin.include_role:
+            name: nerdsrun.strix_halo_vllm.kernel_tuning
+      rescue:
+        - name: "kernel_tuning expected CI failure"
+          ansible.builtin.debug:
+            msg: "kernel_tuning failed as expected in CI (requires Fedora kernel args)"

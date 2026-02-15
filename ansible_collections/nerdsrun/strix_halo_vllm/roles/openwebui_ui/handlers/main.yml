@@ -1,0 +1,6 @@
+---
+- name: Restart open-webui
+  ansible.builtin.command:
+    cmd: "podman restart {{ openwebui_container_name }}"
+  become: false
+  changed_when: true

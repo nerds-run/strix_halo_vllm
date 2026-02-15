@@ -1,0 +1,67 @@
+---
+# ==========================================================================
+# kernel_tuning - Kernel parameters for AMD unified memory optimization
+# Opt-in only. Never auto-reboots.
+# ==========================================================================
+
+- name: Kernel tuning block
+  when: strix_halo_kernel_args_enabled | bool
+  tags:
+    - kernel
+  block:
+    - name: Read current kernel command line
+      ansible.builtin.slurp:
+        src: /proc/cmdline
+      register: kernel_tuning_proc_cmdline
+
+    - name: Parse current kernel command line
+      ansible.builtin.set_fact:
+        kernel_tuning_current_cmdline: "{{ kernel_tuning_proc_cmdline.content | b64decode | trim }}"
+
+    - name: Split desired kernel args
+      ansible.builtin.set_fact:
+        kernel_tuning_desired_args: "{{ strix_halo_kernel_args.split() }}"
+
+    - name: Identify missing kernel args
+      ansible.builtin.set_fact:
+        kernel_tuning_missing_args: >-
+          {{ kernel_tuning_desired_args | difference(kernel_tuning_current_cmdline.split()) }}
+
+    - name: Display kernel arg analysis
+      ansible.builtin.debug:
+        msg:
+          desired: "{{ kernel_tuning_desired_args }}"
+          current_cmdline: "{{ kernel_tuning_current_cmdline }}"
+          missing: "{{ kernel_tuning_missing_args }}"
+
+    - name: Add missing kernel args via grubby
+      ansible.builtin.command:
+        cmd: "grubby --update-kernel=ALL --args='{{ kernel_tuning_missing_args | join(' ') }}'"
+      become: true
+      register: kernel_tuning_grubby_result
+      changed_when: kernel_tuning_missing_args | length > 0
+      when: kernel_tuning_missing_args | length > 0
+
+    - name: Notify reboot handler when changes made and reboot allowed
+      ansible.builtin.debug:
+        msg: "Kernel args updated. Reboot will be triggered."
+      changed_when: true
+      notify: Reboot for kernel args
+      when:
+        - kernel_tuning_missing_args | length > 0
+        - strix_halo_kernel_reboot_allowed | bool
+
+    - name: Warn that reboot is needed but not allowed
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Kernel boot parameters have been updated but a reboot
+          is required for them to take effect. Added: {{ kernel_tuning_missing_args | join(' ') }}.
+          Set strix_halo_kernel_reboot_allowed=true or manually reboot.
+      when:
+        - kernel_tuning_missing_args | length > 0
+        - not (strix_halo_kernel_reboot_allowed | bool)
+
+    - name: Confirm no kernel arg changes needed
+      ansible.builtin.debug:
+        msg: "All desired kernel args are already present. No changes needed."
+      when: kernel_tuning_missing_args | length == 0

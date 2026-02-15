@@ -1,0 +1,16 @@
+---
+- name: "Strix Halo vLLM - Full Deployment"
+  hosts: all
+  gather_facts: true
+  roles:
+    - role: nerdsrun.strix_halo_vllm.host_prereqs
+    - role: nerdsrun.strix_halo_vllm.kernel_tuning
+    - role: nerdsrun.strix_halo_vllm.toolbox_mode
+      when: strix_halo_mode in ['toolbox', 'both']
+    - role: nerdsrun.strix_halo_vllm.podman_service
+      when: strix_halo_mode in ['service', 'both']
+    - role: nerdsrun.strix_halo_vllm.model_cache
+    - role: nerdsrun.strix_halo_vllm.openwebui_ui
+      when: ui_enabled | default(false) | bool
+    - role: nerdsrun.strix_halo_vllm.verify
+      tags: [verify, never]

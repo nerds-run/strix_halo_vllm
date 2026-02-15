@@ -1,0 +1,4 @@
+---
+strix_halo_kernel_args_enabled: false
+strix_halo_kernel_args: "iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856"
+strix_halo_kernel_reboot_allowed: false

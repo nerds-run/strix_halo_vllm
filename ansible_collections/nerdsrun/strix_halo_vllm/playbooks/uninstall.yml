@@ -1,0 +1,142 @@
+---
+- name: "Strix Halo vLLM - Uninstall"
+  hosts: all
+  gather_facts: true
+  vars:
+    strix_halo_toolbox_name: "{{ strix_halo_toolbox_name | default('vllm') }}"
+    vllm_container_name: "{{ vllm_container_name | default('vllm-server') }}"
+    openwebui_container_name: "{{ openwebui_container_name | default('open-webui') }}"
+    openwebui_data_volume: "{{ openwebui_data_volume | default('open-webui') }}"
+    strix_halo_uninstall_purge_cache: "{{ strix_halo_uninstall_purge_cache | default(false) | bool }}"
+  tasks:
+    - name: Initialise removal tracker
+      ansible.builtin.set_fact:
+        _removed_items: []
+
+    # ================================================================
+    # 1. Stop and remove vLLM service container
+    # ================================================================
+    - name: Stop vLLM systemd user service
+      ansible.builtin.systemd:
+        name: "{{ vllm_container_name }}"
+        state: stopped
+        enabled: false
+        scope: user
+      become: false
+      failed_when: false
+
+    - name: Remove vLLM container
+      ansible.builtin.command:
+        cmd: "podman rm -f {{ vllm_container_name }}"
+      register: _vllm_rm
+      changed_when: _vllm_rm.rc == 0
+      failed_when: false
+      become: false
+
+    - name: Track vLLM container removal
+      ansible.builtin.set_fact:
+        _removed_items: "{{ _removed_items + ['Container: ' + vllm_container_name] }}"
+      when: _vllm_rm.rc == 0
+
+    # ================================================================
+    # 2. Remove systemd Quadlet file
+    # ================================================================
+    - name: Remove Quadlet unit file
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.config/containers/systemd/{{ vllm_container_name }}.container"
+        state: absent
+      become: false
+      register: _quadlet_rm
+
+    - name: Track Quadlet removal  # noqa: no-handler
+      ansible.builtin.set_fact:
+        _removed_items: "{{ _removed_items + ['Quadlet: ' + vllm_container_name + '.container'] }}"
+      when: _quadlet_rm.changed
+
+    # ================================================================
+    # 3. Stop and remove Open WebUI container
+    # ================================================================
+    - name: Remove Open WebUI container
+      ansible.builtin.command:
+        cmd: "podman rm -f {{ openwebui_container_name }}"
+      register: _webui_rm
+      changed_when: _webui_rm.rc == 0
+      failed_when: false
+      become: false
+
+    - name: Track Open WebUI removal
+      ansible.builtin.set_fact:
+        _removed_items: "{{ _removed_items + ['Container: ' + openwebui_container_name] }}"
+      when: _webui_rm.rc == 0
+
+    # ================================================================
+    # 4. Remove the toolbox
+    # ================================================================
+    - name: Remove toolbox container
+      ansible.builtin.command:
+        cmd: "toolbox rm -f {{ strix_halo_toolbox_name }}"
+      register: _toolbox_rm
+      changed_when: _toolbox_rm.rc == 0
+      failed_when: false
+      become: false
+
+    - name: Track toolbox removal
+      ansible.builtin.set_fact:
+        _removed_items: "{{ _removed_items + ['Toolbox: ' + strix_halo_toolbox_name] }}"
+      when: _toolbox_rm.rc == 0
+
+    # ================================================================
+    # 5. Optionally purge cache data
+    # ================================================================
+    - name: Purge cache volumes
+      when: strix_halo_uninstall_purge_cache | bool
+      block:
+        - name: Remove Open WebUI data volume
+          ansible.builtin.command:
+            cmd: "podman volume rm -f {{ openwebui_data_volume }}"
+          register: _vol_rm
+          changed_when: _vol_rm.rc == 0
+          failed_when: false
+          become: false
+
+        - name: Track volume removal
+          ansible.builtin.set_fact:
+            _removed_items: "{{ _removed_items + ['Volume: ' + openwebui_data_volume] }}"
+          when: _vol_rm.rc == 0
+
+    - name: Note cache preservation
+      ansible.builtin.debug:
+        msg: >-
+          Cache data preserved. To also remove cached data, rerun with:
+          -e strix_halo_uninstall_purge_cache=true
+      when: not (strix_halo_uninstall_purge_cache | bool)
+
+    # ================================================================
+    # 6. Reload systemd
+    # ================================================================
+    - name: Reload systemd user daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+        scope: user
+      become: false
+
+    # ================================================================
+    # 7. Summary
+    # ================================================================
+    - name: Display uninstall summary
+      ansible.builtin.debug:
+        msg: |
+          === Strix Halo vLLM Uninstall Summary ===
+          {% if _removed_items | length > 0 %}
+          {% for item in _removed_items %}
+            Removed: {{ item }}
+          {% endfor %}
+          {% else %}
+            Nothing to remove - no components were found.
+          {% endif %}
+          systemd user daemon reloaded.
+          {% if not (strix_halo_uninstall_purge_cache | bool) %}
+          Cache data preserved (use purge_cache=true to remove).
+          {% else %}
+          Cache data purged.
+          {% endif %}

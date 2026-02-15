@@ -1,0 +1,295 @@
+---
+# ==========================================================================
+# verify - Non-interactive verification of the Strix Halo vLLM deployment
+# ==========================================================================
+
+- name: Initialise check results
+  ansible.builtin.set_fact:
+    verify_results: []
+
+# ==================================================================
+# 1. Device checks
+# ==================================================================
+- name: Check device nodes exist
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ strix_halo_devices }}"
+  register: verify_device_stat
+  ignore_errors: true
+
+- name: Record device check results
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [{
+        'check': 'Device ' + item.item,
+        'passed': item.stat.exists | default(false),
+        'detail': (item.stat.exists | default(false))
+                  | ternary('present', 'MISSING - amdgpu driver may not be loaded')
+      }] }}
+  loop: "{{ verify_device_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# ==================================================================
+# 2. Group membership
+# ==================================================================
+- name: Get target user group list
+  ansible.builtin.command:
+    cmd: "id -nG {{ strix_halo_target_user }}"
+  register: verify_user_groups
+  changed_when: false
+  ignore_errors: true
+
+- name: Record group membership results
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [{
+        'check': 'User in group ' + item,
+        'passed': item in (verify_user_groups.stdout | default('')).split(),
+        'detail': (item in (verify_user_groups.stdout | default('')).split())
+                  | ternary('member', 'NOT a member - run: sudo usermod -aG ' + item + ' ' + strix_halo_target_user)
+      }] }}
+  loop: "{{ strix_halo_groups }}"
+
+# ==================================================================
+# 3. Permission check
+# ==================================================================
+- name: Check /dev/kfd is readable
+  ansible.builtin.command:
+    cmd: "test -r /dev/kfd"
+  register: verify_kfd_readable
+  changed_when: false
+  ignore_errors: true
+
+- name: Record /dev/kfd permission result
+  ansible.builtin.set_fact:
+    verify_results: >-
+      {{ verify_results + [{
+        'check': '/dev/kfd readable',
+        'passed': verify_kfd_readable.rc | default(1) == 0,
+        'detail': (verify_kfd_readable.rc | default(1) == 0)
+                  | ternary('readable', 'NOT readable - check group membership and device permissions')
+      }] }}
+
+# ==================================================================
+# 4. Toolbox checks
+# ==================================================================
+- name: Toolbox verification
+  when: strix_halo_mode in ['toolbox', 'both']
+  block:
+    - name: Check toolbox container exists
+      ansible.builtin.command:
+        cmd: "podman container exists {{ strix_halo_toolbox_name }}"
+      register: verify_toolbox_exists
+      changed_when: false
+      ignore_errors: true
+
+    - name: Record toolbox existence
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'Toolbox "' + strix_halo_toolbox_name + '" exists',
+            'passed': verify_toolbox_exists.rc | default(1) == 0,
+            'detail': (verify_toolbox_exists.rc | default(1) == 0)
+                      | ternary('exists', 'NOT found')
+          }] }}
+
+    - name: Verify toolbox can be entered
+      ansible.builtin.command:
+        cmd: "toolbox run -c {{ strix_halo_toolbox_name }} true"
+      register: verify_toolbox_enter
+      changed_when: false
+      ignore_errors: true
+
+    - name: Record toolbox entry result
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'Toolbox "' + strix_halo_toolbox_name + '" enterable',
+            'passed': verify_toolbox_enter.rc | default(1) == 0,
+            'detail': (verify_toolbox_enter.rc | default(1) == 0)
+                      | ternary('OK', 'FAILED - ' + (verify_toolbox_enter.stderr | default('unknown error')))
+          }] }}
+
+    - name: Fetch toolbox logs on failure
+      ansible.builtin.command:
+        cmd: "podman logs --tail {{ verify_log_lines }} {{ strix_halo_toolbox_name }}"
+      register: verify_toolbox_logs
+      changed_when: false
+      ignore_errors: true
+      when: verify_toolbox_exists.rc | default(1) != 0 or verify_toolbox_enter.rc | default(1) != 0
+
+    - name: Display toolbox troubleshooting
+      ansible.builtin.debug:
+        msg: |
+          === Toolbox Troubleshooting ===
+          Container: {{ strix_halo_toolbox_name }}
+          Logs: {{ verify_toolbox_logs.stdout | default('(no logs)') }}
+          Hint: toolbox rm -f {{ strix_halo_toolbox_name }} && rerun toolbox_mode role
+      when: verify_toolbox_exists.rc | default(1) != 0 or verify_toolbox_enter.rc | default(1) != 0
+
+# ==================================================================
+# 5. VLLM Service checks
+# ==================================================================
+- name: VLLM service verification
+  when: vllm_enabled | bool or strix_halo_mode in ['service', 'both']
+  block:
+    - name: Check vLLM container is running
+      ansible.builtin.command:
+        cmd: "podman container inspect --format '{%raw%}{{ .State.Status }}{%endraw%}' {{ vllm_container_name }}"
+      register: verify_vllm_running
+      changed_when: false
+      ignore_errors: true
+
+    - name: Record vLLM container status
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'vLLM container running',
+            'passed': (verify_vllm_running.stdout | default('') | trim) == 'running',
+            'detail': ((verify_vllm_running.stdout | default('') | trim) == 'running')
+                      | ternary('running', 'Status: ' + (verify_vllm_running.stdout | default('not found') | trim))
+          }] }}
+
+    - name: Build API headers
+      ansible.builtin.set_fact:
+        verify_api_headers: >-
+          {{ {'Content-Type': 'application/json'}
+             | combine((vllm_api_key_enabled | bool)
+               | ternary({'Authorization': 'Bearer ' + vllm_api_key_value}, {}))
+          }}
+
+    - name: GET /v1/models
+      ansible.builtin.uri:
+        url: "http://localhost:{{ vllm_port }}/v1/models"
+        method: GET
+        headers: "{{ verify_api_headers }}"
+        return_content: true
+        status_code: [200]
+        timeout: 30
+      register: verify_vllm_models
+      ignore_errors: true
+
+    - name: Record /v1/models result
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'vLLM /v1/models HTTP 200',
+            'passed': verify_vllm_models.status | default(0) == 200,
+            'detail': (verify_vllm_models.status | default(0) == 200)
+                      | ternary('OK', 'FAILED - HTTP ' + (verify_vllm_models.status | default('N/A') | string))
+          }] }}
+
+    - name: POST /v1/chat/completions smoke test
+      ansible.builtin.uri:
+        url: "http://localhost:{{ vllm_port }}/v1/chat/completions"
+        method: POST
+        headers: "{{ verify_api_headers }}"
+        body_format: json
+        body:
+          model: "{{ (verify_vllm_models.json.data | default([{'id': 'unknown'}]) | first).id }}"
+          messages:
+            - role: user
+              content: "Say hello in one word."
+          max_tokens: 16
+          temperature: 0
+        return_content: true
+        status_code: [200]
+        timeout: 120
+      register: verify_vllm_chat
+      ignore_errors: true
+
+    - name: Record chat completions result
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'vLLM chat completions',
+            'passed': (verify_vllm_chat.status | default(0) == 200) and (verify_vllm_chat.json.choices | default([]) | length > 0),
+            'detail': ((verify_vllm_chat.status | default(0) == 200) and (verify_vllm_chat.json.choices | default([]) | length > 0))
+                      | ternary('OK', 'FAILED - HTTP ' + (verify_vllm_chat.status | default('N/A') | string))
+          }] }}
+
+    - name: Fetch vLLM logs on failure
+      ansible.builtin.command:
+        cmd: "podman logs --tail {{ verify_log_lines }} {{ vllm_container_name }}"
+      register: verify_vllm_logs
+      changed_when: false
+      ignore_errors: true
+      when: >-
+        (verify_vllm_running.stdout | default('') | trim) != 'running'
+        or verify_vllm_models.status | default(0) != 200
+
+    - name: Display vLLM troubleshooting
+      ansible.builtin.debug:
+        msg: |
+          === vLLM Troubleshooting ===
+          Container: {{ vllm_container_name }}
+          Logs: {{ verify_vllm_logs.stdout | default('(no logs)') }}
+          Hints:
+            - systemctl --user restart {{ vllm_container_name }}
+            - podman exec {{ vllm_container_name }} rocm-smi
+            - ss -tlnp | grep {{ vllm_port }}
+      when: >-
+        (verify_vllm_running.stdout | default('') | trim) != 'running'
+        or verify_vllm_models.status | default(0) != 200
+
+# ==================================================================
+# 6. Open WebUI check
+# ==================================================================
+- name: Open WebUI verification
+  when: ui_enabled | bool
+  block:
+    - name: Check Open WebUI is reachable
+      ansible.builtin.uri:
+        url: "http://localhost:{{ openwebui_port }}"
+        method: GET
+        return_content: false
+        status_code: [200]
+        timeout: 15
+      register: verify_webui_check
+      ignore_errors: true
+
+    - name: Record Open WebUI result
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'Open WebUI on port ' + (openwebui_port | string),
+            'passed': verify_webui_check.status | default(0) == 200,
+            'detail': (verify_webui_check.status | default(0) == 200)
+                      | ternary('HTTP 200 OK', 'FAILED')
+          }] }}
+
+    - name: Fetch Open WebUI logs on failure
+      ansible.builtin.command:
+        cmd: "podman logs --tail {{ verify_log_lines }} {{ openwebui_container_name }}"
+      register: verify_webui_logs
+      changed_when: false
+      ignore_errors: true
+      when: verify_webui_check.status | default(0) != 200
+
+# ==================================================================
+# 7. Summary
+# ==================================================================
+- name: Count results
+  ansible.builtin.set_fact:
+    verify_passed: "{{ verify_results | selectattr('passed') | list | length }}"
+    verify_failed: "{{ verify_results | rejectattr('passed') | list | length }}"
+    verify_total: "{{ verify_results | length }}"
+
+- name: Display verification summary
+  ansible.builtin.debug:
+    msg: |
+      ======================================================================
+                 Strix Halo vLLM Verification Summary
+      ======================================================================
+      {% for r in verify_results %}
+      {{ '[PASS]' if r.passed else '[FAIL]' }}  {{ r.check }} - {{ r.detail }}
+      {% endfor %}
+      ======================================================================
+        Total: {{ verify_total }}   Passed: {{ verify_passed }}   Failed: {{ verify_failed }}
+      ======================================================================
+
+- name: Fail if any check did not pass
+  ansible.builtin.fail:
+    msg: "Verification completed with {{ verify_failed }} failure(s) out of {{ verify_total }}."
+  when: verify_failed | int > 0

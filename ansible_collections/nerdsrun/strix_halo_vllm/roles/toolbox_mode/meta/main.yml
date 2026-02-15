@@ -1,0 +1,23 @@
+---
+galaxy_info:
+  role_name: toolbox_mode
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Create a toolbox container for interactive vLLM development
+    on AMD Strix Halo (gfx1151) systems.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - amd
+    - gpu
+    - vllm
+    - toolbox
+    - strix_halo
+
+dependencies:
+  - role: nerdsrun.strix_halo_vllm.host_prereqs

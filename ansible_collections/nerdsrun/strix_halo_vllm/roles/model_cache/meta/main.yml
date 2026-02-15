@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  role_name: model_cache
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Prefetch LLM model weights into the Hugging Face cache.
+    Supports aria2 acceleration with fallback to huggingface-cli.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - llm
+    - vllm
+    - huggingface
+    - model
+    - cache
+    - amd
+    - strix_halo
+
+dependencies: []

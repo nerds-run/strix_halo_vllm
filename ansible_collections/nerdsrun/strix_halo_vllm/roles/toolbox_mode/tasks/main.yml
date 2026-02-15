@@ -1,0 +1,103 @@
+---
+# ==========================================================================
+# toolbox_mode - Create a toolbox container for interactive vLLM usage
+# ==========================================================================
+
+- name: Check if toolbox already exists
+  ansible.builtin.command:
+    cmd: "podman container inspect {{ strix_halo_toolbox_name }}"
+  register: toolbox_mode_inspect
+  changed_when: false
+  failed_when: false
+  become: false
+  tags:
+    - toolbox
+
+- name: Set toolbox existence fact
+  ansible.builtin.set_fact:
+    toolbox_mode_exists: "{{ toolbox_mode_inspect.rc == 0 }}"
+  tags:
+    - toolbox
+
+- name: Remove existing toolbox for update
+  ansible.builtin.command:
+    cmd: "toolbox rm --force {{ strix_halo_toolbox_name }}"
+  become: false
+  when:
+    - toolbox_mode_exists | bool
+    - strix_halo_toolbox_update | bool
+  changed_when: true
+  tags:
+    - toolbox
+
+- name: Create toolbox container
+  ansible.builtin.command:
+    cmd: "toolbox create --image {{ strix_halo_image }} {{ strix_halo_toolbox_name }}"
+  become: false
+  register: toolbox_mode_create
+  changed_when: true
+  when: (not toolbox_mode_exists | bool) or (strix_halo_toolbox_update | bool)
+  tags:
+    - toolbox
+
+- name: Verify toolbox was created
+  ansible.builtin.command:
+    cmd: "podman container exists {{ strix_halo_toolbox_name }}"
+  become: false
+  changed_when: false
+  failed_when: false
+  register: toolbox_mode_verify
+  when: (not toolbox_mode_exists | bool) or (strix_halo_toolbox_update | bool)
+  tags:
+    - toolbox
+
+- name: Expand cache directory paths
+  ansible.builtin.set_fact:
+    toolbox_mode_hf_cache_expanded: "{{ huggingface_cache_dir | expanduser }}"
+    toolbox_mode_vllm_cache_expanded: "{{ vllm_cache_dir | expanduser }}"
+  tags:
+    - toolbox
+
+- name: Ensure HuggingFace cache directory exists
+  ansible.builtin.file:
+    path: "{{ toolbox_mode_hf_cache_expanded }}"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - toolbox
+
+- name: Ensure vLLM cache directory exists
+  ansible.builtin.file:
+    path: "{{ toolbox_mode_vllm_cache_expanded }}"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - toolbox
+
+- name: Open vLLM port in firewall
+  ansible.posix.firewalld:
+    port: "{{ vllm_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  become: true
+  when: firewall_open_vllm_port | bool
+  tags:
+    - toolbox
+
+- name: Display toolbox usage instructions
+  ansible.builtin.debug:
+    msg: |
+      Toolbox '{{ strix_halo_toolbox_name }}' is ready.
+
+      Enter the toolbox:
+        toolbox enter {{ strix_halo_toolbox_name }}
+
+      GPU devices (/dev/dri, /dev/kfd) are accessible through group memberships.
+
+      Example vLLM usage inside the toolbox:
+        vllm serve <model-name> --host 0.0.0.0 --port 8000
+  tags:
+    - toolbox

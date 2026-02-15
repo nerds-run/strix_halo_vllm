@@ -1,0 +1,129 @@
+---
+# ==========================================================================
+# podman_service - Run vLLM as a systemd-managed Podman Quadlet service
+# ==========================================================================
+
+- name: Expand cache directory paths
+  ansible.builtin.set_fact:
+    podman_service_hf_cache_expanded: "{{ huggingface_cache_dir | expanduser }}"
+    podman_service_vllm_cache_expanded: "{{ vllm_cache_dir | expanduser }}"
+  tags:
+    - service
+
+- name: Ensure HuggingFace cache directory exists
+  ansible.builtin.file:
+    path: "{{ podman_service_hf_cache_expanded }}"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - service
+
+- name: Ensure vLLM cache directory exists
+  ansible.builtin.file:
+    path: "{{ podman_service_vllm_cache_expanded }}"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - service
+
+- name: Pull the vLLM container image
+  ansible.builtin.command:
+    cmd: "podman pull {{ strix_halo_image }}"
+  become: false
+  register: podman_service_image_pull
+  changed_when: "'Writing' in podman_service_image_pull.stdout or 'Storing' in podman_service_image_pull.stdout"
+  tags:
+    - service
+
+- name: Ensure systemd user Quadlet directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_user_dir }}/.config/containers/systemd"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - service
+
+- name: Deploy vLLM Quadlet container unit file
+  ansible.builtin.template:
+    src: vllm-server.container.j2
+    dest: "{{ ansible_user_dir }}/.config/containers/systemd/{{ vllm_container_name }}.container"
+    mode: "0644"
+  become: false
+  notify:
+    - Reload systemd user daemon
+    - Restart vllm service
+  tags:
+    - service
+
+- name: Flush handlers to apply Quadlet changes
+  ansible.builtin.meta: flush_handlers
+  tags:
+    - service
+
+- name: Enable and start vLLM service
+  ansible.builtin.systemd:
+    name: "{{ vllm_container_name }}"
+    state: started
+    enabled: true
+    scope: user
+  become: false
+  when: vllm_enabled | bool
+  tags:
+    - service
+
+- name: Open vLLM port in firewall
+  ansible.posix.firewalld:
+    port: "{{ vllm_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  become: true
+  when:
+    - firewall_open_vllm_port | bool
+    - vllm_enabled | bool
+  tags:
+    - service
+
+- name: Wait for vLLM API to become available
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vllm_port }}/v1/models"
+    method: GET
+    return_content: false
+    status_code: 200
+    headers: >-
+      {{ {'Authorization': 'Bearer ' + vllm_api_key_value}
+         if vllm_api_key_enabled | bool else {} }}
+  become: false
+  register: podman_service_vllm_health
+  until: podman_service_vllm_health.status == 200
+  retries: 60
+  delay: 15
+  when: vllm_enabled | bool
+  tags:
+    - service
+
+- name: Display vLLM service information
+  ansible.builtin.debug:
+    msg: |
+      vLLM server is running as a systemd user service.
+
+      Service    : {{ vllm_container_name }}
+      Image      : {{ strix_halo_image }}
+      Model      : {{ vllm_primary_model }}
+      API        : http://{{ vllm_host }}:{{ vllm_port }}/v1
+      API key    : {{ vllm_api_key_value if vllm_api_key_enabled else '(disabled)' }}
+
+      Manage with:
+        systemctl --user status {{ vllm_container_name }}
+        systemctl --user restart {{ vllm_container_name }}
+        journalctl --user -u {{ vllm_container_name }} -f
+
+      Test:
+        curl http://localhost:{{ vllm_port }}/v1/models \
+          -H "Authorization: Bearer {{ vllm_api_key_value }}"
+  when: vllm_enabled | bool
+  tags:
+    - service

@@ -1,0 +1,9 @@
+---
+- name: "Strix Halo vLLM - Open WebUI Management"
+  hosts: all
+  gather_facts: true
+  vars:
+    ui_enabled: true
+  roles:
+    - role: nerdsrun.strix_halo_vllm.openwebui_ui
+      tags: [ui, ui_down]

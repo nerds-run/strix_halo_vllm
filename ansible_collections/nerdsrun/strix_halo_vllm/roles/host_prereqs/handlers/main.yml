@@ -1,0 +1,7 @@
+---
+- name: Restart podman socket
+  ansible.builtin.systemd:
+    name: podman.socket
+    state: restarted
+    scope: user
+  become: false

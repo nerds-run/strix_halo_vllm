@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  role_name: podman_service
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Run vLLM as a persistent Podman container managed by systemd Quadlet
+    on AMD Strix Halo (gfx1151). Provides an OpenAI-compatible API endpoint.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - amd
+    - gpu
+    - vllm
+    - podman
+    - systemd
+    - strix_halo
+
+dependencies:
+  - role: nerdsrun.strix_halo_vllm.host_prereqs

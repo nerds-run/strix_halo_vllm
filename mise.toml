@@ -1,0 +1,186 @@
+# mise.toml - Task runner for AMD Strix Halo vLLM Ansible Collection
+# https://mise.jdx.dev/tasks/
+
+[tools]
+python = "3.12"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+ANSIBLE_COLLECTIONS_PATH = ".:~/.ansible/collections"
+COLLECTION_PATH = "ansible_collections/nerdsrun/strix_halo_vllm"
+PLAYBOOK_DIR = "ansible_collections/nerdsrun/strix_halo_vllm/playbooks"
+INVENTORY = "inventory"
+
+# ---------------------------------------------------------------------------
+# bootstrap: install deps into mise-managed venv
+# ---------------------------------------------------------------------------
+[tasks.bootstrap]
+description = "Install Ansible toolchain into the project virtualenv"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Installing Ansible toolchain into .venv..."
+pip install --upgrade pip
+pip install \
+  'ansible-core>=2.17' \
+  'ansible-lint>=24' \
+  'molecule>=24' \
+  'molecule-plugins[docker]>=24' \
+  'yamllint>=1.35' \
+  'aiohttp>=3.9'
+
+echo "==> Installing collection dependencies..."
+ansible-galaxy collection install ansible.posix
+
+echo "==> Verifying installed tools..."
+ansible --version
+ansible-lint --version
+yamllint --version
+molecule --version
+
+echo "==> Bootstrap complete."
+"""
+
+# ---------------------------------------------------------------------------
+# ssh-key: pull SSH key from 1Password
+# ---------------------------------------------------------------------------
+[tasks.ssh-key]
+description = "Pull SSH key from 1Password Infrastructure vault"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p .ssh && chmod 700 .ssh
+
+echo "==> Fetching framework_fedora SSH key from 1Password..."
+op item get framework_fedora \
+  --vault Infrastructure \
+  --fields "private key" \
+  --reveal \
+  | sed 's/^"//;s/"$//' \
+  | sed '/^$/d' > .ssh/framework_fedora
+
+echo "" >> .ssh/framework_fedora
+chmod 600 .ssh/framework_fedora
+
+echo "==> Verifying key..."
+ssh-keygen -l -f .ssh/framework_fedora
+
+echo "==> SSH key ready at .ssh/framework_fedora"
+"""
+
+# ---------------------------------------------------------------------------
+# lint: static analysis
+# ---------------------------------------------------------------------------
+[tasks.lint]
+description = "Run ansible-lint and yamllint against the collection"
+depends = ["lint:ansible", "lint:yaml"]
+
+[tasks."lint:ansible"]
+description = "Run ansible-lint"
+run = "ansible-lint"
+
+[tasks."lint:yaml"]
+description = "Run yamllint on the entire repository"
+run = "yamllint -c .yamllint ."
+
+# ---------------------------------------------------------------------------
+# test: molecule convergence tests
+# ---------------------------------------------------------------------------
+[tasks.test]
+description = "Run Molecule test suite"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+export ANSIBLE_COLLECTIONS_PATH="$(pwd):$HOME/.ansible/collections"
+cd "$COLLECTION_PATH"
+molecule test
+"""
+
+# ---------------------------------------------------------------------------
+# deploy tasks
+# ---------------------------------------------------------------------------
+[tasks."deploy:toolbox"]
+description = "Deploy AMD ROCm toolbox container and GPU stack"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/toolbox.yml -i $INVENTORY"
+
+[tasks."deploy:service"]
+description = "Deploy the vLLM inference service"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/service.yml -i $INVENTORY"
+
+[tasks."deploy:all"]
+description = "Run full deployment (toolbox + service + all components)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/site.yml -i $INVENTORY"
+
+# ---------------------------------------------------------------------------
+# verify / uninstall
+# ---------------------------------------------------------------------------
+[tasks.verify]
+description = "Run post-deployment verification playbook"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/verify.yml -i $INVENTORY"
+
+[tasks.uninstall]
+description = "Uninstall vLLM stack and clean up resources"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/uninstall.yml -i $INVENTORY"
+
+# ---------------------------------------------------------------------------
+# ui management
+# ---------------------------------------------------------------------------
+[tasks."ui:up"]
+description = "Bring up Open WebUI frontend"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/ui.yml -i $INVENTORY --tags ui"
+
+[tasks."ui:down"]
+description = "Tear down Open WebUI frontend"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/ui.yml -i $INVENTORY --tags ui_down"
+
+# ---------------------------------------------------------------------------
+# benchmark: LLM performance measurement
+# ---------------------------------------------------------------------------
+[tasks.benchmark]
+description = "Run LLM performance benchmark against the vLLM API"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+python3 scripts/benchmark_api.py "$@"
+"""
+
+# ---------------------------------------------------------------------------
+# logs
+# ---------------------------------------------------------------------------
+[tasks."logs:vllm"]
+description = "Tail vLLM service logs (journalctl + podman)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if systemctl --user is-active --quiet vllm-server.service 2>/dev/null; then
+  echo "==> Tailing journalctl for vllm-server.service (user unit)..."
+  journalctl --user -u vllm-server.service -f --no-pager
+else
+  CONTAINER=$(podman ps --filter name=vllm --format '{{.Names}}' | head -n1)
+  if [ -n "$CONTAINER" ]; then
+    echo "==> Tailing podman logs for container: $CONTAINER"
+    podman logs -f "$CONTAINER"
+  else
+    echo "ERROR: No running vLLM service or container found."
+    exit 1
+  fi
+fi
+"""
+
+[tasks."logs:ui"]
+description = "Tail Open WebUI container logs"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+CONTAINER=$(podman ps --filter name=open-webui --format '{{.Names}}' | head -n1)
+if [ -n "$CONTAINER" ]; then
+  echo "==> Tailing podman logs for container: $CONTAINER"
+  podman logs -f "$CONTAINER"
+else
+  echo "ERROR: No running Open WebUI container found."
+  echo "Hint: Start it with 'mise run ui:up'"
+  exit 1
+fi
+"""

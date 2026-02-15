@@ -1,0 +1,12 @@
+---
+ui_enabled: false
+ui_type: "openwebui"
+openwebui_image: "ghcr.io/open-webui/open-webui:main"
+openwebui_port: 3000
+openwebui_data_volume: "open-webui"
+openwebui_auth_enabled: true
+firewall_open_ui_port: false
+openwebui_openai_api_base_url: "http://127.0.0.1:8000/v1"
+openwebui_openai_api_key: "{{ vllm_api_key_value | default('local-dev-key') }}"
+openwebui_container_name: "open-webui"
+strix_halo_target_user: "{{ ansible_user_id }}"

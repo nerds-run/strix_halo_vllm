@@ -1,0 +1,33 @@
+---
+namespace: nerdsrun
+name: strix_halo_vllm
+version: 1.0.0
+description: >-
+  Ansible collection for AMD Strix Halo (gfx1151) vLLM deployment on Fedora.
+  Handles hardware detection, kernel tuning, rootless Podman containers,
+  model prefetching, and optional Open WebUI frontend.
+authors:
+  - NerdsRun
+license:
+  - MIT
+repository: https://github.com/nerdsrun/amdllmv
+documentation: https://github.com/nerdsrun/amdllmv/tree/main/docs
+homepage: https://github.com/nerdsrun/amdllmv
+issues: https://github.com/nerdsrun/amdllmv/issues
+tags:
+  - infrastructure
+  - linux
+  - tools
+  - amd
+  - vllm
+  - strix_halo
+  - gpu
+  - ai
+  - fedora
+dependencies:
+  ansible.posix: ">=1.5.0"
+readme: README.md
+build_ignore:
+  - molecule
+  - docs
+  - "*.tar.gz"

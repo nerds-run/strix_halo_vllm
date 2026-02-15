@@ -1,0 +1,188 @@
+---
+# ==========================================================================
+# host_prereqs - Prepare Fedora for Strix Halo vLLM usage
+# FAIL FAST if gfx1151 hardware is not detected
+# ==========================================================================
+
+# ------------------------------------------------------------------
+# 1. FAIL FAST - Detect AMD Strix Halo gfx1151 hardware
+# ------------------------------------------------------------------
+- name: Discover KFD topology node directories
+  ansible.builtin.find:
+    paths: /sys/class/kfd/kfd/topology/nodes
+    file_type: directory
+    recurse: false
+  register: host_prereqs_kfd_nodes
+  tags:
+    - hardware_required
+
+- name: Fail if no KFD topology nodes found
+  ansible.builtin.fail:
+    msg: >-
+      Strix Halo gfx1151 hardware not detected.
+      No KFD topology nodes found under /sys/class/kfd/kfd/topology/nodes/.
+      This automation requires AMD Ryzen AI Max 'Strix Halo' hardware.
+  when: host_prereqs_kfd_nodes.files | length == 0
+  tags:
+    - hardware_required
+
+- name: Read properties from each KFD topology node
+  ansible.builtin.slurp:
+    src: "{{ item.path }}/properties"
+  register: host_prereqs_kfd_properties
+  loop: "{{ host_prereqs_kfd_nodes.files }}"
+  loop_control:
+    label: "{{ item.path | basename }}"
+  tags:
+    - hardware_required
+
+- name: Extract gfx_target_version values
+  ansible.builtin.set_fact:
+    host_prereqs_detected_gfx_versions: >-
+      {{
+        host_prereqs_kfd_properties.results
+        | map(attribute='content')
+        | map('b64decode')
+        | map('regex_findall', 'gfx_target_version\s+(\d+)')
+        | flatten
+        | unique
+        | list
+      }}
+  tags:
+    - hardware_required
+
+- name: Fail if Strix Halo gfx1151 is not detected
+  ansible.builtin.fail:
+    msg: >-
+      Strix Halo gfx1151 hardware not detected.
+      Found gfx_target_version(s): {{ host_prereqs_detected_gfx_versions | join(', ') | default('none') }}.
+      This automation requires AMD Ryzen AI Max 'Strix Halo' hardware
+      (KFD target version 110501).
+  when: "'110501' not in host_prereqs_detected_gfx_versions"
+  tags:
+    - hardware_required
+
+- name: Strix Halo gfx1151 hardware confirmed
+  ansible.builtin.debug:
+    msg: "gfx1151 detected (KFD target version 110501 found in: {{ host_prereqs_detected_gfx_versions | join(', ') }})"
+  tags:
+    - hardware_required
+
+# ------------------------------------------------------------------
+# 2. Validate Fedora distribution
+# ------------------------------------------------------------------
+- name: Validate host is running Fedora
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['distribution'] == 'Fedora'
+    fail_msg: >-
+      This collection requires Fedora. Detected: {{ ansible_facts['distribution'] | default('unknown') }}.
+    success_msg: "Running on Fedora {{ ansible_facts['distribution_version'] }}."
+
+# ------------------------------------------------------------------
+# 3. Ensure required device nodes exist
+# ------------------------------------------------------------------
+- name: Check required device nodes
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  register: host_prereqs_device_stat
+  loop: "{{ strix_halo_devices }}"
+  when: strix_halo_require_devices | bool
+  tags:
+    - hardware_required
+
+- name: Fail if any required device node is missing
+  ansible.builtin.fail:
+    msg: >-
+      Required device {{ item.item }} does not exist.
+      Ensure the amdgpu kernel driver is loaded (modprobe amdgpu).
+  loop: "{{ host_prereqs_device_stat.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item | default('N/A') }}"
+  when:
+    - strix_halo_require_devices | bool
+    - not (item.stat.exists | default(false))
+  tags:
+    - hardware_required
+
+# ------------------------------------------------------------------
+# 4. Ensure target user is in video and render groups
+# ------------------------------------------------------------------
+- name: Ensure target user is in required groups
+  ansible.builtin.user:
+    name: "{{ strix_halo_target_user }}"
+    groups: "{{ strix_halo_groups }}"
+    append: true
+  become: true
+
+# ------------------------------------------------------------------
+# 5. Install podman and toolbox packages
+# ------------------------------------------------------------------
+- name: Install podman and toolbox
+  ansible.builtin.package:
+    name:
+      - podman
+      - toolbox
+    state: present
+  become: true
+
+# ------------------------------------------------------------------
+# 6. Ensure podman rootless is configured (subuid/subgid)
+# ------------------------------------------------------------------
+- name: Check subuid entry for target user
+  ansible.builtin.command:
+    cmd: "grep -q '^{{ strix_halo_target_user }}:' /etc/subuid"
+  register: host_prereqs_subuid_check
+  changed_when: false
+  failed_when: false
+
+- name: Check subgid entry for target user
+  ansible.builtin.command:
+    cmd: "grep -q '^{{ strix_halo_target_user }}:' /etc/subgid"
+  register: host_prereqs_subgid_check
+  changed_when: false
+  failed_when: false
+
+- name: Configure subuid for rootless podman
+  ansible.builtin.command:
+    cmd: "usermod --add-subuids 100000-165535 {{ strix_halo_target_user }}"
+  become: true
+  when: host_prereqs_subuid_check.rc != 0
+  changed_when: true
+
+- name: Configure subgid for rootless podman
+  ansible.builtin.command:
+    cmd: "usermod --add-subgids 100000-165535 {{ strix_halo_target_user }}"
+  become: true
+  when: host_prereqs_subgid_check.rc != 0
+  changed_when: true
+
+# ------------------------------------------------------------------
+# 7. RDMA device check (optional)
+# ------------------------------------------------------------------
+- name: RDMA device validation
+  when: strix_halo_rdma_enabled | bool
+  tags:
+    - rdma
+  block:
+    - name: Stat RDMA device path
+      ansible.builtin.stat:
+        path: "{{ strix_halo_rdma_device_path }}"
+      register: host_prereqs_rdma_stat
+
+    - name: Fail if RDMA device path does not exist
+      ansible.builtin.fail:
+        msg: >-
+          RDMA is enabled but {{ strix_halo_rdma_device_path }} does not exist.
+          Ensure InfiniBand/RDMA kernel modules are loaded.
+      when: not host_prereqs_rdma_stat.stat.exists
+
+# ------------------------------------------------------------------
+# 8. Pull the vLLM container image
+# ------------------------------------------------------------------
+- name: Pull the vLLM container image
+  ansible.builtin.command:
+    cmd: "podman pull {{ strix_halo_image }}"
+  register: host_prereqs_pull_result
+  changed_when: "'Writing' in host_prereqs_pull_result.stdout or 'Storing' in host_prereqs_pull_result.stdout"
+  become: false

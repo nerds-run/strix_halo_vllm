@@ -1,0 +1,22 @@
+---
+galaxy_info:
+  role_name: kernel_tuning
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Optionally configure kernel boot parameters for AMD unified memory
+    optimization on Strix Halo. Never auto-reboots unless explicitly allowed.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - amd
+    - gpu
+    - kernel
+    - tuning
+    - strix_halo
+
+dependencies: []

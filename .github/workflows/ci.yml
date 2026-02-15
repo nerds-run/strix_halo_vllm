@@ -1,0 +1,68 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  ANSIBLE_COLLECTIONS_PATH: "${{ github.workspace }}:~/.ansible/collections"
+  MISE_YES: "1"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mise
+        uses: jdx/mise-action@v2
+
+      - name: Bootstrap toolchain
+        run: mise run bootstrap
+
+      - name: Install collection dependencies
+        run: ansible-galaxy collection install ansible.posix
+
+      - name: Run ansible-lint
+        run: mise run lint:ansible
+
+      - name: Run yamllint
+        run: mise run lint:yaml
+
+  syntax-check:
+    name: Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install mise
+        uses: jdx/mise-action@v2
+
+      - name: Bootstrap toolchain
+        run: mise run bootstrap
+
+      - name: Install collection dependencies
+        run: ansible-galaxy collection install ansible.posix
+
+      - name: Syntax check all playbooks
+        run: |
+          for pb in ansible_collections/nerdsrun/strix_halo_vllm/playbooks/*.yml; do
+            echo "==> Checking $pb"
+            ansible-playbook "$pb" -i inventory --syntax-check
+          done
