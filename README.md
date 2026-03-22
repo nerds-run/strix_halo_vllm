@@ -1,6 +1,6 @@
-# AMD Strix Halo vLLM Automation
+# AMD Strix Halo LLM Automation
 
-**nerdsrun.strix_halo_vllm** -- Ansible collection for deploying vLLM on AMD Ryzen AI Max "Strix Halo" (gfx1151) APUs
+**nerdsrun.strix_halo_vllm** -- Ansible collection for deploying LLM inference on AMD Ryzen AI Max "Strix Halo" (gfx1151) APUs
 
 ![CI](https://img.shields.io/github/actions/workflow/status/nerdsrun/amdllmv/ci.yml?branch=main&label=CI)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
@@ -9,9 +9,9 @@
 
 ## Overview
 
-Enterprise-quality, idempotent Ansible automation that takes a Fedora system with AMD Strix Halo hardware from zero to a fully operational vLLM inference server. Supports toolbox mode for interactive development, service mode for persistent API endpoints, model weight prefetching, and an optional Open WebUI chat frontend.
+Enterprise-quality, idempotent Ansible automation that takes a Fedora system with AMD Strix Halo hardware from zero to a fully operational LLM inference server. Supports two backends: **vLLM** (ROCm) and **llama.cpp** (Vulkan). Includes toolbox mode for interactive development, service mode for persistent API endpoints, model weight prefetching, and an optional Open WebUI chat frontend.
 
-**Upstream source of truth:** [kyuz0/amd-strix-halo-vllm-toolboxes](https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes/)
+**Upstream images:** [kyuz0/amd-strix-halo-toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes/) (Vulkan/llama.cpp) | [kyuz0/amd-strix-halo-vllm-toolboxes](https://github.com/kyuz0/amd-strix-halo-vllm-toolboxes/) (ROCm/vLLM)
 
 ---
 
@@ -45,9 +45,12 @@ $EDITOR inventory/hosts.yml            # set your target host/user
 $EDITOR inventory/group_vars/all.yml   # tune deployment options
 
 # 4. Deploy
-mise run deploy:toolbox   # interactive toolbox
-mise run deploy:service   # systemd-managed vLLM API server
-mise run deploy:all       # both modes
+mise run deploy:toolbox        # interactive toolbox (vLLM/ROCm)
+mise run deploy:service        # systemd vLLM API server (ROCm)
+mise run deploy:llamacpp       # llama.cpp Vulkan — 122B model (default)
+mise run deploy:llamacpp:coder # llama.cpp — Coder 30B profile
+mise run deploy:llamacpp:fast  # llama.cpp — Fast 35B profile
+mise run deploy:all            # full site.yml deployment
 
 # 5. Verify
 mise run verify
@@ -60,26 +63,40 @@ mise run ui:up            # Open WebUI at http://localhost:3000
 
 ## Modes
 
-| Mode | Variable | Description |
-|---|---|---|
-| `toolbox` | `strix_halo_mode: "toolbox"` | Interactive toolbox container for development |
-| `service` | `strix_halo_mode: "service"` | Persistent vLLM server via systemd Quadlet |
-| `both` | `strix_halo_mode: "both"` | Deploy both simultaneously |
+| Mode | Variable | Backend | Description |
+|---|---|---|---|
+| `toolbox` | `strix_halo_mode: "toolbox"` | vLLM/ROCm | Interactive toolbox container for development |
+| `service` | `strix_halo_mode: "service"` | vLLM/ROCm | Persistent vLLM server via systemd Quadlet (port 8000) |
+| `both` | `strix_halo_mode: "both"` | vLLM/ROCm | Deploy both simultaneously |
+| `llamacpp` | `strix_halo_mode: "llamacpp"` | llama.cpp/Vulkan | GGUF model server via systemd Quadlet (port 8080) |
+
+### llama.cpp Model Profiles
+
+When using `llamacpp` mode, select a model profile with `llamacpp_model_profile` or via mise:
+
+| Profile | Model | Size | Active Params | tok/s | Use Case |
+|---|---|---|---|---|---|
+| `big` (default) | Qwen3.5-122B-A10B | 77 GB | 10B | ~22 | Reasoning, vision, general |
+| `coder` | Qwen3-Coder-30B-A3B | ~20 GB | 3B | ~83 | Coding, tool-use, agentic |
+| `fast` | Qwen3.5-35B-A3B | ~20 GB | 3B | ~59 | Fast general + vision |
 
 ---
 
-## Model Prefetching
+## Models
 
-Default models (downloaded automatically):
+### llama.cpp (Vulkan) -- GGUF Models
 
-| Model | Type | Size | tok/s (128GB system) |
-|---|---|---|---|
-| `btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit` | MoE, 3B active | ~8GB | ~35 |
-| `btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-8bit` | MoE, 3B active | ~15GB | ~25 |
-| `dazipe/Qwen3-Next-80B-A3B-Instruct-GPTQ-Int4A16` | MoE, 3B active | ~46GB | ~18 |
-| `Qwen/Qwen3-14B-AWQ` | Dense, 14B | ~7GB | ~12 |
+The `llamacpp` mode downloads and serves GGUF-quantized models via the Vulkan backend. Models are selected via profiles (see Modes above). The Vulkan backend bypasses a [known ROCm/HIP hang](https://github.com/ROCm/ROCm/issues/6027) with Qwen 3.5 models on gfx1151.
 
-MoE (Mixture of Experts) models are strongly recommended for Strix Halo -- they activate only a fraction of their parameters per token, giving much better speed on bandwidth-limited iGPUs. See the [Performance Guide](ansible_collections/nerdsrun/strix_halo_vllm/docs/PERFORMANCE.md).
+### vLLM (ROCm) -- HuggingFace Models
+
+The `service`/`toolbox` modes use vLLM with ROCm. Default prefetch models:
+
+| Model | Type | Size |
+|---|---|---|
+| `btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-8bit` | MoE, 3B active | ~15GB |
+| `btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit` | MoE, 3B active | ~8GB |
+| `Qwen/Qwen3-14B-AWQ` | Dense, 14B | ~7GB |
 
 Add custom models via `model_prefetch_extra: ["org/model-name"]`.
 
@@ -92,18 +109,19 @@ Set `ui_enabled: true` or use `mise run ui:up` to deploy [Open WebUI](https://gi
 | Setting | Value |
 |---|---|
 | Open WebUI URL | `http://localhost:3000` |
-| vLLM API URL | `http://localhost:8000/v1` |
-| API Key | `vllm_api_key_value` (default: `local-dev-key`) |
+| Backend API URL | Auto-detected from `strix_halo_mode` (vLLM :8000, llama.cpp :8080) |
+| API Key | `local-dev-key` (default) |
 
-Open WebUI auto-connects to vLLM. The container-to-container URL is resolved automatically via `host.containers.internal`.
+Open WebUI auto-connects to whichever backend is deployed. The container-to-container URL is resolved automatically via `host.containers.internal`.
 
 ---
 
 ## Security Notes
 
 - **API Key**: Default is `local-dev-key` -- change it for any network-accessible deployment
-- **Network Binding**: vLLM binds to `0.0.0.0:8000` by default. Set `firewall_open_vllm_port: true` to open the port in firewalld (works in both toolbox and service modes), or restrict binding
-- **seccomp=unconfined**: Required for ROCm GPU access inside containers. Does not disable other security mechanisms
+- **Network Binding**: vLLM binds to `0.0.0.0:8000`, llama.cpp to `0.0.0.0:8080`. Set `firewall_open_vllm_port` / `firewall_open_llamacpp_port` to open in firewalld
+- **seccomp=unconfined**: Required for ROCm GPU access (vLLM mode). Not needed for Vulkan (llama.cpp mode)
+- **Quadlet files**: Deployed with `mode: 0600` -- API keys and tokens are rendered in the unit file
 - **Rootless Podman**: All containers run rootless under the invoking user
 
 ---
@@ -114,14 +132,18 @@ Open WebUI auto-connects to vLLM. The container-to-container URL is resolved aut
 |---|---|
 | `mise run bootstrap` | Install Ansible toolchain |
 | `mise run ssh-key` | Pull SSH key from 1Password |
-| `mise run deploy:toolbox` | Deploy toolbox mode |
-| `mise run deploy:service` | Deploy service mode |
+| `mise run deploy:toolbox` | Deploy toolbox mode (vLLM/ROCm) |
+| `mise run deploy:service` | Deploy service mode (vLLM/ROCm) |
+| `mise run deploy:llamacpp` | Deploy llama.cpp/Vulkan (big profile) |
+| `mise run deploy:llamacpp:coder` | Deploy llama.cpp coder profile |
+| `mise run deploy:llamacpp:fast` | Deploy llama.cpp fast profile |
 | `mise run deploy:all` | Full deployment |
 | `mise run verify` | Run verification checks |
 | `mise run uninstall` | Remove all components |
 | `mise run ui:up` | Start Open WebUI |
 | `mise run ui:down` | Stop Open WebUI |
 | `mise run logs:vllm` | Tail vLLM logs |
+| `mise run logs:llamacpp` | Tail llama.cpp logs |
 | `mise run logs:ui` | Tail Open WebUI logs |
 | `mise run benchmark` | Run LLM performance benchmark |
 | `mise run lint` | Run ansible-lint + yamllint |
@@ -137,6 +159,7 @@ Open WebUI auto-connects to vLLM. The container-to-container URL is resolved aut
 | Permission denied on GPU | `sudo usermod -aG video,render $USER` then re-login |
 | gfx1151 not detected | Update kernel: `sudo dnf upgrade --refresh` |
 | vLLM won't start | `mise run logs:vllm` for ROCm errors |
+| llama.cpp won't start | `systemctl --user reset-failed llamacpp-server` then retry |
 | Open WebUI 500 error | `podman restart open-webui` |
 | Slow inference | See [Performance Guide](ansible_collections/nerdsrun/strix_halo_vllm/docs/PERFORMANCE.md) |
 

@@ -10,7 +10,7 @@ Strix Halo is fundamentally different from discrete GPUs:
 
 | Property | Strix Halo (gfx1151) | Discrete GPU (e.g. MI300X) |
 |---|---|---|
-| **Architecture** | RDNA 4 iGPU | CDNA 3 |
+| **Architecture** | RDNA 3.5 iGPU (gfx1151) | CDNA 3 |
 | **VRAM** | Shared system RAM (up to 128 GB) | Dedicated HBM3e (192 GB) |
 | **Bandwidth** | ~200 GB/s (LPDDR5-8000, 8-channel) | ~5.3 TB/s |
 | **Compute Units** | 20 SMs | 304 CUs |
@@ -133,6 +133,37 @@ Default context lengths (8K-32K) are fine for most use cases. Only increase if y
 
 ---
 
+## llama.cpp (Vulkan Backend)
+
+The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This is **required** for Qwen 3.5 models which hang on ROCm ([ROCm#6027](https://github.com/ROCm/ROCm/issues/6027)).
+
+### Confirmed Benchmarks (Vulkan, UD-Q4_K_XL quantization)
+
+| Model | Active Params | Size | tok/s |
+|---|---|---|---|
+| Qwen3.5-122B-A10B | 10B | 77 GB | **22.8** |
+| Qwen3.5-35B-A3B | 3B | 21 GB | **59.4** |
+| Qwen3-Coder-30B-A3B | 3B | 17 GB | **83.4** |
+
+### Vulkan-Specific Tuning
+
+- **`-b 256`** (batch size): Smaller batches improve prompt processing on MoE models with Vulkan
+- **`--no-mmap`**: Required on Strix Halo unified memory — prevents crashes
+- **`-fa 1`** (flash attention): Required for stability on gfx1151
+- **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context
+
+### Context Size vs. Memory (122B model, 77GB)
+
+| Context | KV Cache | Feasible? |
+|---------|----------|-----------|
+| 16,384 | ~8-12 GB | Yes (default) |
+| 32,768 | ~16-24 GB | Tight but possible |
+| 65,536+ | ~32+ GB | Risky |
+
+The 30B/35B models (~20GB) leave ~95GB headroom -- context can be pushed to 128K+ with quantized KV cache.
+
+---
+
 ## Putting It All Together
 
 ### Maximum Speed (Toolbox Mode)
@@ -189,7 +220,17 @@ Expected: **~25 tok/s** on 128 GB Strix Halo.
 
 ## Benchmark Reference
 
-All numbers on AMD Ryzen AI Max "Strix Halo", 128 GB LPDDR5-8000, 8-channel, Fedora 43, ROCm 7.12 (TheROCk), vLLM with `--enforce-eager` and TunableOp enabled.
+All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
+
+### llama.cpp (Vulkan, UD-Q4_K_XL GGUF)
+
+| Model | Type | Size | tok/s |
+|---|---|---|---|
+| Qwen3-Coder-30B-A3B | MoE, 3B active | 17 GB | **83.4** |
+| Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | **59.4** |
+| Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | **22.8** |
+
+### vLLM (ROCm/TheROCk, --enforce-eager + TunableOp)
 
 | Model | Type | Size | tok/s |
 |---|---|---|---|
@@ -197,7 +238,6 @@ All numbers on AMD Ryzen AI Max "Strix Halo", 128 GB LPDDR5-8000, 8-channel, Fed
 | Qwen3-Coder-30B-A3B (GPTQ-8bit) | MoE | ~15 GB | ~25 |
 | Qwen3-Next-80B-A3B (GPTQ-Int4) | MoE | ~46 GB | ~18 |
 | Qwen3-14B-AWQ | Dense | ~7 GB | ~12 |
-| Qwen3-14B-AWQ (without TunableOp) | Dense | ~7 GB | ~6 |
 
 ---
 

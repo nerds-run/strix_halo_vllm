@@ -87,6 +87,44 @@ mise run deploy:toolbox
 podman system info
 ```
 
+## llama.cpp Service Won't Start
+
+**Symptoms:** Service fails or exits immediately after deploy
+
+**Solutions:**
+```bash
+# Check if systemd is in "restart too quickly" state
+systemctl --user status llamacpp-server
+
+# Reset failed state and restart
+systemctl --user reset-failed llamacpp-server
+systemctl --user daemon-reload
+systemctl --user start llamacpp-server
+
+# Check logs (--log-disable is on by default, check journal)
+journalctl --user -u llamacpp-server --no-pager -n 50
+
+# Verify model file exists at expected path
+ls -lh ~/models/*/UD-Q4_K_XL/
+
+# Check the Quadlet unit file
+cat ~/.config/containers/systemd/llamacpp-server.container
+
+# Test manually with logging enabled
+podman run --rm --device /dev/dri -v ~/models:/models:Z \
+  docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv \
+  llama-server -m /models/<repo_dir>/UD-Q4_K_XL/<model>.gguf \
+  -ngl 999 -fa 1 --no-mmap --ctx-size 16384 --host 0.0.0.0 --port 8080
+```
+
+## Qwen 3.5 Hangs on ROCm
+
+**Symptoms:** Qwen 3.5 models hang during tensor loading with ROCm/HIP backend
+
+**Cause:** Known bug with Qwen 3.5 hybrid architecture (SSM/DeltaNet + MoE) on gfx1151. Tracked at [ROCm#6027](https://github.com/ROCm/ROCm/issues/6027).
+
+**Solution:** Use the Vulkan backend instead (`strix_halo_mode: "llamacpp"`). This is what the `llamacpp_service` role does.
+
 ## vLLM Service Won't Start
 
 **Symptoms:** Service fails to start or crashes immediately
@@ -144,30 +182,31 @@ hf whoami
 # model_prefetch_strict: false  # warns but continues
 ```
 
-## Open WebUI Can't Connect to vLLM
+## Open WebUI Can't Connect to Backend
 
 **Symptoms:** Open WebUI shows "connection refused", 500 errors, or no models available
 
 **Causes:**
-- vLLM not running or not yet ready
+- Backend not running or not yet ready
 - Wrong API URL or key
 - Container networking issue
-- Container needs restart after changing vLLM model
+- Container needs restart after switching models/backends
 
 **Solutions:**
 ```bash
-# Verify vLLM is responding
-curl http://localhost:8000/v1/models \
-  -H "Authorization: Bearer local-dev-key"
+# Verify backend is responding (use correct port)
+curl http://127.0.0.1:8080/v1/models    # llama.cpp
+curl http://127.0.0.1:8000/v1/models    # vLLM
+
+# IMPORTANT: Use 127.0.0.1, not localhost (IPv6 issue on Fedora)
 
 # Check Open WebUI container env
 podman inspect open-webui | grep -A2 OPENAI
 
 # The container uses host.containers.internal to reach the host
-# Verify this resolves correctly
-podman exec open-webui getent hosts host.containers.internal
+podman exec open-webui curl -s http://host.containers.internal:8080/v1/models
 
-# Restart Open WebUI (required after changing vLLM model)
+# Restart Open WebUI (required after switching backends)
 podman restart open-webui
 ```
 
@@ -280,6 +319,9 @@ sudo sealert -a /var/log/audit/audit.log
 ## Collecting Logs
 
 ```bash
+# llama.cpp service logs
+mise run logs:llamacpp
+
 # vLLM service logs
 mise run logs:vllm
 

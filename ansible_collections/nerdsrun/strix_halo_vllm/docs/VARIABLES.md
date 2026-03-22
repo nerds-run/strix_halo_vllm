@@ -4,7 +4,7 @@
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `strix_halo_mode` | string | `"toolbox"` | Deployment mode: `toolbox`, `service`, or `both` |
+| `strix_halo_mode` | string | `"toolbox"` | Deployment mode: `toolbox`, `service`, `both`, or `llamacpp` |
 | `strix_halo_image` | string | `"docker.io/kyuz0/vllm-therock-gfx1151:latest"` | Container image for vLLM |
 | `strix_halo_toolbox_name` | string | `"vllm"` | Name of the toolbox container |
 | `strix_halo_target_user` | string | `"{{ ansible_user_id }}"` | User for rootless podman operations |
@@ -58,11 +58,35 @@
 | `vllm_extra_args` | list | `[]` | Additional vLLM CLI arguments |
 | `vllm_container_name` | string | `"vllm-server"` | Container/service name |
 
+## llama.cpp Server Variables
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `llamacpp_image` | string | `"docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv"` | Container image (Vulkan backend) |
+| `llamacpp_enabled` | bool | `true` | Enable the llama.cpp server |
+| `llamacpp_host` | string | `"0.0.0.0"` | llama.cpp bind address |
+| `llamacpp_port` | int | `8080` | llama.cpp listen port |
+| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, or `fast` |
+| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions (repo, file, include, sampling params) |
+| `llamacpp_model_dir` | string | `"~/models"` | Directory for GGUF model storage |
+| `llamacpp_ngl` | int | `999` | GPU layers to offload (999 = all) |
+| `llamacpp_flash_attn` | bool | `true` | Enable flash attention |
+| `llamacpp_no_mmap` | bool | `true` | Disable mmap (required for Strix Halo stability) |
+| `llamacpp_batch_size` | int | `256` | Batch size for prompt processing |
+| `llamacpp_thinking_enabled` | bool | `true` | Enable thinking/reasoning mode |
+| `llamacpp_cache_type_k` | string | `""` | KV cache key quantization (e.g. `q8_0`, `q4_0`) |
+| `llamacpp_cache_type_v` | string | `""` | KV cache value quantization |
+| `llamacpp_extra_args` | list | `[]` | Additional llama-server CLI arguments |
+| `llamacpp_api_key_enabled` | bool | `false` | Require API key authentication |
+| `llamacpp_api_key_value` | string | `"local-dev-key"` | API key value |
+| `llamacpp_container_name` | string | `"llamacpp-server"` | Container/service name |
+
 ## Firewall Variables
 
 | Variable | Type | Default | Description |
 |---|---|---|---|
-| `firewall_open_vllm_port` | bool | `false` | Open vLLM port in firewalld (applies in both toolbox and service modes) |
+| `firewall_open_vllm_port` | bool | `false` | Open vLLM port (8000) in firewalld |
+| `firewall_open_llamacpp_port` | bool | `false` | Open llama.cpp port (8080) in firewalld |
 | `firewall_open_ui_port` | bool | `false` | Open WebUI port in firewalld |
 
 ## Open WebUI Variables
@@ -75,8 +99,8 @@
 | `openwebui_port` | int | `3000` | Open WebUI listen port |
 | `openwebui_data_volume` | string | `"open-webui"` | Podman volume for persistent data |
 | `openwebui_auth_enabled` | bool | `true` | Enable authentication (false shows warning) |
-| `openwebui_openai_api_base_url` | string | `"http://127.0.0.1:8000/v1"` | vLLM API base URL |
-| `openwebui_openai_api_key` | string | `vllm_api_key_value` | API key for vLLM connection |
+| `openwebui_openai_api_base_url` | string | `""` (auto-resolved) | Backend API URL (auto-detected from `strix_halo_mode`) |
+| `openwebui_openai_api_key` | string | `"local-dev-key"` | API key for backend connection |
 | `openwebui_container_name` | string | `"open-webui"` | Container name |
 
 ## Uninstall Variables

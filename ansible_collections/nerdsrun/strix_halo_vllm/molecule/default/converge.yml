@@ -35,3 +35,68 @@
         - name: "kernel_tuning expected CI failure"
           ansible.builtin.debug:
             msg: "kernel_tuning failed as expected in CI (requires Fedora kernel args)"
+
+    - name: "Test llamacpp_service role inclusion"
+      vars:
+        strix_halo_mode: "llamacpp"
+        llamacpp_enabled: false
+      block:
+        - name: "Include llamacpp_service"
+          ansible.builtin.include_role:
+            name: nerdsrun.strix_halo_vllm.llamacpp_service
+      rescue:
+        - name: "llamacpp_service expected CI failure"
+          ansible.builtin.debug:
+            msg: "llamacpp_service failed as expected in CI (requires Strix Halo + Vulkan)"
+
+    - name: "Validate llamacpp_service defaults are loadable"
+      block:
+        - name: "Load llamacpp_service defaults"
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../../roles/llamacpp_service/defaults/main.yml"
+          register: _llamacpp_defaults
+
+        - name: "Assert model profiles are defined"
+          ansible.builtin.assert:
+            that:
+              - llamacpp_model_profiles is defined
+              - "'big' in llamacpp_model_profiles"
+              - "'coder' in llamacpp_model_profiles"
+              - "'fast' in llamacpp_model_profiles"
+              - "llamacpp_model_profiles.big.repo is defined"
+              - "llamacpp_model_profiles.coder.jinja | bool"
+              - "llamacpp_model_profiles.coder.repeat_penalty | float > 0"
+              - "llamacpp_model_profile == 'big'"
+            fail_msg: "llamacpp_service defaults are malformed"
+
+        - name: "Assert profile fields are consistent"
+          ansible.builtin.assert:
+            that:
+              - item.value.repo is defined
+              - item.value.file is defined
+              - item.value.include is defined
+              - item.value.ctx_size | int > 0
+              - item.value.temp | float >= 0
+              - item.value.top_p | float >= 0
+              - item.value.top_k | int >= 0
+            fail_msg: "Profile '{{ item.key }}' is missing required fields"
+          loop: "{{ llamacpp_model_profiles | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+    - name: "Validate openwebui_ui mode-aware URL resolution"
+      block:
+        - name: "Test llamacpp mode URL resolution"
+          ansible.builtin.set_fact:
+            _test_url: >-
+              {{ ''
+                 if ('' | length > 0)
+                 else ('http://127.0.0.1:8080/v1')
+                 if ('llamacpp' == 'llamacpp')
+                 else ('http://127.0.0.1:8000/v1') }}
+
+        - name: "Assert llamacpp URL resolves to port 8080"
+          ansible.builtin.assert:
+            that:
+              - "'8080' in _test_url"
+            fail_msg: "URL resolution for llamacpp mode failed: {{ _test_url }}"

@@ -50,8 +50,9 @@
   ansible.builtin.template:
     src: vllm-server.container.j2
     dest: "{{ ansible_user_dir }}/.config/containers/systemd/{{ vllm_container_name }}.container"
-    mode: "0644"
+    mode: "0600"
   become: false
+  no_log: "{{ (hf_token | default('') | length > 0) or (vllm_api_key_enabled | bool) }}"
   notify:
     - Reload systemd user daemon
     - Restart vllm service
@@ -114,7 +115,7 @@
       Image      : {{ strix_halo_image }}
       Model      : {{ vllm_primary_model }}
       API        : http://{{ vllm_host }}:{{ vllm_port }}/v1
-      API key    : {{ vllm_api_key_value if vllm_api_key_enabled else '(disabled)' }}
+      API key    : {{ '(enabled)' if vllm_api_key_enabled else '(disabled)' }}
 
       Manage with:
         systemctl --user status {{ vllm_container_name }}
@@ -122,8 +123,7 @@
         journalctl --user -u {{ vllm_container_name }} -f
 
       Test:
-        curl http://localhost:{{ vllm_port }}/v1/models \
-          -H "Authorization: Bearer {{ vllm_api_key_value }}"
+        curl http://localhost:{{ vllm_port }}/v1/models
   when: vllm_enabled | bool
   tags:
     - service

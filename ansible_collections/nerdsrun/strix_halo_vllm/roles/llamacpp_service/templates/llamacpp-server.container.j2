@@ -1,0 +1,58 @@
+# {{ ansible_managed }}
+# Podman Quadlet container unit for llama.cpp (Vulkan) on AMD Strix Halo (gfx1151)
+# Uses Vulkan backend to work around ROCm/HIP hang with Qwen 3.5 models.
+# Profile: {{ llamacpp_model_profile }} — {{ llamacpp_active.repo }}
+
+[Unit]
+Description=llama.cpp {{ llamacpp_model_profile }} server (Vulkan / Strix Halo gfx1151)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image={{ llamacpp_image }}
+ContainerName={{ llamacpp_container_name }}
+AddDevice=/dev/dri
+PublishPort={{ llamacpp_port }}:8080
+Volume={{ llamacpp_service_model_dir_expanded }}:/models:Z
+Exec=llama-server \
+  -m /models/{{ llamacpp_service_repo_dir }}/{{ llamacpp_active.file }} \
+  -ngl {{ llamacpp_ngl }} \
+{% if llamacpp_flash_attn %}
+  -fa 1 \
+{% endif -%}
+{% if llamacpp_no_mmap %}
+  --no-mmap \
+{% endif -%}
+{% if llamacpp_active.jinja | default(false) %}
+  --jinja \
+{% endif -%}
+  --ctx-size {{ llamacpp_active.ctx_size }} \
+  -b {{ llamacpp_batch_size }} \
+  --host 0.0.0.0 --port 8080 \
+  --temp {{ llamacpp_active.temp }} --top-p {{ llamacpp_active.top_p }} --top-k {{ llamacpp_active.top_k }} --min-p {{ llamacpp_active.min_p }} \
+{% if llamacpp_active.repeat_penalty | default(0) | float > 0 %}
+  --repeat-penalty {{ llamacpp_active.repeat_penalty }} \
+{% endif -%}
+{% if llamacpp_cache_type_k | default('') | length > 0 %}
+  --cache-type-k {{ llamacpp_cache_type_k }} \
+{% endif -%}
+{% if llamacpp_cache_type_v | default('') | length > 0 %}
+  --cache-type-v {{ llamacpp_cache_type_v }} \
+{% endif -%}
+{% if not llamacpp_thinking_enabled %}
+  --chat-template-kwargs '{"enable_thinking":false}' \
+{% endif -%}
+{% if llamacpp_api_key_enabled %}
+  --api-key {{ llamacpp_api_key_value }} \
+{% endif -%}
+{% for arg in llamacpp_extra_args %}
+  {{ arg }} \
+{% endfor -%}
+  --log-disable
+
+[Service]
+Restart=on-failure
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

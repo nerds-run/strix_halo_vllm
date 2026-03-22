@@ -1,0 +1,215 @@
+---
+# ==========================================================================
+# llamacpp_service - Run llama.cpp (Vulkan) as a systemd-managed Podman
+#                    Quadlet service for GGUF model inference
+# ==========================================================================
+
+# ------------------------------------------------------------------
+# 1. Resolve active model profile
+# ------------------------------------------------------------------
+- name: Validate model profile exists
+  ansible.builtin.assert:
+    that:
+      - llamacpp_model_profile in llamacpp_model_profiles
+    fail_msg: >-
+      Unknown profile '{{ llamacpp_model_profile }}'.
+      Valid profiles: {{ llamacpp_model_profiles.keys() | list | join(', ') }}
+  tags:
+    - llamacpp
+
+- name: Resolve active model profile
+  ansible.builtin.set_fact:
+    llamacpp_active: "{{ llamacpp_model_profiles[llamacpp_model_profile] }}"
+  tags:
+    - llamacpp
+
+- name: Display active model profile
+  ansible.builtin.debug:
+    msg: "Profile: {{ llamacpp_model_profile }} — {{ llamacpp_active.repo }} (ctx={{ llamacpp_active.ctx_size }})"
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 2. Expand paths
+# ------------------------------------------------------------------
+- name: Expand model directory path
+  ansible.builtin.set_fact:
+    llamacpp_service_model_dir_expanded: "{{ llamacpp_model_dir | expanduser }}"
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 3. Ensure directories exist
+# ------------------------------------------------------------------
+- name: Ensure model directory exists
+  ansible.builtin.file:
+    path: "{{ llamacpp_service_model_dir_expanded }}"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 4. Pull container image
+# ------------------------------------------------------------------
+- name: Pull llama.cpp Vulkan container image
+  ansible.builtin.command:
+    cmd: "podman pull {{ llamacpp_image }}"
+  become: false
+  register: llamacpp_service_image_pull
+  changed_when: "'Writing' in llamacpp_service_image_pull.stdout or 'Storing' in llamacpp_service_image_pull.stdout"
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 5. Download GGUF model files
+# ------------------------------------------------------------------
+- name: Ensure pip is installed
+  ansible.builtin.package:
+    name: python3-pip
+    state: present
+  become: true
+  tags:
+    - llamacpp
+
+- name: Ensure huggingface-hub is available
+  ansible.builtin.pip:
+    name: "huggingface-hub"
+    state: present
+    extra_args: "--user"
+  become: false
+  tags:
+    - llamacpp
+
+- name: Resolve hf CLI path
+  ansible.builtin.set_fact:
+    llamacpp_service_hf_cli: "{{ ansible_facts['env']['HOME'] }}/.local/bin/hf"
+  tags:
+    - llamacpp
+
+- name: Resolve model base directory
+  ansible.builtin.set_fact:
+    llamacpp_service_repo_dir: "{{ llamacpp_active.repo | regex_replace('/', '_') }}"
+    llamacpp_service_model_base: "{{ llamacpp_service_model_dir_expanded }}/{{ llamacpp_active.repo | regex_replace('/', '_') }}"
+  tags:
+    - llamacpp
+
+- name: Download GGUF model from Hugging Face
+  ansible.builtin.command:
+    cmd: >-
+      {{ llamacpp_service_hf_cli }} download {{ llamacpp_active.repo }}
+      --local-dir {{ llamacpp_service_model_base }}
+      --include "{{ llamacpp_active.include }}"
+      {% if hf_token %}--token {{ hf_token }}{% endif %}
+  become: false
+  register: llamacpp_service_download
+  changed_when: "'Fetching' in (llamacpp_service_download.stderr | default(''))"
+  no_log: "{{ hf_token | default('') | length > 0 }}"
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 6. Deploy Quadlet unit
+# ------------------------------------------------------------------
+- name: Ensure systemd user Quadlet directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_user_dir }}/.config/containers/systemd"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - llamacpp
+
+- name: Deploy llama.cpp Quadlet container unit file
+  ansible.builtin.template:
+    src: llamacpp-server.container.j2
+    dest: "{{ ansible_user_dir }}/.config/containers/systemd/{{ llamacpp_container_name }}.container"
+    mode: "0600"
+  become: false
+  no_log: "{{ (hf_token | default('') | length > 0) or (llamacpp_api_key_enabled | bool) }}"
+  notify:
+    - Reload systemd user daemon
+    - Restart llamacpp service
+  tags:
+    - llamacpp
+
+- name: Flush handlers to apply Quadlet changes
+  ansible.builtin.meta: flush_handlers
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 7. Enable and start service
+# ------------------------------------------------------------------
+- name: Enable and start llama.cpp service
+  ansible.builtin.systemd:
+    name: "{{ llamacpp_container_name }}"
+    state: started
+    enabled: true
+    scope: user
+  become: false
+  when: llamacpp_enabled | bool
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 8. Firewall
+# ------------------------------------------------------------------
+- name: Open llama.cpp port in firewall
+  ansible.posix.firewalld:
+    port: "{{ llamacpp_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  become: true
+  when:
+    - firewall_open_llamacpp_port | bool
+    - llamacpp_enabled | bool
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 9. Health check
+# ------------------------------------------------------------------
+- name: Wait for llama.cpp API to become available
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ llamacpp_port }}/v1/models"
+    method: GET
+    return_content: false
+    status_code: 200
+  become: false
+  register: llamacpp_service_health
+  until: llamacpp_service_health.status == 200
+  retries: 60
+  delay: 15
+  when: llamacpp_enabled | bool
+  tags:
+    - llamacpp
+
+# ------------------------------------------------------------------
+# 10. Display info
+# ------------------------------------------------------------------
+- name: Display llama.cpp service information
+  ansible.builtin.debug:
+    msg: |
+      llama.cpp server is running as a systemd user service (Vulkan backend).
+
+      Profile    : {{ llamacpp_model_profile }}
+      Service    : {{ llamacpp_container_name }}
+      Image      : {{ llamacpp_image }}
+      Model      : {{ llamacpp_active.repo }} ({{ llamacpp_active.file }})
+      API        : http://{{ llamacpp_host }}:{{ llamacpp_port }}/v1
+      Context    : {{ llamacpp_active.ctx_size }} tokens
+      Backend    : Vulkan (RADV) — bypasses ROCm/HIP hang on gfx1151
+
+      Manage with:
+        systemctl --user status {{ llamacpp_container_name }}
+        systemctl --user restart {{ llamacpp_container_name }}
+        journalctl --user -u {{ llamacpp_container_name }} -f
+
+      Test:
+        curl http://localhost:{{ llamacpp_port }}/v1/models
+  when: llamacpp_enabled | bool
+  tags:
+    - llamacpp
