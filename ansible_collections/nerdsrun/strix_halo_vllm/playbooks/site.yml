@@ -1,5 +1,5 @@
 ---
-- name: "Strix Halo vLLM - Full Deployment"
+- name: "Strix Halo - Full Deployment"
   hosts: all
   gather_facts: true
   roles:
@@ -9,7 +9,10 @@
       when: strix_halo_mode in ['toolbox', 'both']
     - role: nerdsrun.strix_halo_vllm.podman_service
       when: strix_halo_mode in ['service', 'both']
+    - role: nerdsrun.strix_halo_vllm.llamacpp_service
+      when: strix_halo_mode == 'llamacpp'
     - role: nerdsrun.strix_halo_vllm.model_cache
+      when: strix_halo_mode != 'llamacpp'
     - role: nerdsrun.strix_halo_vllm.openwebui_ui
       when: ui_enabled | default(false) | bool
     - role: nerdsrun.strix_halo_vllm.verify

@@ -4,7 +4,7 @@
 # Override any role default here to customize behavior for your environment.
 # Refer to docs/VARIABLES.md for the complete variable reference.
 
-# Deployment mode: "toolbox" | "service" | "both"
+# Deployment mode: "toolbox" | "service" | "both" | "llamacpp"
 strix_halo_mode: "toolbox"
 
 # Kernel tuning

@@ -5,3 +5,7 @@ __pycache__/
 *.retry
 benchmark_results/
 inventory/hosts.yml
+
+# Claude code ignores
+CLAUDE.md
+.claude/

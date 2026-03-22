@@ -132,7 +132,7 @@
 # 5. VLLM Service checks
 # ==================================================================
 - name: VLLM service verification
-  when: vllm_enabled | bool or strix_halo_mode in ['service', 'both']
+  when: strix_halo_mode in ['service', 'both']
   block:
     - name: Check vLLM container is running
       ansible.builtin.command:
@@ -198,6 +198,7 @@
         timeout: 120
       register: verify_vllm_chat
       ignore_errors: true
+      when: verify_vllm_models.status | default(0) == 200
 
     - name: Record chat completions result
       ansible.builtin.set_fact:
@@ -232,6 +233,112 @@
       when: >-
         (verify_vllm_running.stdout | default('') | trim) != 'running'
         or verify_vllm_models.status | default(0) != 200
+
+# ==================================================================
+# 5b. llama.cpp Service checks
+# ==================================================================
+- name: Llama.cpp service verification
+  when: strix_halo_mode == 'llamacpp'
+  block:
+    - name: Check llama.cpp container is running
+      ansible.builtin.command:
+        cmd: "podman container inspect --format '{%raw%}{{ .State.Status }}{%endraw%}' {{ llamacpp_container_name }}"
+      register: verify_llamacpp_running
+      changed_when: false
+      ignore_errors: true
+
+    - name: Record llama.cpp container status
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'llama.cpp container running',
+            'passed': (verify_llamacpp_running.stdout | default('') | trim) == 'running',
+            'detail': ((verify_llamacpp_running.stdout | default('') | trim) == 'running')
+                      | ternary('running', 'Status: ' + (verify_llamacpp_running.stdout | default('not found') | trim))
+          }] }}
+
+    - name: Build llama.cpp API headers
+      ansible.builtin.set_fact:
+        verify_llamacpp_headers: >-
+          {{ {'Content-Type': 'application/json'}
+             | combine((llamacpp_api_key_enabled | default(false) | bool)
+               | ternary({'Authorization': 'Bearer ' + llamacpp_api_key_value | default('local-dev-key')}, {}))
+          }}
+
+    - name: GET /v1/models from llama.cpp
+      ansible.builtin.uri:
+        url: "http://localhost:{{ llamacpp_port }}/v1/models"
+        method: GET
+        headers: "{{ verify_llamacpp_headers }}"
+        return_content: true
+        status_code: [200]
+        timeout: 30
+      register: verify_llamacpp_models
+      ignore_errors: true
+
+    - name: Record llama.cpp /v1/models result
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'llama.cpp /v1/models HTTP 200',
+            'passed': verify_llamacpp_models.status | default(0) == 200,
+            'detail': (verify_llamacpp_models.status | default(0) == 200)
+                      | ternary('OK', 'FAILED - HTTP ' + (verify_llamacpp_models.status | default('N/A') | string))
+          }] }}
+
+    - name: POST /v1/chat/completions smoke test (llama.cpp)
+      ansible.builtin.uri:
+        url: "http://localhost:{{ llamacpp_port }}/v1/chat/completions"
+        method: POST
+        headers: "{{ verify_llamacpp_headers }}"
+        body_format: json
+        body:
+          model: "{{ (verify_llamacpp_models.json.data | default([{'id': 'unknown'}]) | first).id }}"
+          messages:
+            - role: user
+              content: "Say hello in one word."
+          max_tokens: 16
+          temperature: 0
+        return_content: true
+        status_code: [200]
+        timeout: 120
+      register: verify_llamacpp_chat
+      ignore_errors: true
+      when: verify_llamacpp_models.status | default(0) == 200
+
+    - name: Record llama.cpp chat completions result
+      ansible.builtin.set_fact:
+        verify_results: >-
+          {{ verify_results + [{
+            'check': 'llama.cpp chat completions',
+            'passed': (verify_llamacpp_chat.status | default(0) == 200) and (verify_llamacpp_chat.json.choices | default([]) | length > 0),
+            'detail': ((verify_llamacpp_chat.status | default(0) == 200) and (verify_llamacpp_chat.json.choices | default([]) | length > 0))
+                      | ternary('OK', 'FAILED - HTTP ' + (verify_llamacpp_chat.status | default('N/A') | string))
+          }] }}
+
+    - name: Fetch llama.cpp logs on failure
+      ansible.builtin.command:
+        cmd: "podman logs --tail {{ verify_log_lines }} {{ llamacpp_container_name }}"
+      register: verify_llamacpp_logs
+      changed_when: false
+      ignore_errors: true
+      when: >-
+        (verify_llamacpp_running.stdout | default('') | trim) != 'running'
+        or verify_llamacpp_models.status | default(0) != 200
+
+    - name: Display llama.cpp troubleshooting
+      ansible.builtin.debug:
+        msg: |
+          === llama.cpp Troubleshooting ===
+          Container: {{ llamacpp_container_name }}
+          Logs: {{ verify_llamacpp_logs.stdout | default('(no logs)') }}
+          Hints:
+            - systemctl --user restart {{ llamacpp_container_name }}
+            - podman logs {{ llamacpp_container_name }}
+            - ss -tlnp | grep {{ llamacpp_port }}
+      when: >-
+        (verify_llamacpp_running.stdout | default('') | trim) != 'running'
+        or verify_llamacpp_models.status | default(0) != 200
 
 # ==================================================================
 # 6. Open WebUI check
@@ -280,7 +387,7 @@
   ansible.builtin.debug:
     msg: |
       ======================================================================
-                 Strix Halo vLLM Verification Summary
+              Strix Halo Deployment Verification Summary
       ======================================================================
       {% for r in verify_results %}
       {{ '[PASS]' if r.passed else '[FAIL]' }}  {{ r.check }} - {{ r.detail }}

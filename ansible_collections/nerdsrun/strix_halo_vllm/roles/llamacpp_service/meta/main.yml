@@ -1,0 +1,27 @@
+---
+galaxy_info:
+  role_name: llamacpp_service
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Run llama.cpp with Vulkan backend as a persistent Podman container managed
+    by systemd Quadlet on AMD Strix Halo (gfx1151). Serves GGUF models via an
+    OpenAI-compatible API endpoint. Uses Vulkan to work around ROCm/HIP hang
+    with Qwen 3.5 models.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - amd
+    - gpu
+    - llama_cpp
+    - vulkan
+    - podman
+    - systemd
+    - strix_halo
+
+dependencies:
+  - role: nerdsrun.strix_halo_vllm.host_prereqs

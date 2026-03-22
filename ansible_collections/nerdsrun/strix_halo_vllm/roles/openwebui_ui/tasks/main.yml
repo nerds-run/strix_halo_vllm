@@ -6,6 +6,18 @@
 # ------------------------------------------------------------------
 # UI UP tasks
 # ------------------------------------------------------------------
+- name: Resolve backend API URL based on deployment mode
+  ansible.builtin.set_fact:
+    openwebui_openai_api_base_url: >-
+      {{ openwebui_openai_api_base_url
+         if (openwebui_openai_api_base_url | default('') | length > 0)
+         else ('http://127.0.0.1:' + (llamacpp_port | default(8080) | string) + '/v1')
+         if (strix_halo_mode | default('service') == 'llamacpp')
+         else ('http://127.0.0.1:' + (vllm_port | default(8000) | string) + '/v1') }}
+  when: ui_enabled | bool
+  tags:
+    - ui
+
 - name: Open WebUI deployment block
   when: ui_enabled | bool
   become: false
@@ -18,12 +30,18 @@
       register: openwebui_ui_pull
       changed_when: "'Writing' in openwebui_ui_pull.stdout or 'Storing' in openwebui_ui_pull.stdout"
 
+    - name: Check if data volume exists
+      ansible.builtin.command:
+        cmd: "podman volume exists {{ openwebui_data_volume }}"
+      register: openwebui_ui_vol_exists
+      changed_when: false
+      failed_when: false
+
     - name: Create data volume if it does not exist
       ansible.builtin.command:
         cmd: "podman volume create {{ openwebui_data_volume }}"
-      register: openwebui_ui_vol_create
-      changed_when: openwebui_ui_vol_create.rc == 0
-      failed_when: false
+      when: openwebui_ui_vol_exists.rc != 0
+      changed_when: true
 
     - name: Check if Open WebUI container already exists
       ansible.builtin.command:
@@ -55,6 +73,8 @@
           -v {{ openwebui_data_volume }}:/app/backend/data
           -e OPENAI_API_BASE_URL={{ openwebui_ui_resolved_api_url }}
           -e OPENAI_API_KEY={{ openwebui_openai_api_key }}
+          -e ENABLE_OPENAI_API=true
+          -e ENABLE_OLLAMA_API=true
           {% if not (openwebui_auth_enabled | bool) %}-e WEBUI_AUTH=False{% endif %}
           --restart unless-stopped
           {{ openwebui_image }}
@@ -89,7 +109,7 @@
           Open WebUI is running.
 
           URL        : http://localhost:{{ openwebui_port }}
-          vLLM API   : {{ openwebui_ui_resolved_api_url }}
+          Backend API: {{ openwebui_ui_resolved_api_url }}
           Container  : {{ openwebui_container_name }}
 
           On first access, create an admin account (local only).

@@ -1,0 +1,83 @@
+---
+# ==========================================================================
+# llamacpp_service defaults
+# ==========================================================================
+# Container image: llama.cpp with Vulkan (RADV) backend for Strix Halo.
+# Uses Vulkan instead of ROCm/HIP to work around the Qwen 3.5 hang bug
+# (https://github.com/ROCm/ROCm/issues/6027).
+llamacpp_image: "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv"
+llamacpp_container_name: "llamacpp-server"
+llamacpp_enabled: true
+llamacpp_host: "0.0.0.0"
+llamacpp_port: 8080
+
+# --------------------------------------------------------------------------
+# Model profiles — select with llamacpp_model_profile
+# --------------------------------------------------------------------------
+# big:   Qwen3.5-122B-A10B — most powerful, reasoning/vision/coding (~77GB, ~22 tok/s)
+# coder: Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
+# fast:  Qwen3.5-35B-A3B — fast general + vision (~20GB, ~50-55 tok/s)
+llamacpp_model_profile: "big"
+
+llamacpp_model_profiles:
+  big:
+    repo: "unsloth/Qwen3.5-122B-A10B-GGUF"
+    file: "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf"
+    include: "*UD-Q4_K_XL*"
+    ctx_size: 16384
+    temp: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    jinja: false
+    repeat_penalty: 0
+  coder:
+    repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF"
+    file: "UD-Q4_K_XL/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf"
+    include: "*UD-Q4_K_XL*"
+    ctx_size: 32768
+    temp: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 1.05
+  fast:
+    repo: "unsloth/Qwen3.5-35B-A3B-GGUF"
+    file: "UD-Q4_K_XL/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
+    include: "*UD-Q4_K_XL*"
+    ctx_size: 32768
+    temp: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    jinja: false
+    repeat_penalty: 1.05
+
+llamacpp_model_dir: "~/models"
+
+# --------------------------------------------------------------------------
+# Shared inference flags (apply to all profiles)
+# --------------------------------------------------------------------------
+llamacpp_ngl: 999
+llamacpp_flash_attn: true
+llamacpp_no_mmap: true
+llamacpp_batch_size: 256
+llamacpp_thinking_enabled: true
+llamacpp_extra_args: []
+
+# KV cache quantization (set to q8_0 or q4_0 for longer context windows)
+llamacpp_cache_type_k: ""
+llamacpp_cache_type_v: ""
+
+# API key (disabled by default — llama.cpp has no built-in auth)
+llamacpp_api_key_enabled: false
+llamacpp_api_key_value: "local-dev-key"
+
+# Networking
+firewall_open_llamacpp_port: false
+
+# Shared variables (duplicated from host_prereqs to allow standalone use)
+strix_halo_target_user: "{{ ansible_user_id }}"
+huggingface_cache_dir: "~/.cache/huggingface"
+hf_token: ""

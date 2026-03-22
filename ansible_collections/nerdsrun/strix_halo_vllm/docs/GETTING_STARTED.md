@@ -1,6 +1,6 @@
 # Getting Started
 
-Step-by-step guide to deploy vLLM on AMD Strix Halo hardware.
+Step-by-step guide to deploy LLM inference on AMD Strix Halo hardware. Supports two backends: **vLLM** (ROCm) and **llama.cpp** (Vulkan).
 
 ---
 
@@ -133,7 +133,7 @@ $EDITOR inventory/group_vars/all.yml
 
 ```yaml
 ---
-strix_halo_mode: "toolbox"     # or "service" or "both"
+strix_halo_mode: "llamacpp"    # or "toolbox", "service", "both"
 ```
 
 ### Recommended Configuration
@@ -157,7 +157,7 @@ firewall_open_ui_port: true
 
 | Variable | Description |
 |---|---|
-| `strix_halo_mode` | `toolbox` (interactive), `service` (systemd), or `both` |
+| `strix_halo_mode` | `toolbox`, `service`, `both` (vLLM/ROCm), or `llamacpp` (Vulkan) |
 | `strix_halo_kernel_args_enabled` | Tune kernel for GPU memory (recommended) |
 | `ui_enabled` | Deploy Open WebUI chat frontend |
 | `vllm_primary_model` | Model to serve in service mode |
@@ -172,25 +172,29 @@ See [Variables Reference](VARIABLES.md) for all options.
 Choose your deployment mode:
 
 ```bash
-# Interactive toolbox (development / experimentation)
-mise run deploy:toolbox
+# --- llama.cpp (Vulkan) --- recommended for Qwen 3.5 models
+mise run deploy:llamacpp          # 122B model (default, ~22 tok/s)
+mise run deploy:llamacpp:coder    # Coder 30B (~83 tok/s)
+mise run deploy:llamacpp:fast     # Fast 35B (~59 tok/s)
 
-# Persistent vLLM API server (production)
-mise run deploy:service
+# --- vLLM (ROCm) ---
+mise run deploy:toolbox           # Interactive toolbox
+mise run deploy:service           # Persistent systemd service
 
-# Both modes
-mise run deploy:all
+# --- Full deployment ---
+mise run deploy:all               # site.yml (mode-dependent)
 ```
 
 ### What the Playbook Does
 
 1. **host_prereqs** -- Verifies hardware, groups, devices; installs podman/toolbox
 2. **kernel_tuning** -- Adds GPU memory kernel parameters (if enabled); reboots if needed
-3. **toolbox_mode** -- Pulls the vLLM image and creates a toolbox container; opens firewall port if enabled
-4. **model_cache** -- Downloads model weights via aria2 or huggingface-cli
-5. **podman_service** -- Creates a systemd Quadlet for the vLLM server (service mode)
-6. **openwebui_ui** -- Deploys Open WebUI container (if enabled)
-7. **verify** -- Runs post-deployment health checks
+3. **toolbox_mode** -- Pulls vLLM image and creates toolbox (toolbox/both modes)
+4. **podman_service** -- Creates systemd Quadlet for vLLM (service/both modes)
+5. **llamacpp_service** -- Downloads GGUF model, creates systemd Quadlet for llama.cpp (llamacpp mode)
+6. **model_cache** -- Downloads HuggingFace model weights (skipped in llamacpp mode)
+7. **openwebui_ui** -- Deploys Open WebUI container (if enabled, auto-connects to active backend)
+8. **verify** -- Runs post-deployment health checks
 
 ---
 
@@ -218,68 +222,50 @@ curl http://localhost:8000/v1/models \
 
 ---
 
-## Step 8 -- Start Using vLLM
+## Step 8 -- Start Using Your Model
 
-### Toolbox Mode
+### llama.cpp Mode
 
-Enter the toolbox and launch any of the prefetched models:
-
-```bash
-toolbox enter vllm
-```
-
-**Qwen3-Coder-30B MoE (4-bit) -- Fastest, ~35 tok/s:**
-```bash
-PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1 \
-vllm serve btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-4bit \
-  --enforce-eager \
-  --api-key local-dev-key
-```
-
-**Qwen3-Coder-30B MoE (8-bit) -- Balanced, ~25 tok/s:**
-```bash
-PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1 \
-vllm serve btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-8bit \
-  --enforce-eager \
-  --api-key local-dev-key
-```
-
-**Qwen3-Next-80B MoE (4-bit) -- Best quality, ~18 tok/s:**
-```bash
-PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1 \
-vllm serve dazipe/Qwen3-Next-80B-A3B-Instruct-GPTQ-Int4A16 \
-  --enforce-eager \
-  --api-key local-dev-key
-```
-
-**Qwen3-14B Dense (AWQ) -- Smallest, ~12 tok/s:**
-```bash
-PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1 \
-vllm serve Qwen/Qwen3-14B-AWQ \
-  --enforce-eager \
-  --api-key local-dev-key
-```
-
-> The first request after launch will be slower as TunableOp benchmarks kernel variants. Subsequent requests use cached results.
-
-### Service Mode
-
-The vLLM server starts automatically via systemd:
+The llama.cpp server starts automatically via systemd after deployment:
 
 ```bash
 # Check status
-systemctl --user status vllm-server
+systemctl --user status llamacpp-server
 
 # View logs
-mise run logs:vllm
+mise run logs:llamacpp
 
-# Restart
-systemctl --user restart vllm-server
+# Switch model profiles
+mise run deploy:llamacpp          # 122B (default)
+mise run deploy:llamacpp:coder    # Coder 30B
+mise run deploy:llamacpp:fast     # Fast 35B
+
+# Test the API
+curl http://localhost:8080/v1/models
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"max_tokens":50}'
+```
+
+### vLLM Toolbox Mode
+
+```bash
+toolbox enter vllm
+PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=1 \
+vllm serve btbtyler09/Qwen3-Coder-30B-A3B-Instruct-gptq-8bit \
+  --enforce-eager --api-key local-dev-key
+```
+
+### vLLM Service Mode
+
+```bash
+systemctl --user status vllm-server
+mise run logs:vllm
 ```
 
 ### Open WebUI
 
-Browse to `http://<host>:3000`. Select a model from the dropdown and start chatting. If models don't appear, ensure vLLM is running and try refreshing or restarting the Open WebUI container:
+Browse to `http://<host>:3000`. The UI auto-connects to whichever backend is deployed (vLLM on port 8000 or llama.cpp on port 8080). If models don't appear, restart the container:
 
 ```bash
 podman restart open-webui

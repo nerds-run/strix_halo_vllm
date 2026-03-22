@@ -8,11 +8,14 @@ strix_halo_devices:
 strix_halo_groups:
   - video
   - render
-vllm_enabled: false
 vllm_port: 8000
 vllm_api_key_enabled: true
 vllm_api_key_value: "local-dev-key"
 vllm_container_name: "vllm-server"
+llamacpp_port: 8080
+llamacpp_container_name: "llamacpp-server"
+llamacpp_api_key_enabled: false
+llamacpp_api_key_value: "local-dev-key"
 ui_enabled: false
 openwebui_port: 3000
 openwebui_container_name: "open-webui"

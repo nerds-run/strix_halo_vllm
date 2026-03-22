@@ -11,6 +11,7 @@
         - "{{ playbook_dir }}/../../roles/kernel_tuning/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/toolbox_mode/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/podman_service/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/llamacpp_service/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/model_cache/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/openwebui_ui/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/verify/tasks/main.yml"
@@ -25,6 +26,26 @@
       loop_control:
         label: "{{ item.item }}"
 
+    - name: "Verify llamacpp_service role structure"
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ playbook_dir }}/../../roles/llamacpp_service/defaults/main.yml"
+        - "{{ playbook_dir }}/../../roles/llamacpp_service/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/llamacpp_service/templates/llamacpp-server.container.j2"
+        - "{{ playbook_dir }}/../../roles/llamacpp_service/handlers/main.yml"
+        - "{{ playbook_dir }}/../../roles/llamacpp_service/meta/main.yml"
+      register: _llamacpp_files
+
+    - name: "Assert all llamacpp_service files exist"
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+        fail_msg: "Missing llamacpp_service file: {{ item.item }}"
+      loop: "{{ _llamacpp_files.results }}"
+      loop_control:
+        label: "{{ item.item | basename }}"
+
     - name: "Verify playbook syntax"
       ansible.builtin.command:
         cmd: "ansible-playbook --syntax-check {{ item }}"
@@ -32,6 +53,7 @@
         - "{{ playbook_dir }}/../../playbooks/site.yml"
         - "{{ playbook_dir }}/../../playbooks/toolbox.yml"
         - "{{ playbook_dir }}/../../playbooks/service.yml"
+        - "{{ playbook_dir }}/../../playbooks/llamacpp.yml"
         - "{{ playbook_dir }}/../../playbooks/verify.yml"
         - "{{ playbook_dir }}/../../playbooks/uninstall.yml"
         - "{{ playbook_dir }}/../../playbooks/ui.yml"

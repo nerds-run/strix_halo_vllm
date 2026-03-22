@@ -110,6 +110,18 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/toolbox.yml -i $INVENTORY"
 description = "Deploy the vLLM inference service"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/service.yml -i $INVENTORY"
 
+[tasks."deploy:llamacpp"]
+description = "Deploy llama.cpp Vulkan service — default profile (big: Qwen3.5-122B-A10B)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY"
+
+[tasks."deploy:llamacpp:coder"]
+description = "Deploy llama.cpp — coder profile (Qwen3-Coder-30B-A3B, tool-use)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=coder"
+
+[tasks."deploy:llamacpp:fast"]
+description = "Deploy llama.cpp — fast profile (Qwen3.5-35B-A3B, general+vision)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=fast"
+
 [tasks."deploy:all"]
 description = "Run full deployment (toolbox + service + all components)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/site.yml -i $INVENTORY"
@@ -166,6 +178,26 @@ else
     podman logs -f "$CONTAINER"
   else
     echo "ERROR: No running vLLM service or container found."
+    exit 1
+  fi
+fi
+"""
+
+[tasks."logs:llamacpp"]
+description = "Tail llama.cpp service logs"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+if systemctl --user is-active --quiet llamacpp-server.service 2>/dev/null; then
+  echo "==> Tailing journalctl for llamacpp-server.service (user unit)..."
+  journalctl --user -u llamacpp-server.service -f --no-pager
+else
+  CONTAINER=$(podman ps --filter name=llamacpp --format '{{.Names}}' | head -n1)
+  if [ -n "$CONTAINER" ]; then
+    echo "==> Tailing podman logs for container: $CONTAINER"
+    podman logs -f "$CONTAINER"
+  else
+    echo "ERROR: No running llama.cpp service or container found."
     exit 1
   fi
 fi

@@ -6,7 +6,11 @@ openwebui_port: 3000
 openwebui_data_volume: "open-webui"
 openwebui_auth_enabled: true
 firewall_open_ui_port: false
-openwebui_openai_api_base_url: "http://127.0.0.1:8000/v1"
-openwebui_openai_api_key: "{{ vllm_api_key_value | default('local-dev-key') }}"
+# API base URL — auto-resolved in tasks based on strix_halo_mode.
+# Override here to point at a custom endpoint.
+# vLLM default: http://127.0.0.1:8000/v1
+# llama.cpp default: http://127.0.0.1:8080/v1
+openwebui_openai_api_base_url: ""
+openwebui_openai_api_key: "local-dev-key"
 openwebui_container_name: "open-webui"
 strix_halo_target_user: "{{ ansible_user_id }}"
