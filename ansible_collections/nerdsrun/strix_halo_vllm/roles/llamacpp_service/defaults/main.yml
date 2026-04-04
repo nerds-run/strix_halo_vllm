@@ -16,7 +16,7 @@ llamacpp_port: 8080
 # --------------------------------------------------------------------------
 # big:   Qwen3.5-122B-A10B — most powerful, reasoning/vision/coding (~77GB, ~22 tok/s)
 # coder: Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
-# fast:  Qwen3.5-35B-A3B — fast general + vision (~20GB, ~50-55 tok/s)
+# fast:  Qwen3.5-35B-A3B — fast reasoning/vision/coding (~20GB, ~50-55 tok/s)
 llamacpp_model_profile: "big"
 
 llamacpp_model_profiles:
@@ -24,7 +24,7 @@ llamacpp_model_profiles:
     repo: "unsloth/Qwen3.5-122B-A10B-GGUF"
     file: "UD-Q4_K_XL/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf"
     include: "*UD-Q4_K_XL*"
-    ctx_size: 16384
+    ctx_size: 131072
     temp: 0.6
     top_p: 0.95
     top_k: 20
@@ -46,12 +46,12 @@ llamacpp_model_profiles:
     repo: "unsloth/Qwen3.5-35B-A3B-GGUF"
     file: "UD-Q4_K_XL/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
     include: "*UD-Q4_K_XL*"
-    ctx_size: 32768
+    ctx_size: 131072
     temp: 0.6
     top_p: 0.95
     top_k: 20
     min_p: 0.0
-    jinja: false
+    jinja: true
     repeat_penalty: 1.05
 
 llamacpp_model_dir: "~/models"
@@ -67,8 +67,8 @@ llamacpp_thinking_enabled: true
 llamacpp_extra_args: []
 
 # KV cache quantization (set to q8_0 or q4_0 for longer context windows)
-llamacpp_cache_type_k: ""
-llamacpp_cache_type_v: ""
+llamacpp_cache_type_k: "q8_0"
+llamacpp_cache_type_v: "q8_0"
 
 # API key (disabled by default — llama.cpp has no built-in auth)
 llamacpp_api_key_enabled: false
