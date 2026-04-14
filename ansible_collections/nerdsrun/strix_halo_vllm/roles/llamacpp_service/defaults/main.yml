@@ -112,6 +112,16 @@ llamacpp_model_profiles:
     #   and --reasoning-parser are NOT supported by llama-server. llama.cpp
     #   drives tool calls through --jinja + the chat template embedded in
     #   the GGUF; reasoning blocks come out natively in the assistant stream.
+    # Caching strategy:
+    #   * --cache-reuse 256 — automatic prefix-KV reuse across requests that
+    #     share a prefix ≥256 tokens. Pure in-memory, capped by --cache-ram.
+    #   * --cache-ram 2048 — cap the in-memory prompt-cache pool at 2 GB
+    #     (default 8 GB). Prevents the cache from growing into OOM territory.
+    #   * --slot-save-path /models/slot-cache — directory for EXPLICIT slot
+    #     save/restore via the API (POST /slots/{id}?action=save|restore).
+    #     Not used by cache-reuse (which is RAM-only). Left wired up so a
+    #     future client-side helper can call ?action=save periodically to
+    #     persist slot state across service restarts / OOM crashes.
     repo: "unsloth/MiniMax-M2.7-GGUF"
     file: "UD-IQ4_XS/MiniMax-M2.7-UD-IQ4_XS-00001-of-00004.gguf"
     include: "*UD-IQ4_XS*"
@@ -123,6 +133,10 @@ llamacpp_model_profiles:
     jinja: true
     repeat_penalty: 0
     batch_size: 4096
+    # Physical ubatch 1024 (up from llama.cpp's default 512) — strix-halo-guide
+    # benchmarks +22% pp128 on Vulkan/RADV for gfx1151. Pure prefill lever,
+    # decode is unaffected.
+    ubatch_size: 1024
     cache_type_k: "q4_0"
     cache_type_v: "q4_0"
     extra_args:
@@ -142,9 +156,21 @@ llamacpp_ngl: 999
 llamacpp_flash_attn: true
 llamacpp_no_mmap: true
 llamacpp_batch_size: 512
+# Physical (micro) batch size — 0 lets llama-server pick the default (currently 512).
+# Raising to 1024+ improves prefill throughput on Vulkan/RADV at the cost of some
+# GPU scratch memory. Per-profile override via llamacpp_model_profiles.<p>.ubatch_size.
+llamacpp_ubatch_size: 0
 llamacpp_thinking_enabled: true
 llamacpp_log_disable: true
 llamacpp_extra_args: []
+
+# Container environment variables rendered as Environment=KEY=VAL lines in the
+# Quadlet unit. Add driver/runtime knobs here without touching the template.
+# Measured no-ops on gfx1151 + MiniMax-M2.7 (left as examples):
+#   RADV_PERFTEST: "nogttspill"    # neutral — try under memory pressure
+#   RADV_PERFTEST: "gpl"           # faster shader pipeline creation (cold start)
+# Per-profile override via llamacpp_model_profiles.<p>.env (merged over this).
+llamacpp_env: {}
 
 # KV cache quantization (set to q8_0 or q4_0 for longer context windows)
 llamacpp_cache_type_k: "q8_0"

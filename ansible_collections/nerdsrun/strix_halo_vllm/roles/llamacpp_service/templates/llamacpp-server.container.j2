@@ -14,6 +14,9 @@ ContainerName={{ llamacpp_container_name }}
 AddDevice=/dev/dri
 PublishPort={{ llamacpp_port }}:8080
 Volume={{ llamacpp_service_model_dir_expanded }}:/models:Z
+{% for key, value in (llamacpp_env | default({})).items() %}
+Environment={{ key }}={{ value }}
+{% endfor -%}
 Exec=llama-server \
   -m /models/{{ llamacpp_service_repo_dir }}/{{ llamacpp_active.file }} \
   -ngl {{ llamacpp_ngl }} \
@@ -28,6 +31,10 @@ Exec=llama-server \
 {% endif -%}
   --ctx-size {{ llamacpp_active.ctx_size }} \
   -b {{ llamacpp_active.batch_size | default(llamacpp_batch_size) }} \
+{% set _ubatch = llamacpp_active.ubatch_size | default(llamacpp_ubatch_size) | default(0) | int %}
+{% if _ubatch > 0 %}
+  -ub {{ _ubatch }} \
+{% endif -%}
   --host 0.0.0.0 --port 8080 \
   --temp {{ llamacpp_active.temp }} --top-p {{ llamacpp_active.top_p }} --top-k {{ llamacpp_active.top_k }} --min-p {{ llamacpp_active.min_p }} \
 {% if llamacpp_active.repeat_penalty | default(0) | float > 0 %}
