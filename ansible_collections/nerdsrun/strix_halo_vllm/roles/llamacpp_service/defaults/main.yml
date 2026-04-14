@@ -14,9 +14,13 @@ llamacpp_port: 8080
 # --------------------------------------------------------------------------
 # Model profiles — select with llamacpp_model_profile
 # --------------------------------------------------------------------------
-# big:   Qwen3.5-122B-A10B — most powerful, reasoning/vision/coding (~77GB, ~22 tok/s)
-# coder: Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
-# fast:  Qwen3.5-35B-A3B — fast reasoning/vision/coding (~20GB, ~50-55 tok/s)
+# big:      Qwen3.5-122B-A10B — most powerful, reasoning/vision/coding (~77GB, ~22 tok/s)
+# coder:    Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
+# fast:     Qwen3.5-35B-A3B — fast reasoning/vision/coding (~20GB, ~50-55 tok/s)
+# nemotron: Nemotron-3-Nano-30B-A3B — hybrid Mamba-Transformer MoE, coding/agentic/reasoning (~20GB)
+# super:    Nemotron-3-Super-120B-A12B — hybrid LatentMoE (Mamba-2+MoE+Attn), reasoning/planning (~84GB)
+#           WARNING: ~84GB at Q4 leaves minimal headroom on 128GB — do not run alongside other models
+#           NOTE: Requires llama.cpp build ≥8351 (mamba-base.cpp assertion fix, issue #20570)
 llamacpp_model_profile: "big"
 
 llamacpp_model_profiles:
@@ -53,6 +57,48 @@ llamacpp_model_profiles:
     min_p: 0.0
     jinja: true
     repeat_penalty: 1.05
+  nemotron:
+    # Hybrid Mamba-Transformer MoE (128 experts, 6 active per token)
+    # Requires llama.cpp build ≥8351 — earlier builds crash with an assertion
+    # in mamba-base.cpp (https://github.com/ggml-org/llama.cpp/issues/20570)
+    repo: "unsloth/Nemotron-3-Nano-30B-A3B-GGUF"
+    file: "Nemotron-3-Nano-30B-A3B-UD-Q4_K_XL.gguf"
+    include: "*UD-Q4_K_XL*"
+    ctx_size: 131072
+    temp: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 1.05
+    extra_args:
+      - "--reasoning-format deepseek"
+      - "--reasoning on"
+  super:
+    # Hybrid LatentMoE (Mamba-2 + MoE + Attention), Multi-Token Prediction
+    # 120B total / 12B active per token — requires ~84GB at Q4_K_XL
+    # WARNING: Leaves minimal headroom on 128GB — do not run alongside other models
+    # Requires llama.cpp build ≥8351 (mamba-base.cpp assertion fix, issue #20570)
+    # TODO: MTP (Multi-Token Prediction) layers may be in GGUF — enable with
+    #       --speculative-config flags once llama.cpp supports MTP for this arch
+    repo: "unsloth/Nemotron-3-Super-120B-A12B-GGUF"
+    file: "UD-Q3_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q3_K_XL-00001-of-00003.gguf"
+    include: "*UD-Q3_K_XL*"
+    ctx_size: 131072
+    temp: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 1.05
+    batch_size: 2048
+    cache_type_k: "q4_0"
+    cache_type_v: "q4_0"
+    extra_args:
+      - "--reasoning-format deepseek"
+      - "--reasoning auto"
+      - "--reasoning-budget 256"
+      - "-np 1"
 
 llamacpp_model_dir: "~/models"
 
@@ -62,8 +108,9 @@ llamacpp_model_dir: "~/models"
 llamacpp_ngl: 999
 llamacpp_flash_attn: true
 llamacpp_no_mmap: true
-llamacpp_batch_size: 256
+llamacpp_batch_size: 512
 llamacpp_thinking_enabled: true
+llamacpp_log_disable: true
 llamacpp_extra_args: []
 
 # KV cache quantization (set to q8_0 or q4_0 for longer context windows)

@@ -176,6 +176,8 @@ Choose your deployment mode:
 mise run deploy:llamacpp          # 122B model (default, ~22 tok/s)
 mise run deploy:llamacpp:coder    # Coder 30B (~83 tok/s)
 mise run deploy:llamacpp:fast     # Fast 35B (~59 tok/s)
+mise run deploy:llamacpp:nemotron # Nemotron Nano 30B (~95 tok/s, hybrid Mamba-Transformer)
+mise run deploy:llamacpp:super    # Nemotron Super 120B (~22 tok/s, needs llama.cpp ≥8351, ~84 GB)
 
 # --- vLLM (ROCm) ---
 mise run deploy:toolbox           # Interactive toolbox
@@ -239,6 +241,8 @@ mise run logs:llamacpp
 mise run deploy:llamacpp          # 122B (default)
 mise run deploy:llamacpp:coder    # Coder 30B
 mise run deploy:llamacpp:fast     # Fast 35B
+mise run deploy:llamacpp:nemotron # Nemotron Nano 30B
+mise run deploy:llamacpp:super    # Nemotron Super 120B
 
 # Test the API
 curl http://localhost:8080/v1/models
