@@ -52,6 +52,7 @@ mise run deploy:llamacpp:coder    # llama.cpp — Coder 30B profile
 mise run deploy:llamacpp:fast     # llama.cpp — Fast 35B profile
 mise run deploy:llamacpp:nemotron # llama.cpp — Nemotron Nano 30B profile
 mise run deploy:llamacpp:super    # llama.cpp — Nemotron Super 120B profile
+mise run deploy:llamacpp:minimax  # llama.cpp — MiniMax-M2.7 229B profile
 mise run deploy:all               # full site.yml deployment
 
 # 5. Verify
@@ -83,8 +84,11 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 | `fast` | Qwen3.5-35B-A3B | ~20 GB | 3B | ~59 | Fast general + vision |
 | `nemotron` | Nemotron-3-Nano-30B-A3B | ~20 GB | 3B | ~95 | Coding, agentic, reasoning |
 | `super` | Nemotron-3-Super-120B-A12B | ~84 GB | 12B | ~22 | Reasoning, planning, orchestration |
+| `minimax` | MiniMax-M2.7 (229B MoE) | ~108 GB | 10B | TBD | Long-context agentic, tool-use, reasoning |
 
 > **Note:** The `nemotron` and `super` profiles require llama.cpp build **≥8351** (fixes [ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570) — mamba-base.cpp assertion crash). Both are hybrid Mamba-Transformer architectures. The `super` profile uses ~84 GB at Q3_K_XL — do not run alongside other models on 128 GB systems.
+>
+> **MiniMax-M2.7:** Ships at UD-IQ4_XS (~108 GB) — the tightest fit on 128 GB unified memory. Do not run alongside other models. Uses `--tool-call-parser minimax_m2` and `--reasoning-parser minimax_m2_append_think`. Per [Unsloth docs](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF), do **NOT** run these GGUFs on CUDA 13.2 (produces gibberish) — this deployment uses Vulkan, so no action needed.
 
 ---
 
@@ -145,6 +149,7 @@ Open WebUI auto-connects to whichever backend is deployed. The container-to-cont
 | `mise run deploy:llamacpp:fast` | Deploy llama.cpp fast profile |
 | `mise run deploy:llamacpp:nemotron` | Deploy llama.cpp nemotron profile |
 | `mise run deploy:llamacpp:super` | Deploy llama.cpp super profile |
+| `mise run deploy:llamacpp:minimax` | Deploy llama.cpp minimax profile |
 | `mise run deploy:all` | Full deployment |
 | `mise run verify` | Run verification checks |
 | `mise run uninstall` | Remove all components |

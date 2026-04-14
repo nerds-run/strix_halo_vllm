@@ -66,7 +66,7 @@
 | `llamacpp_enabled` | bool | `true` | Enable the llama.cpp server |
 | `llamacpp_host` | string | `"0.0.0.0"` | llama.cpp bind address |
 | `llamacpp_port` | int | `8080` | llama.cpp listen port |
-| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `nemotron`, or `super` |
+| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `nemotron`, `super`, or `minimax` |
 | `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions (repo, file, include, sampling params, optional `batch_size`, `cache_type_k`, `cache_type_v`, `extra_args`) |
 | `llamacpp_model_dir` | string | `"~/models"` | Directory for GGUF model storage |
 | `llamacpp_ngl` | int | `999` | GPU layers to offload (999 = all) |

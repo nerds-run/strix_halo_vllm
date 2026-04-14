@@ -146,6 +146,7 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 | Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
 | Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~84 GB | Q3_K_XL | **~22** |
+| MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **TBD** |
 
 ### Vulkan-Specific Tuning
 
@@ -165,6 +166,20 @@ The `nemotron` and `super` profiles use NVIDIA's hybrid Mamba-Transformer archit
 
 - llama.cpp build **≥8351** — fixes a `mamba-base.cpp` assertion that crashes earlier builds ([ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570))
 - `super` needs ~84 GB resident at Q3_K_XL — do **not** run alongside other containerized models on a 128 GB system
+
+### MiniMax-M2.7 (minimax profile)
+
+MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at `UD-IQ4_XS` (~108 GB). This is the tightest fit in 128 GB unified memory — leave `strix_halo_mode: "llamacpp"` as the only active backend and do not run Open WebUI or other containerized models alongside it.
+
+**Launch params baked into the profile:**
+
+- `--temp 1.0 --top-p 0.95 --top-k 40` (MiniMax-recommended sampling)
+- `--jinja` (required for the model's chat template)
+- `--tool-call-parser minimax_m2` (structured tool-use output)
+- `--reasoning-parser minimax_m2_append_think` (appends `<think>` blocks to assistant replies)
+- `batch_size: 2048`, `cache_type_k/v: q4_0` — same tight-memory posture as the `super` profile
+
+**CUDA 13.2 warning:** [Unsloth's model card](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF) warns that running these GGUFs on CUDA 13.2 produces gibberish output. This deployment uses the Vulkan backend so that path is avoided, but be aware if you repoint the container image at a CUDA build.
 
 ### Context Size vs. Memory (122B model, 77GB)
 
@@ -245,6 +260,7 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 | Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | Q4_K_XL | **22.8** |
 | Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~84 GB | Q3_K_XL | **~22** |
+| MiniMax-M2.7 (229B) | MoE, 10B active | ~108 GB | UD-IQ4_XS | **TBD** |
 
 ### vLLM (ROCm/TheROCk, --enforce-eager + TunableOp)
 

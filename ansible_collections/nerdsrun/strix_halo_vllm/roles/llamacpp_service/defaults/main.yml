@@ -21,6 +21,9 @@ llamacpp_port: 8080
 # super:    Nemotron-3-Super-120B-A12B — hybrid LatentMoE (Mamba-2+MoE+Attn), reasoning/planning (~84GB)
 #           WARNING: ~84GB at Q4 leaves minimal headroom on 128GB — do not run alongside other models
 #           NOTE: Requires llama.cpp build ≥8351 (mamba-base.cpp assertion fix, issue #20570)
+# minimax:  MiniMax-M2.7 — 229B MoE / 10B active, long-context agentic + reasoning (~108GB)
+#           WARNING: ~108GB at UD-IQ4_XS — tightest fit on 128GB, do not run alongside other models
+#           NOTE: Vulkan backend only — do NOT use CUDA 13.2 (produces gibberish per Unsloth docs)
 llamacpp_model_profile: "big"
 
 llamacpp_model_profiles:
@@ -98,6 +101,29 @@ llamacpp_model_profiles:
       - "--reasoning-format deepseek"
       - "--reasoning auto"
       - "--reasoning-budget 256"
+      - "-np 1"
+  minimax:
+    # MiniMax-M2.7 — 229B MoE / 10B active per token
+    # UD-IQ4_XS weights alone are ~108GB — tightest fit in 128GB unified memory
+    # WARNING: Do not run alongside other containerized models on 128GB systems
+    # NOTE: Unsloth docs warn NOT to use CUDA 13.2 to run these GGUFs (gibberish output).
+    #       This deployment uses the Vulkan backend, so we're already safe.
+    repo: "unsloth/MiniMax-M2.7-GGUF"
+    file: "UD-IQ4_XS/MiniMax-M2.7-UD-IQ4_XS-00001-of-00004.gguf"
+    include: "*UD-IQ4_XS*"
+    ctx_size: 131072
+    temp: 1.0
+    top_p: 0.95
+    top_k: 40
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 0
+    batch_size: 2048
+    cache_type_k: "q4_0"
+    cache_type_v: "q4_0"
+    extra_args:
+      - "--tool-call-parser minimax_m2"
+      - "--reasoning-parser minimax_m2_append_think"
       - "-np 1"
 
 llamacpp_model_dir: "~/models"

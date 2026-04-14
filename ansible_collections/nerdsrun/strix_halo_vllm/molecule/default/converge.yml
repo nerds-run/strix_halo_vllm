@@ -63,11 +63,26 @@
               - "'big' in llamacpp_model_profiles"
               - "'coder' in llamacpp_model_profiles"
               - "'fast' in llamacpp_model_profiles"
+              - "'nemotron' in llamacpp_model_profiles"
+              - "'super' in llamacpp_model_profiles"
+              - "'minimax' in llamacpp_model_profiles"
               - "llamacpp_model_profiles.big.repo is defined"
               - "llamacpp_model_profiles.coder.jinja | bool"
               - "llamacpp_model_profiles.coder.repeat_penalty | float > 0"
               - "llamacpp_model_profile == 'big'"
             fail_msg: "llamacpp_service defaults are malformed"
+
+        - name: "Assert minimax profile has required MiniMax-M2.7 launch config"
+          ansible.builtin.assert:
+            that:
+              - "llamacpp_model_profiles.minimax.repo == 'unsloth/MiniMax-M2.7-GGUF'"
+              - "'UD-IQ4_XS' in llamacpp_model_profiles.minimax.file"
+              - "llamacpp_model_profiles.minimax.temp | float == 1.0"
+              - "llamacpp_model_profiles.minimax.top_p | float == 0.95"
+              - "llamacpp_model_profiles.minimax.top_k | int == 40"
+              - "llamacpp_model_profiles.minimax.jinja | bool"
+              - "llamacpp_model_profiles.minimax.extra_args | select('search', 'minimax_m2') | list | length >= 2"
+            fail_msg: "minimax profile is missing MiniMax-M2.7 required launch params"
 
         - name: "Assert profile fields are consistent"
           ansible.builtin.assert:

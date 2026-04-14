@@ -130,6 +130,10 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY 
 description = "Deploy llama.cpp — super profile (Nemotron-3-Super-120B-A12B, reasoning/planning)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=super"
 
+[tasks."deploy:llamacpp:minimax"]
+description = "Deploy llama.cpp — minimax profile (MiniMax-M2.7 229B/10B, agentic/long-context)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=minimax"
+
 [tasks."deploy:all"]
 description = "Run full deployment (toolbox + service + all components)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/site.yml -i $INVENTORY"
