@@ -174,10 +174,12 @@ MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at 
 **Launch params baked into the profile:**
 
 - `--temp 1.0 --top-p 0.95 --top-k 40` (MiniMax-recommended sampling)
-- `--jinja` (required for the model's chat template)
-- `--tool-call-parser minimax_m2` (structured tool-use output)
-- `--reasoning-parser minimax_m2_append_think` (appends `<think>` blocks to assistant replies)
+- `--jinja` (drives tool calling via the chat template embedded in the GGUF)
+- `--reasoning-format auto` (llama.cpp detects the model's reasoning block format)
 - `batch_size: 2048`, `cache_type_k/v: q4_0` — same tight-memory posture as the `super` profile
+- `-np 1` — single request slot; 108 GB model + KV cache leaves no room for concurrency
+
+> **Tool calling / reasoning parsers:** MiniMax's model card references `--tool-call-parser minimax_m2` and `--reasoning-parser minimax_m2_append_think`. Those are **vLLM** flags and crash `llama-server` with `invalid argument`. In llama.cpp, `--jinja` handles tool calls via the GGUF's chat template and `--reasoning-format auto` handles the reasoning output.
 
 **CUDA 13.2 warning:** [Unsloth's model card](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF) warns that running these GGUFs on CUDA 13.2 produces gibberish output. This deployment uses the Vulkan backend so that path is avoided, but be aware if you repoint the container image at a CUDA build.
 

@@ -81,7 +81,8 @@
               - "llamacpp_model_profiles.minimax.top_p | float == 0.95"
               - "llamacpp_model_profiles.minimax.top_k | int == 40"
               - "llamacpp_model_profiles.minimax.jinja | bool"
-              - "llamacpp_model_profiles.minimax.extra_args | select('search', 'minimax_m2') | list | length >= 2"
+              - "llamacpp_model_profiles.minimax.cache_type_k in ['q4_0', 'q8_0']"
+              - "llamacpp_model_profiles.minimax.cache_type_v in ['q4_0', 'q8_0']"
             fail_msg: "minimax profile is missing MiniMax-M2.7 required launch params"
 
         - name: "Assert profile fields are consistent"

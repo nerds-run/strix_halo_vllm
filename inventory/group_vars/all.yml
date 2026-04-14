@@ -18,3 +18,6 @@ firewall_open_vllm_port: true
 
 # Force-recreate toolbox on deploy
 strix_halo_toolbox_update: true
+
+# Log llama.cpp request timings (prompt/eval tok/s) to the journal
+llamacpp_log_disable: false

@@ -88,7 +88,7 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 
 > **Note:** The `nemotron` and `super` profiles require llama.cpp build **≥8351** (fixes [ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570) — mamba-base.cpp assertion crash). Both are hybrid Mamba-Transformer architectures. The `super` profile uses ~84 GB at Q3_K_XL — do not run alongside other models on 128 GB systems.
 >
-> **MiniMax-M2.7:** Ships at UD-IQ4_XS (~108 GB) — the tightest fit on 128 GB unified memory. Do not run alongside other models. Uses `--tool-call-parser minimax_m2` and `--reasoning-parser minimax_m2_append_think`. Per [Unsloth docs](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF), do **NOT** run these GGUFs on CUDA 13.2 (produces gibberish) — this deployment uses Vulkan, so no action needed.
+> **MiniMax-M2.7:** Ships at UD-IQ4_XS (~108 GB) — the tightest fit on 128 GB unified memory. Do not run alongside other models. Tool calling rides on `--jinja` + the chat template baked into the GGUF, with `--reasoning-format auto` to surface the model's reasoning blocks (llama.cpp does not support the vLLM-style `--tool-call-parser` / `--reasoning-parser` flags referenced in the MiniMax docs). Per [Unsloth docs](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF), do **NOT** run these GGUFs on CUDA 13.2 (produces gibberish) — this deployment uses Vulkan, so no action needed.
 
 ---
 
