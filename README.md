@@ -45,12 +45,14 @@ $EDITOR inventory/hosts.yml            # set your target host/user
 $EDITOR inventory/group_vars/all.yml   # tune deployment options
 
 # 4. Deploy
-mise run deploy:toolbox        # interactive toolbox (vLLM/ROCm)
-mise run deploy:service        # systemd vLLM API server (ROCm)
-mise run deploy:llamacpp       # llama.cpp Vulkan — 122B model (default)
-mise run deploy:llamacpp:coder # llama.cpp — Coder 30B profile
-mise run deploy:llamacpp:fast  # llama.cpp — Fast 35B profile
-mise run deploy:all            # full site.yml deployment
+mise run deploy:toolbox           # interactive toolbox (vLLM/ROCm)
+mise run deploy:service           # systemd vLLM API server (ROCm)
+mise run deploy:llamacpp          # llama.cpp Vulkan — 122B model (default)
+mise run deploy:llamacpp:coder    # llama.cpp — Coder 30B profile
+mise run deploy:llamacpp:fast     # llama.cpp — Fast 35B profile
+mise run deploy:llamacpp:nemotron # llama.cpp — Nemotron Nano 30B profile
+mise run deploy:llamacpp:super    # llama.cpp — Nemotron Super 120B profile
+mise run deploy:all               # full site.yml deployment
 
 # 5. Verify
 mise run verify
@@ -79,6 +81,10 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 | `big` (default) | Qwen3.5-122B-A10B | 77 GB | 10B | ~22 | Reasoning, vision, general |
 | `coder` | Qwen3-Coder-30B-A3B | ~20 GB | 3B | ~83 | Coding, tool-use, agentic |
 | `fast` | Qwen3.5-35B-A3B | ~20 GB | 3B | ~59 | Fast general + vision |
+| `nemotron` | Nemotron-3-Nano-30B-A3B | ~20 GB | 3B | ~95 | Coding, agentic, reasoning |
+| `super` | Nemotron-3-Super-120B-A12B | ~84 GB | 12B | ~22 | Reasoning, planning, orchestration |
+
+> **Note:** The `nemotron` and `super` profiles require llama.cpp build **≥8351** (fixes [ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570) — mamba-base.cpp assertion crash). Both are hybrid Mamba-Transformer architectures. The `super` profile uses ~84 GB at Q3_K_XL — do not run alongside other models on 128 GB systems.
 
 ---
 
@@ -137,6 +143,8 @@ Open WebUI auto-connects to whichever backend is deployed. The container-to-cont
 | `mise run deploy:llamacpp` | Deploy llama.cpp/Vulkan (big profile) |
 | `mise run deploy:llamacpp:coder` | Deploy llama.cpp coder profile |
 | `mise run deploy:llamacpp:fast` | Deploy llama.cpp fast profile |
+| `mise run deploy:llamacpp:nemotron` | Deploy llama.cpp nemotron profile |
+| `mise run deploy:llamacpp:super` | Deploy llama.cpp super profile |
 | `mise run deploy:all` | Full deployment |
 | `mise run verify` | Run verification checks |
 | `mise run uninstall` | Remove all components |

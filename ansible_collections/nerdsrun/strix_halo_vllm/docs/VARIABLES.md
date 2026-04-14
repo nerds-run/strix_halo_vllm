@@ -66,17 +66,18 @@
 | `llamacpp_enabled` | bool | `true` | Enable the llama.cpp server |
 | `llamacpp_host` | string | `"0.0.0.0"` | llama.cpp bind address |
 | `llamacpp_port` | int | `8080` | llama.cpp listen port |
-| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, or `fast` |
-| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions (repo, file, include, sampling params) |
+| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `nemotron`, or `super` |
+| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions (repo, file, include, sampling params, optional `batch_size`, `cache_type_k`, `cache_type_v`, `extra_args`) |
 | `llamacpp_model_dir` | string | `"~/models"` | Directory for GGUF model storage |
 | `llamacpp_ngl` | int | `999` | GPU layers to offload (999 = all) |
 | `llamacpp_flash_attn` | bool | `true` | Enable flash attention |
 | `llamacpp_no_mmap` | bool | `true` | Disable mmap (required for Strix Halo stability) |
-| `llamacpp_batch_size` | int | `256` | Batch size for prompt processing |
+| `llamacpp_batch_size` | int | `512` | Batch size for prompt processing (per-profile `batch_size` overrides) |
 | `llamacpp_thinking_enabled` | bool | `true` | Enable thinking/reasoning mode |
-| `llamacpp_cache_type_k` | string | `""` | KV cache key quantization (e.g. `q8_0`, `q4_0`) |
-| `llamacpp_cache_type_v` | string | `""` | KV cache value quantization |
-| `llamacpp_extra_args` | list | `[]` | Additional llama-server CLI arguments |
+| `llamacpp_log_disable` | bool | `true` | Pass `--log-disable` to llama-server (reduces log noise) |
+| `llamacpp_cache_type_k` | string | `""` | KV cache key quantization (e.g. `q8_0`, `q4_0`) — per-profile `cache_type_k` overrides |
+| `llamacpp_cache_type_v` | string | `""` | KV cache value quantization — per-profile `cache_type_v` overrides |
+| `llamacpp_extra_args` | list | `[]` | Additional llama-server CLI arguments (appended after any per-profile `extra_args`) |
 | `llamacpp_api_key_enabled` | bool | `false` | Require API key authentication |
 | `llamacpp_api_key_value` | string | `"local-dev-key"` | API key value |
 | `llamacpp_container_name` | string | `"llamacpp-server"` | Container/service name |

@@ -137,20 +137,34 @@ Default context lengths (8K-32K) are fine for most use cases. Only increase if y
 
 The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This is **required** for Qwen 3.5 models which hang on ROCm ([ROCm#6027](https://github.com/ROCm/ROCm/issues/6027)).
 
-### Confirmed Benchmarks (Vulkan, UD-Q4_K_XL quantization)
+### Confirmed Benchmarks (Vulkan)
 
-| Model | Active Params | Size | tok/s |
-|---|---|---|---|
-| Qwen3.5-122B-A10B | 10B | 77 GB | **22.8** |
-| Qwen3.5-35B-A3B | 3B | 21 GB | **59.4** |
-| Qwen3-Coder-30B-A3B | 3B | 17 GB | **83.4** |
+| Model | Architecture | Active Params | Size | Quant | tok/s |
+|---|---|---|---|---|---|
+| Qwen3-Coder-30B-A3B | MoE | 3B | 17 GB | Q4_K_XL | **83.4** |
+| Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **~95** |
+| Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
+| Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
+| Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~84 GB | Q3_K_XL | **~22** |
 
 ### Vulkan-Specific Tuning
 
-- **`-b 256`** (batch size): Smaller batches improve prompt processing on MoE models with Vulkan
+- **`-b 512`** (batch size): Default. Per-profile override in `llamacpp_model_profiles.<profile>.batch_size` (e.g. `super` uses `2048` for faster prefill on 120B)
 - **`--no-mmap`**: Required on Strix Halo unified memory — prevents crashes
 - **`-fa 1`** (flash attention): Required for stability on gfx1151
-- **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context
+- **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context. The `super` profile uses `q4_0` to fit 128K context in the tight headroom left after the 84 GB model load.
+
+### Hybrid Mamba-Transformer Models (Nemotron-3)
+
+The `nemotron` and `super` profiles use NVIDIA's hybrid Mamba-Transformer architectures:
+
+- **Nemotron-3-Nano-30B-A3B** — Mamba blocks + MoE (128 experts, 6 active per token). Coding/agentic focus.
+- **Nemotron-3-Super-120B-A12B** — LatentMoE: Mamba-2 + MoE + Attention layers. Reasoning/planning focus. Multi-Token Prediction (MTP) layers may be present in the GGUF but `--speculative-config` support for this arch is not yet wired up in llama.cpp.
+
+**Requirements:**
+
+- llama.cpp build **≥8351** — fixes a `mamba-base.cpp` assertion that crashes earlier builds ([ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570))
+- `super` needs ~84 GB resident at Q3_K_XL — do **not** run alongside other containerized models on a 128 GB system
 
 ### Context Size vs. Memory (122B model, 77GB)
 
@@ -222,13 +236,15 @@ Expected: **~25 tok/s** on 128 GB Strix Halo.
 
 All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 
-### llama.cpp (Vulkan, UD-Q4_K_XL GGUF)
+### llama.cpp (Vulkan GGUF)
 
-| Model | Type | Size | tok/s |
-|---|---|---|---|
-| Qwen3-Coder-30B-A3B | MoE, 3B active | 17 GB | **83.4** |
-| Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | **59.4** |
-| Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | **22.8** |
+| Model | Type | Size | Quant | tok/s |
+|---|---|---|---|---|
+| Qwen3-Coder-30B-A3B | MoE, 3B active | 17 GB | Q4_K_XL | **83.4** |
+| Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE, 3B active | ~20 GB | Q4_K_XL | **~95** |
+| Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | Q4_K_XL | **59.4** |
+| Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | Q4_K_XL | **22.8** |
+| Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~84 GB | Q3_K_XL | **~22** |
 
 ### vLLM (ROCm/TheROCk, --enforce-eager + TunableOp)
 

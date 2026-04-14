@@ -27,17 +27,19 @@ Exec=llama-server \
   --jinja \
 {% endif -%}
   --ctx-size {{ llamacpp_active.ctx_size }} \
-  -b {{ llamacpp_batch_size }} \
+  -b {{ llamacpp_active.batch_size | default(llamacpp_batch_size) }} \
   --host 0.0.0.0 --port 8080 \
   --temp {{ llamacpp_active.temp }} --top-p {{ llamacpp_active.top_p }} --top-k {{ llamacpp_active.top_k }} --min-p {{ llamacpp_active.min_p }} \
 {% if llamacpp_active.repeat_penalty | default(0) | float > 0 %}
   --repeat-penalty {{ llamacpp_active.repeat_penalty }} \
 {% endif -%}
-{% if llamacpp_cache_type_k | default('') | length > 0 %}
-  --cache-type-k {{ llamacpp_cache_type_k }} \
+{% set _cache_k = llamacpp_active.cache_type_k | default(llamacpp_cache_type_k) | default('') %}
+{% set _cache_v = llamacpp_active.cache_type_v | default(llamacpp_cache_type_v) | default('') %}
+{% if _cache_k | length > 0 %}
+  --cache-type-k {{ _cache_k }} \
 {% endif -%}
-{% if llamacpp_cache_type_v | default('') | length > 0 %}
-  --cache-type-v {{ llamacpp_cache_type_v }} \
+{% if _cache_v | length > 0 %}
+  --cache-type-v {{ _cache_v }} \
 {% endif -%}
 {% if not llamacpp_thinking_enabled %}
   --chat-template-kwargs '{"enable_thinking":false}' \
@@ -45,10 +47,16 @@ Exec=llama-server \
 {% if llamacpp_api_key_enabled %}
   --api-key {{ llamacpp_api_key_value }} \
 {% endif -%}
+{% for arg in llamacpp_active.extra_args | default([]) %}
+  {{ arg }} \
+{% endfor -%}
 {% for arg in llamacpp_extra_args %}
   {{ arg }} \
 {% endfor -%}
-  --log-disable
+{% if llamacpp_log_disable %}
+  --log-disable \
+{% endif -%}
+  --alias {{ llamacpp_model_profile }}
 
 [Service]
 Restart=on-failure

@@ -498,7 +498,10 @@ async def detect_model(
 
 async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     """Execute the full benchmark suite and return results dict."""
-    timeout = aiohttp.ClientTimeout(total=300)
+    # No total timeout — streaming requests can queue arbitrarily long behind
+    # other requests on np=1 setups. We use sock_read to catch real hangs:
+    # if the server stops sending bytes for 2 minutes, the request errors out.
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=120)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         # Detect model
         print("==> Detecting model...")
@@ -520,15 +523,35 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         # Collect hardware metadata
         hardware = collect_hardware_metadata()
 
+        # Resolve which prompts and concurrency levels to run
+        if args.quick:
+            active_prompts = list(PROMPTS.keys())
+            active_concurrency = [1]
+        else:
+            if args.prompts:
+                requested = [p.strip() for p in args.prompts.split(",")]
+                active_prompts = [p for p in requested if p in PROMPTS]
+                if not active_prompts:
+                    print(f"ERROR: No valid prompts in {args.prompts}. Valid: {list(PROMPTS.keys())}")
+                    sys.exit(1)
+            else:
+                active_prompts = list(PROMPTS.keys())
+
+            if args.concurrency:
+                active_concurrency = [int(c.strip()) for c in args.concurrency.split(",")]
+            else:
+                active_concurrency = CONCURRENCY_LEVELS
+
         # Run benchmarks
         results: dict[str, Any] = {}
-        total_combos = len(PROMPTS) * len(CONCURRENCY_LEVELS)
+        total_combos = len(active_prompts) * len(active_concurrency)
         combo_num = 0
 
-        for prompt_name, prompt_text in PROMPTS.items():
+        for prompt_name in active_prompts:
+            prompt_text = PROMPTS[prompt_name]
             prompt_results: dict[str, Any] = {"concurrency": {}}
 
-            for concurrency in CONCURRENCY_LEVELS:
+            for concurrency in active_concurrency:
                 combo_num += 1
                 label = PROMPT_LABELS[prompt_name]
                 print(f"==> [{combo_num}/{total_combos}] {label}, "
@@ -597,7 +620,8 @@ async def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "model_id": model,
             "max_tokens": args.max_tokens,
             "iterations": args.iterations,
-            "concurrency_levels": CONCURRENCY_LEVELS,
+            "concurrency_levels": active_concurrency,
+            "active_prompts": active_prompts,
             "hardware": hardware,
         },
         "results": results,
@@ -613,6 +637,8 @@ def generate_markdown(data: dict[str, Any]) -> str:
     """Generate a Markdown report from benchmark results."""
     meta = data["metadata"]
     results = data["results"]
+    active_prompts = meta.get("active_prompts", list(PROMPTS.keys()))
+    active_concurrency = meta.get("concurrency_levels", CONCURRENCY_LEVELS)
     lines: list[str] = []
 
     lines.append(f"# vLLM Benchmark Report")
@@ -627,23 +653,24 @@ def generate_markdown(data: dict[str, Any]) -> str:
     lines.append(f"- **Memory:** {hw['memory_total_gb']} GB")
     lines.append("")
 
-    # Summary table (concurrency=1 only)
-    lines.append("## Summary (Concurrency = 1)")
-    lines.append("")
-    lines.append("| Prompt Size | tok/s | TTFT (ms) | Latency (ms) | Errors |")
-    lines.append("|---|---|---|---|---|")
-    for prompt_name in PROMPTS:
-        c1 = results.get(prompt_name, {}).get("concurrency", {}).get("1", {})
-        tps = c1.get("tokens_per_sec", {}).get("mean", 0)
-        ttft = c1.get("ttft_ms", {}).get("mean", 0)
-        lat = c1.get("total_latency_ms", {}).get("mean", 0)
-        errs = c1.get("errors", 0)
-        label = PROMPT_LABELS[prompt_name]
-        lines.append(f"| {label} | {tps:.1f} | {ttft:.0f} | {lat:.0f} | {errs} |")
-    lines.append("")
+    # Summary table (concurrency=1 only, if tested)
+    if 1 in active_concurrency:
+        lines.append("## Summary (Concurrency = 1)")
+        lines.append("")
+        lines.append("| Prompt Size | tok/s | TTFT (ms) | Latency (ms) | Errors |")
+        lines.append("|---|---|---|---|---|")
+        for prompt_name in active_prompts:
+            c1 = results.get(prompt_name, {}).get("concurrency", {}).get("1", {})
+            tps = c1.get("tokens_per_sec", {}).get("mean", 0)
+            ttft = c1.get("ttft_ms", {}).get("mean", 0)
+            lat = c1.get("total_latency_ms", {}).get("mean", 0)
+            errs = c1.get("errors", 0)
+            label = PROMPT_LABELS[prompt_name]
+            lines.append(f"| {label} | {tps:.1f} | {ttft:.0f} | {lat:.0f} | {errs} |")
+        lines.append("")
 
     # Detailed tables per prompt size
-    for prompt_name in PROMPTS:
+    for prompt_name in active_prompts:
         label = PROMPT_LABELS[prompt_name]
         lines.append(f"## {label} - Detailed Results")
         lines.append("")
@@ -651,7 +678,7 @@ def generate_markdown(data: dict[str, Any]) -> str:
                       "| TTFT ms (mean) | Latency ms (mean) | Errors |")
         lines.append("|---|---|---|---|---|---|---|")
         conc_data = results.get(prompt_name, {}).get("concurrency", {})
-        for c in CONCURRENCY_LEVELS:
+        for c in active_concurrency:
             cd = conc_data.get(str(c), {})
             tps = cd.get("tokens_per_sec", {})
             ttft = cd.get("ttft_ms", {})
@@ -668,30 +695,31 @@ def generate_markdown(data: dict[str, Any]) -> str:
             )
         lines.append("")
 
-    # Concurrency scaling table
-    lines.append("## Concurrency Scaling (Total Throughput)")
-    lines.append("")
-    lines.append("Aggregate tok/s across all concurrent requests at each level.")
-    lines.append("")
-    header = "| Prompt Size |"
-    sep = "|---|"
-    for c in CONCURRENCY_LEVELS:
-        header += f" C={c} tok/s |"
-        sep += "---|"
-    lines.append(header)
-    lines.append(sep)
-    for prompt_name in PROMPTS:
-        label = PROMPT_LABELS[prompt_name]
-        row = f"| {label} |"
-        conc_data = results.get(prompt_name, {}).get("concurrency", {})
-        for c in CONCURRENCY_LEVELS:
-            cd = conc_data.get(str(c), {})
-            mean_tps = cd.get("tokens_per_sec", {}).get("mean", 0)
-            # Total throughput = per-request tok/s * concurrency
-            total = mean_tps * c
-            row += f" {total:.1f} |"
-        lines.append(row)
-    lines.append("")
+    # Concurrency scaling table (only if multiple concurrency levels tested)
+    if len(active_concurrency) > 1:
+        lines.append("## Concurrency Scaling (Total Throughput)")
+        lines.append("")
+        lines.append("Aggregate tok/s across all concurrent requests at each level.")
+        lines.append("")
+        header = "| Prompt Size |"
+        sep = "|---|"
+        for c in active_concurrency:
+            header += f" C={c} tok/s |"
+            sep += "---|"
+        lines.append(header)
+        lines.append(sep)
+        for prompt_name in active_prompts:
+            label = PROMPT_LABELS[prompt_name]
+            row = f"| {label} |"
+            conc_data = results.get(prompt_name, {}).get("concurrency", {})
+            for c in active_concurrency:
+                cd = conc_data.get(str(c), {})
+                mean_tps = cd.get("tokens_per_sec", {}).get("mean", 0)
+                # Total throughput = per-request tok/s * concurrency
+                total = mean_tps * c
+                row += f" {total:.1f} |"
+            lines.append(row)
+        lines.append("")
 
     return "\n".join(lines)
 
@@ -732,11 +760,31 @@ def parse_args() -> argparse.Namespace:
         default="benchmark_results",
         help="Output directory for reports (default: benchmark_results/)",
     )
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Quick sanity check: one iteration, C=1 only, all 3 prompt sizes (3 tests total)",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=str,
+        default=None,
+        help="Comma-separated concurrency levels (default: 1,2,4,8). Example: --concurrency 1,4",
+    )
+    parser.add_argument(
+        "--prompts",
+        type=str,
+        default=None,
+        help="Comma-separated prompt sizes from: short,medium,long (default: all). Example: --prompts medium",
+    )
     return parser.parse_args()
 
 
 async def main() -> None:
     args = parse_args()
+
+    if args.quick:
+        args.iterations = 1
 
     print("=" * 60)
     print("  vLLM Performance Benchmark")
@@ -744,6 +792,8 @@ async def main() -> None:
     print(f"  Base URL:    {args.base_url}")
     print(f"  Max tokens:  {args.max_tokens}")
     print(f"  Iterations:  {args.iterations}")
+    if args.quick:
+        print("  Mode:        QUICK (3 tests, C=1 only)")
     print(f"  Output dir:  {args.output_dir}")
     print("=" * 60)
     print()
