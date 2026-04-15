@@ -27,12 +27,27 @@
         kernel_tuning_missing_args: >-
           {{ kernel_tuning_desired_args | difference(kernel_tuning_current_cmdline.split()) }}
 
+    - name: Identify stale kernel args to remove
+      ansible.builtin.set_fact:
+        kernel_tuning_stale_args: >-
+          {{ strix_halo_kernel_args_remove | default([])
+             | intersect(kernel_tuning_current_cmdline.split()) }}
+
+    - name: Remove stale kernel args via grubby
+      ansible.builtin.command:
+        cmd: "grubby --update-kernel=ALL --remove-args='{{ kernel_tuning_stale_args | join(' ') }}'"
+      become: true
+      register: kernel_tuning_grubby_remove_result
+      changed_when: kernel_tuning_stale_args | length > 0
+      when: kernel_tuning_stale_args | length > 0
+
     - name: Display kernel arg analysis
       ansible.builtin.debug:
         msg:
           desired: "{{ kernel_tuning_desired_args }}"
           current_cmdline: "{{ kernel_tuning_current_cmdline }}"
           missing: "{{ kernel_tuning_missing_args }}"
+          to_remove: "{{ strix_halo_kernel_args_remove | default([]) }}"
 
     - name: Add missing kernel args via grubby
       ansible.builtin.command:
@@ -48,20 +63,24 @@
       changed_when: true
       notify: Reboot for kernel args
       when:
-        - kernel_tuning_missing_args | length > 0
+        - (kernel_tuning_missing_args | length > 0) or (kernel_tuning_stale_args | length > 0)
         - strix_halo_kernel_reboot_allowed | bool
 
     - name: Warn that reboot is needed but not allowed
       ansible.builtin.debug:
         msg: >-
           WARNING: Kernel boot parameters have been updated but a reboot
-          is required for them to take effect. Added: {{ kernel_tuning_missing_args | join(' ') }}.
+          is required for them to take effect.
+          Added: {{ kernel_tuning_missing_args | join(' ') or '(none)' }}.
+          Removed: {{ kernel_tuning_stale_args | join(' ') or '(none)' }}.
           Set strix_halo_kernel_reboot_allowed=true or manually reboot.
       when:
-        - kernel_tuning_missing_args | length > 0
+        - (kernel_tuning_missing_args | length > 0) or (kernel_tuning_stale_args | length > 0)
         - not (strix_halo_kernel_reboot_allowed | bool)
 
     - name: Confirm no kernel arg changes needed
       ansible.builtin.debug:
         msg: "All desired kernel args are already present. No changes needed."
-      when: kernel_tuning_missing_args | length == 0
+      when:
+        - kernel_tuning_missing_args | length == 0
+        - kernel_tuning_stale_args | length == 0

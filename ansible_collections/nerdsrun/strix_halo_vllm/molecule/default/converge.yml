@@ -36,6 +36,34 @@
           ansible.builtin.debug:
             msg: "kernel_tuning failed as expected in CI (requires Fedora kernel args)"
 
+    - name: "Test gpu_tuning role inclusion"
+      vars:
+        gpu_tuning_enabled: false  # skip actual sysfs writes in CI
+      block:
+        - name: "Include gpu_tuning"
+          ansible.builtin.include_role:
+            name: nerdsrun.strix_halo_vllm.gpu_tuning
+      rescue:
+        - name: "gpu_tuning expected CI failure"
+          ansible.builtin.debug:
+            msg: "gpu_tuning failed as expected in CI (requires Strix Halo amdgpu)"
+
+    - name: "Validate gpu_tuning defaults are loadable"
+      block:
+        - name: "Load gpu_tuning defaults"
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../../roles/gpu_tuning/defaults/main.yml"
+
+        - name: "Assert gpu_tuning variables are defined and sane"
+          ansible.builtin.assert:
+            that:
+              - gpu_tuning_enabled is defined
+              - gpu_tuning_perf_level in ['auto', 'high', 'manual', 'low']
+              - gpu_tuning_profile_mode | int >= -1
+              - gpu_tuning_unit_name | length > 0
+              - gpu_tuning_unit_name is match('.*\\.service$')
+            fail_msg: "gpu_tuning defaults are malformed"
+
     - name: "Test llamacpp_service role inclusion"
       vars:
         strix_halo_mode: "llamacpp"

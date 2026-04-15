@@ -1,0 +1,27 @@
+# {{ ansible_managed }}
+# Pin amdgpu iGPU to a compute-friendly performance state at boot.
+# Runs after the amdgpu driver is up and before user sessions start.
+[Unit]
+Description=Pin amdgpu performance level and power profile for LLM inference
+After=multi-user.target
+ConditionPathExists=/sys/class/drm
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/sh -c '\
+  card=$(for d in /sys/class/drm/card*/device; do \
+    if [ -f "$d/uevent" ] && grep -q "^DRIVER=amdgpu$" "$d/uevent"; then \
+      basename $(dirname "$d"); break; \
+    fi; \
+  done); \
+  if [ -z "$card" ]; then echo "no amdgpu card found" >&2; exit 1; fi; \
+  echo "tuning $card"; \
+  echo {{ gpu_tuning_perf_level }} > /sys/class/drm/$card/device/power_dpm_force_performance_level; \
+{% if gpu_tuning_profile_mode | int >= 0 %}
+  echo {{ gpu_tuning_profile_mode }} > /sys/class/drm/$card/device/pp_power_profile_mode; \
+{% endif %}
+  echo "done"'
+
+[Install]
+WantedBy=multi-user.target

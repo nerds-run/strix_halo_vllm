@@ -8,7 +8,8 @@ ansible_collections/nerdsrun/strix_halo_vllm/
 ├── meta/runtime.yml
 ├── roles/
 │   ├── host_prereqs/      # Hardware detection, packages, groups, image pull
-│   ├── kernel_tuning/     # Optional kernel boot parameters (grubby)
+│   ├── kernel_tuning/     # Optional kernel boot parameters (grubby add+remove)
+│   ├── gpu_tuning/        # amdgpu sysfs power profile pinning + boot-persist unit
 │   ├── toolbox_mode/      # Interactive toolbox container
 │   ├── podman_service/    # systemd Quadlet vLLM service (ROCm)
 │   ├── llamacpp_service/  # systemd Quadlet llama.cpp service (Vulkan)
@@ -35,6 +36,8 @@ ansible_collections/nerdsrun/strix_halo_vllm/
 ```
 host_prereqs ──► kernel_tuning
      │
+     ├──► gpu_tuning        (when mode=llamacpp — sysfs iGPU pin + boot-persist)
+     │
      ├──► toolbox_mode      (when mode=toolbox|both)
      │
      ├──► podman_service    (when mode=service|both)     [ROCm, port 8000]
@@ -55,7 +58,7 @@ The `strix_halo_mode` variable controls which deployment path is taken:
 - **toolbox**: `host_prereqs` -> `kernel_tuning` -> `toolbox_mode` -> `model_cache`
 - **service**: `host_prereqs` -> `kernel_tuning` -> `podman_service` -> `model_cache`
 - **both**: All of the above
-- **llamacpp**: `host_prereqs` -> `kernel_tuning` -> `llamacpp_service` (downloads its own GGUF models)
+- **llamacpp**: `host_prereqs` -> `kernel_tuning` -> `gpu_tuning` -> `llamacpp_service` (downloads its own GGUF models)
 
 ## Fail-Fast Hardware Detection
 
@@ -68,7 +71,8 @@ with an actionable error message showing what was detected vs. what is required.
 | Role | Strategy |
 |---|---|
 | host_prereqs | Package state checks, group membership append, conditional image pull |
-| kernel_tuning | Compare `/proc/cmdline` against desired args, skip if present |
+| kernel_tuning | Compare `/proc/cmdline` against desired add/remove lists via grubby |
+| gpu_tuning | sysfs writes always re-apply (cheap, no-op if already at target); systemd unit template uses Ansible handler for reload |
 | toolbox_mode | `podman container inspect` to check existence, skip if present; firewalld rule when `firewall_open_vllm_port` |
 | podman_service | Quadlet template with `notify` handlers, only restarts on change |
 | llamacpp_service | Profile-based Quadlet template; `hf download` handles idempotent GGUF caching |

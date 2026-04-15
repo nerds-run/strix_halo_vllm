@@ -9,6 +9,7 @@
       loop:
         - "{{ playbook_dir }}/../../roles/host_prereqs/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/kernel_tuning/tasks/main.yml"
+        - "{{ playbook_dir }}/../../roles/gpu_tuning/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/toolbox_mode/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/podman_service/tasks/main.yml"
         - "{{ playbook_dir }}/../../roles/llamacpp_service/tasks/main.yml"

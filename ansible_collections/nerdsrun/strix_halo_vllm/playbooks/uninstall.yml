@@ -5,8 +5,10 @@
   vars:
     strix_halo_toolbox_name: "{{ strix_halo_toolbox_name | default('vllm') }}"
     vllm_container_name: "{{ vllm_container_name | default('vllm-server') }}"
+    llamacpp_container_name: "{{ llamacpp_container_name | default('llamacpp-server') }}"
     openwebui_container_name: "{{ openwebui_container_name | default('open-webui') }}"
     openwebui_data_volume: "{{ openwebui_data_volume | default('open-webui') }}"
+    gpu_tuning_unit_name: "{{ gpu_tuning_unit_name | default('amdgpu-performance.service') }}"
     strix_halo_uninstall_purge_cache: "{{ strix_halo_uninstall_purge_cache | default(false) | bool }}"
   tasks:
     - name: Initialise removal tracker
@@ -52,6 +54,68 @@
       ansible.builtin.set_fact:
         _removed_items: "{{ _removed_items + ['Quadlet: ' + vllm_container_name + '.container'] }}"
       when: _quadlet_rm.changed
+
+    # ================================================================
+    # 2b. Stop and remove llama.cpp service container + Quadlet
+    # ================================================================
+    - name: Stop llama.cpp systemd user service
+      ansible.builtin.systemd:
+        name: "{{ llamacpp_container_name }}"
+        state: stopped
+        enabled: false
+        scope: user
+      become: false
+      failed_when: false
+
+    - name: Remove llama.cpp container
+      ansible.builtin.command:
+        cmd: "podman rm -f {{ llamacpp_container_name }}"
+      register: _llamacpp_rm
+      changed_when: _llamacpp_rm.rc == 0
+      failed_when: false
+      become: false
+
+    - name: Track llama.cpp container removal
+      ansible.builtin.set_fact:
+        _removed_items: "{{ _removed_items + ['Container: ' + llamacpp_container_name] }}"
+      when: _llamacpp_rm.rc == 0
+
+    - name: Remove llama.cpp Quadlet unit file
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.config/containers/systemd/{{ llamacpp_container_name }}.container"
+        state: absent
+      become: false
+      register: _llamacpp_quadlet_rm
+
+    - name: Track llama.cpp Quadlet removal  # noqa: no-handler
+      ansible.builtin.set_fact:
+        _removed_items: "{{ _removed_items + ['Quadlet: ' + llamacpp_container_name + '.container'] }}"
+      when: _llamacpp_quadlet_rm.changed
+
+    # ================================================================
+    # 2c. Remove amdgpu-performance systemd unit (from gpu_tuning role)
+    # ================================================================
+    - name: Stop and disable amdgpu-performance unit
+      ansible.builtin.systemd:
+        name: "{{ gpu_tuning_unit_name }}"
+        state: stopped
+        enabled: false
+        daemon_reload: true
+      become: true
+      failed_when: false
+      register: _gpu_unit_stop
+
+    - name: Remove amdgpu-performance unit file
+      ansible.builtin.file:
+        path: "/etc/systemd/system/{{ gpu_tuning_unit_name }}"
+        state: absent
+      become: true
+      register: _gpu_unit_rm
+
+    - name: Track amdgpu-performance unit removal  # noqa: no-handler
+      ansible.builtin.set_fact:
+        _removed_items: "{{ _removed_items + ['systemd unit: ' + gpu_tuning_unit_name] }}"
+      when: _gpu_unit_rm.changed
 
     # ================================================================
     # 3. Stop and remove Open WebUI container

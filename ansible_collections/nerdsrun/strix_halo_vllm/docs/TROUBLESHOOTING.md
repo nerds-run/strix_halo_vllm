@@ -339,6 +339,80 @@ cat /proc/cmdline
 rocm-smi 2>/dev/null || echo "rocm-smi not available on host"
 ```
 
+## OOM Triage — llama.cpp Service Killed (exit 137)
+
+**Symptoms:** `systemctl --user status llamacpp-server` shows `status=137/n/a` and "A process of this unit has been killed by the OOM killer" in the journal. Service auto-restarts (`NRestarts` increments) but there's a 30-60s outage while the model reloads.
+
+**Find the actual cause in dmesg:**
+
+```bash
+# Look for the process that triggered OOM (not necessarily llama-server)
+sudo dmesg -T --level=err,warn | grep -iE "invoked oom-killer|Killed process" | tail -5
+```
+
+The triggering process is often not `llama-server` itself — common culprits on Fedora include `sssd_kcm` (Kerberos cache manager), `podman cleanup`, or heavy log rotation. The kernel picks llama-server as the victim because it's the largest user process (`oom_score_adj=200`).
+
+**Immediate recovery:**
+
+```bash
+# If systemd got stuck on restart backoff:
+systemctl --user reset-failed llamacpp-server
+systemctl --user restart llamacpp-server
+
+# Watch model reload (can take 30-60s with --no-mmap + 100 GB weights):
+journalctl --user -u llamacpp-server -f
+```
+
+**Root-cause fixes (in rough order of impact):**
+
+| Cause | Fix |
+|---|---|
+| **Tight model + unbounded prompt cache** (e.g. MiniMax 108 GB + `--cache-reuse` at default 8 GB) | Add `--cache-ram 2048` to the profile's `extra_args` to cap the in-memory prompt cache pool. q8_0 KV doubles snapshot size vs q4_0 — prefer q4_0 on oversized models. |
+| **Oversized `ctx_size`** | Drop to the smallest value that matches your working context. Summary-resetting around 40-50K with `ctx_size: 49152` gives ~5 GB headroom on 128 GB systems |
+| **Other processes grabbing RAM mid-inference** | Disable unused services (e.g. `systemctl disable sssd_kcm` if you don't use Kerberos). Inspect `ps auxf --sort=-rss | head` to find transient allocators |
+| **Cache-reuse snapshot write fails mid-allocation** | Journal will show `srv prompt_save: saving prompt with length N, total state size = X MiB` right before the OOM. Lower `--cache-ram` or drop `--cache-reuse` to eliminate the snapshot path |
+
+**Verify free memory is comfortable:**
+
+```bash
+ansible -i inventory all -m shell -a 'free -h | head -2'
+# Target: >5 GB available on 128 GB systems for MiniMax-class models
+```
+
+## llama-server Refuses to Start ("invalid argument")
+
+**Symptoms:** Service fails within 1s of start, journal shows `error: invalid argument: --<flag>`.
+
+**Cause:** A model card or recipe specified flags that are specific to another inference engine (vLLM / TGI). llama.cpp has its own CLI surface.
+
+**Common offenders:**
+
+| Model-card flag | llama.cpp equivalent |
+|---|---|
+| `--tool-call-parser minimax_m2` | `--jinja` + the GGUF's embedded chat template |
+| `--reasoning-parser minimax_m2_append_think` | `--reasoning-format auto` |
+| `--enforce-eager` | (vLLM-only; no equivalent needed on llama.cpp) |
+| `--max-model-len N` | `--ctx-size N` |
+| `--gpu-memory-utilization` | (vLLM-only) |
+
+When in doubt: `podman run --rm <image> llama-server --help 2>&1 | grep -i <flag_stem>` to verify a flag actually exists in the build.
+
+## GPU Perf Level Reverted After Reboot
+
+**Symptoms:** `cat /sys/class/drm/card1/device/power_dpm_force_performance_level` returns `auto` after a reboot, decode tok/s is lower than expected.
+
+**Cause:** The `amdgpu-performance.service` systemd unit (installed by the `gpu_tuning` role) isn't enabled or failed at boot.
+
+**Fix:**
+
+```bash
+sudo systemctl status amdgpu-performance.service
+# if disabled:
+sudo systemctl enable --now amdgpu-performance.service
+```
+
+Re-run `mise run deploy:llamacpp` to reinstall/re-enable the unit idempotently.
+
 ## Complete Reset
 
 ```bash

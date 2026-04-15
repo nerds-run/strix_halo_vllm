@@ -125,7 +125,7 @@ llamacpp_model_profiles:
     repo: "unsloth/MiniMax-M2.7-GGUF"
     file: "UD-IQ4_XS/MiniMax-M2.7-UD-IQ4_XS-00001-of-00004.gguf"
     include: "*UD-IQ4_XS*"
-    ctx_size: 49152
+    ctx_size: 81920
     temp: 1.0
     top_p: 0.95
     top_k: 40
