@@ -5,4 +5,5 @@
   roles:
     - role: nerdsrun.strix_halo_vllm.host_prereqs
     - role: nerdsrun.strix_halo_vllm.kernel_tuning
+    - role: nerdsrun.strix_halo_vllm.gpu_tuning
     - role: nerdsrun.strix_halo_vllm.llamacpp_service

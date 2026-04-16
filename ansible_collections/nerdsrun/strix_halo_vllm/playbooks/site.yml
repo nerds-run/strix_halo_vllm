@@ -5,6 +5,8 @@
   roles:
     - role: nerdsrun.strix_halo_vllm.host_prereqs
     - role: nerdsrun.strix_halo_vllm.kernel_tuning
+    - role: nerdsrun.strix_halo_vllm.gpu_tuning
+      when: strix_halo_mode == 'llamacpp'
     - role: nerdsrun.strix_halo_vllm.toolbox_mode
       when: strix_halo_mode in ['toolbox', 'both']
     - role: nerdsrun.strix_halo_vllm.podman_service

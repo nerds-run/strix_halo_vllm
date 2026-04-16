@@ -1,4 +1,12 @@
 ---
 strix_halo_kernel_args_enabled: false
-strix_halo_kernel_args: "iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856"
+# amd_iommu=off: disables the AMD IOMMU entirely. strix-halo-guide benchmarks
+# show +6% memory bandwidth vs iommu=pt on gfx1151 LLM inference. Trade-off:
+# loses DMA isolation (fine on a single-user inference box). If you need DMA
+# protection (multi-tenant, untrusted VFIO), override this back to "iommu=pt".
+strix_halo_kernel_args: "amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856"
+# Kernel args to remove (grubby --remove-args). Needed when swapping values
+# since the "add missing" logic above doesn't know to evict superseded args.
+strix_halo_kernel_args_remove:
+  - "iommu=pt"
 strix_halo_kernel_reboot_allowed: false

@@ -1,0 +1,25 @@
+---
+# ==========================================================================
+# gpu_tuning defaults
+# ==========================================================================
+# Pin the amdgpu iGPU to a high-performance state for LLM inference.
+# Reverts on reboot unless persisted via a systemd oneshot (handled here).
+
+gpu_tuning_enabled: true
+
+# Performance level sets how the driver manages clocks:
+#   "auto"   — driver DVFS (default, can throttle iGPU under Vulkan compute)
+#   "high"   — pin to highest clock state  ← best choice for LLM inference
+#   "manual" — freezes clocks until you pin individual states via pp_dpm_*
+gpu_tuning_perf_level: "high"
+
+# Power profile mode — integer matching pp_power_profile_mode. Note: on
+# Strix Halo (gfx1151), amdgpu does NOT expose pp_power_profile_mode, so
+# this defaults to -1 (skip). Left here for future-proofing and use on
+# cards that do expose it (e.g., discrete RDNA). Valid values when present:
+#   0 = BOOTUP_DEFAULT, 1 = 3D_FULL_SCREEN, 2 = POWER_SAVER,
+#   3 = VIDEO, 4 = VR, 5 = COMPUTE
+gpu_tuning_profile_mode: -1
+
+# systemd unit name for boot-time persistence
+gpu_tuning_unit_name: "amdgpu-performance.service"

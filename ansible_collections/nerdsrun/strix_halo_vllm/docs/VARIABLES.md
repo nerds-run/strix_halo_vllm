@@ -19,8 +19,20 @@
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `strix_halo_kernel_args_enabled` | bool | `false` | Enable kernel parameter tuning |
-| `strix_halo_kernel_args` | string | `"iommu=pt amdgpu.gttsize=126976 ttm.pages_limit=32505856"` | Kernel args to add |
+| `strix_halo_kernel_args` | string | `"amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856"` | Kernel args to add (`amd_iommu=off` measured +6% memory bandwidth on gfx1151) |
+| `strix_halo_kernel_args_remove` | list | `["iommu=pt"]` | Kernel args to remove via `grubby --remove-args` (needed when swapping superseded values like `iommu=pt` → `amd_iommu=off`) |
 | `strix_halo_kernel_reboot_allowed` | bool | `false` | Allow automatic reboot after kernel arg changes |
+
+## GPU Tuning Variables
+
+Pin the amdgpu (gfx1151) iGPU to a high-performance state so Vulkan compute workloads don't get throttled by the default DVFS governor. Immediate effect via sysfs plus a systemd oneshot for boot persistence.
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `gpu_tuning_enabled` | bool | `true` | Write sysfs and install systemd oneshot |
+| `gpu_tuning_perf_level` | string | `"high"` | `power_dpm_force_performance_level` value: `auto`, `high`, `low`, or `manual` |
+| `gpu_tuning_profile_mode` | int | `-1` | `pp_power_profile_mode` value. `-1` skips (gfx1151 doesn't expose this knob); `5` = COMPUTE on cards that do |
+| `gpu_tuning_unit_name` | string | `"amdgpu-performance.service"` | systemd unit name for boot-time persistence |
 
 ## RDMA Variables
 
@@ -66,17 +78,19 @@
 | `llamacpp_enabled` | bool | `true` | Enable the llama.cpp server |
 | `llamacpp_host` | string | `"0.0.0.0"` | llama.cpp bind address |
 | `llamacpp_port` | int | `8080` | llama.cpp listen port |
-| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `nemotron`, or `super` |
-| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions (repo, file, include, sampling params, optional `batch_size`, `cache_type_k`, `cache_type_v`, `extra_args`) |
+| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `nemotron`, `super`, or `minimax` |
+| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions. Per-profile overrides available for: `batch_size`, `ubatch_size`, `cache_type_k`, `cache_type_v`, `extra_args` |
 | `llamacpp_model_dir` | string | `"~/models"` | Directory for GGUF model storage |
 | `llamacpp_ngl` | int | `999` | GPU layers to offload (999 = all) |
 | `llamacpp_flash_attn` | bool | `true` | Enable flash attention |
 | `llamacpp_no_mmap` | bool | `true` | Disable mmap (required for Strix Halo stability) |
-| `llamacpp_batch_size` | int | `512` | Batch size for prompt processing (per-profile `batch_size` overrides) |
+| `llamacpp_batch_size` | int | `512` | Logical batch size for prompt processing (per-profile `batch_size` overrides) |
+| `llamacpp_ubatch_size` | int | `0` | Physical (micro) batch size. `0` lets llama-server pick (default 512); `1024` improves prefill throughput on Vulkan/RADV at the cost of some GPU scratch memory |
 | `llamacpp_thinking_enabled` | bool | `true` | Enable thinking/reasoning mode |
-| `llamacpp_log_disable` | bool | `true` | Pass `--log-disable` to llama-server (reduces log noise) |
+| `llamacpp_log_disable` | bool | `true` | Pass `--log-disable` to llama-server (reduces log noise). Set `false` to stream per-request `prompt eval time` / `eval time` to the journal |
 | `llamacpp_cache_type_k` | string | `""` | KV cache key quantization (e.g. `q8_0`, `q4_0`) — per-profile `cache_type_k` overrides |
 | `llamacpp_cache_type_v` | string | `""` | KV cache value quantization — per-profile `cache_type_v` overrides |
+| `llamacpp_env` | dict | `{}` | Extra container environment vars rendered as `Environment=KEY=VAL` in the Quadlet. Useful for Vulkan/driver knobs (e.g. `RADV_PERFTEST`) |
 | `llamacpp_extra_args` | list | `[]` | Additional llama-server CLI arguments (appended after any per-profile `extra_args`) |
 | `llamacpp_api_key_enabled` | bool | `false` | Require API key authentication |
 | `llamacpp_api_key_value` | string | `"local-dev-key"` | API key value |

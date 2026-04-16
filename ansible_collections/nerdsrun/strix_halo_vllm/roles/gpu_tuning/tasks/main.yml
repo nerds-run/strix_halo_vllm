@@ -1,0 +1,88 @@
+---
+# ==========================================================================
+# gpu_tuning tasks
+# ==========================================================================
+# Pin the amdgpu iGPU to a high-performance state for LLM inference and
+# persist the setting via a systemd oneshot unit.
+
+- name: Skip gpu_tuning when disabled
+  ansible.builtin.debug:
+    msg: "gpu_tuning_enabled is false — leaving GPU governor alone"
+  when: not gpu_tuning_enabled
+  tags:
+    - gpu
+    - tuning
+
+- name: Locate the amdgpu card under /sys/class/drm
+  ansible.builtin.shell: >-
+    set -o pipefail;
+    for d in /sys/class/drm/card*/device; do
+      if grep -q "^DRIVER=amdgpu$" "$d/uevent" 2>/dev/null; then
+        basename "$(dirname "$d")"; break;
+      fi;
+    done
+  register: _gpu_tuning_card
+  changed_when: false
+  failed_when: _gpu_tuning_card.stdout | length == 0
+  when: gpu_tuning_enabled
+  tags:
+    - gpu
+    - tuning
+
+- name: Report discovered amdgpu card
+  ansible.builtin.debug:
+    msg: "amdgpu card: {{ _gpu_tuning_card.stdout }}"
+  when: gpu_tuning_enabled
+  tags:
+    - gpu
+    - tuning
+
+- name: Apply performance level immediately (takes effect without reboot)
+  ansible.builtin.shell: |
+    set -o pipefail
+    echo {{ gpu_tuning_perf_level | quote }} > /sys/class/drm/{{ _gpu_tuning_card.stdout }}/device/power_dpm_force_performance_level
+  become: true
+  changed_when: true  # sysfs writes aren't idempotent-reportable; always mark changed
+  when: gpu_tuning_enabled
+  tags:
+    - gpu
+    - tuning
+
+- name: Apply power profile mode immediately (takes effect without reboot)
+  ansible.builtin.shell: |
+    set -o pipefail
+    echo {{ gpu_tuning_profile_mode | int }} > /sys/class/drm/{{ _gpu_tuning_card.stdout }}/device/pp_power_profile_mode
+  become: true
+  changed_when: true
+  when:
+    - gpu_tuning_enabled
+    - gpu_tuning_profile_mode | int >= 0
+  tags:
+    - gpu
+    - tuning
+
+- name: Deploy systemd oneshot for boot-time persistence
+  ansible.builtin.template:
+    src: amdgpu-performance.service.j2
+    dest: "/etc/systemd/system/{{ gpu_tuning_unit_name }}"
+    owner: root
+    group: root
+    mode: "0644"
+  become: true
+  notify: Reload systemd
+  when: gpu_tuning_enabled
+  tags:
+    - gpu
+    - tuning
+
+- name: Enable amdgpu performance unit
+  ansible.builtin.systemd:
+    name: "{{ gpu_tuning_unit_name }}"
+    enabled: true
+    state: started
+    daemon_reload: true
+  become: true
+  when: gpu_tuning_enabled
+  tags:
+    - gpu
+    - tuning

@@ -1,0 +1,24 @@
+---
+galaxy_info:
+  role_name: gpu_tuning
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Pin the amdgpu (gfx1151) iGPU to a manual performance level and the COMPUTE
+    power profile so Vulkan/ROCm inference workloads don't get throttled by the
+    default governor. Writes take effect immediately and persist across reboots
+    via a systemd oneshot unit.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - amd
+    - gpu
+    - tuning
+    - performance
+    - strix_halo
+
+dependencies: []

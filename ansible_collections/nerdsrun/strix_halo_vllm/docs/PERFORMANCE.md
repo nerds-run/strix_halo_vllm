@@ -146,13 +146,22 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 | Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
 | Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~84 GB | Q3_K_XL | **~22** |
+| MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **~22 fresh / ~17 at 40K ctx** |
 
 ### Vulkan-Specific Tuning
 
-- **`-b 512`** (batch size): Default. Per-profile override in `llamacpp_model_profiles.<profile>.batch_size` (e.g. `super` uses `2048` for faster prefill on 120B)
+- **`-b 512`** (batch size, logical): Default. Per-profile override in `llamacpp_model_profiles.<profile>.batch_size` (e.g. `super` uses `2048`, `minimax` uses `4096` for faster prefill on long prompts)
+- **`-ub 512`** (ubatch, physical): Default. Set `llamacpp_ubatch_size: 1024` or per-profile `ubatch_size` for **~+30% prefill throughput** on Vulkan/RADV (gfx1151-specific optimization — pure prefill lever, decode is unaffected)
 - **`--no-mmap`**: Required on Strix Halo unified memory — prevents crashes
-- **`-fa 1`** (flash attention): Required for stability on gfx1151
-- **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context. The `super` profile uses `q4_0` to fit 128K context in the tight headroom left after the 84 GB model load.
+- **`-fa 1`** (flash attention): Required for stability on gfx1151. Combined with quantized KV cache (both k and v must be the same quant), llama.cpp v4100+ uses a DP4A integer-dot-product fast path for Vulkan (see [PR #20797](https://github.com/ggml-org/llama.cpp/pull/20797))
+- **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context. Note: mismatched k/v quants (e.g. k=q8_0 v=q4_0) disable the DP4A fast path — keep them matched
+
+### Host-Side Tuning (gpu_tuning role)
+
+The `gpu_tuning` role writes two things to persist across reboots:
+
+- **`power_dpm_force_performance_level=high`** — pins the iGPU at max clocks so Vulkan compute load doesn't hunt DVFS states. Measured **+~7% decode** and a 5-10× reduction in tok/s variance on MoE workloads.
+- **`amd_iommu=off` kernel arg** (via `kernel_tuning` role) — disables AMD IOMMU. Measured **+~6% memory bandwidth** on gfx1151 per strix-halo-guide. Trade-off: loses DMA isolation (fine on single-user inference hosts). Override with `strix_halo_kernel_args_remove: []` to keep `iommu=pt` if your deployment needs DMA protection.
 
 ### Hybrid Mamba-Transformer Models (Nemotron-3)
 
@@ -165,6 +174,48 @@ The `nemotron` and `super` profiles use NVIDIA's hybrid Mamba-Transformer archit
 
 - llama.cpp build **≥8351** — fixes a `mamba-base.cpp` assertion that crashes earlier builds ([ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570))
 - `super` needs ~84 GB resident at Q3_K_XL — do **not** run alongside other containerized models on a 128 GB system
+
+### MiniMax-M2.7 (minimax profile)
+
+MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at `UD-IQ4_XS` (~108 GB). This is the tightest fit in 128 GB unified memory — leave `strix_halo_mode: "llamacpp"` as the only active backend and do not run Open WebUI or other containerized models alongside it.
+
+**Launch params baked into the profile:**
+
+- `--temp 1.0 --top-p 0.95 --top-k 40` (MiniMax-recommended sampling)
+- `--jinja` (drives tool calling via the chat template embedded in the GGUF)
+- `--reasoning-format auto` (llama.cpp detects the model's reasoning block format)
+- `batch_size: 4096`, `ubatch_size: 1024` — aggressive prefill batching (measured ~+30% prefill tok/s on >1K-token prompts vs default `-ub 512`)
+- `cache_type_k/v: q4_0` — halves KV footprint and enables the Vulkan DP4A fast path
+- `--cache-reuse 256` — automatic prefix-KV reuse across requests that share a ≥256-token prefix (most meaningful on agent workloads where system prompts + tool schemas repeat)
+- `--cache-ram 2048` — caps the in-memory prompt-cache pool at 2 GB (default 8 GB). **Critical for MiniMax** — at 128 ctx with q8_0 KV, the default 8 GB cap's snapshot-save path OOM-killed us. q4_0 + 2 GB cap avoids the crash
+- `--slot-save-path /models/slot-cache` — directory for explicit `POST /slots/{id}?action=save|restore` calls. Not auto-populated (`--cache-reuse` is RAM-only); reserved for future client-side slot persistence
+- `--metrics` — enables Prometheus `/metrics` endpoint for dashboards
+- `-np 1` — single request slot; 108 GB model + KV cache leaves no room for concurrency
+
+**Observed performance (ctx 80K, post-GPU-pin + kernel tuning):**
+
+| Position | Decode tok/s |
+|---|---|
+| Fresh (<5K) | 20-22 |
+| Mid (15-25K) | 19-20 |
+| Deep (35-45K) | 17-18 |
+| Cache-reuse hit | 27-28 (effective-zero position) |
+| Peak prefill (>10K prompt) | 200-285 tok/s |
+
+Summary-reset recovers decode by ~3 tok/s — the agent client is responsible for summarizing (llama.cpp doesn't auto-summarize).
+
+> **Tool calling / reasoning parsers:** MiniMax's model card references `--tool-call-parser minimax_m2` and `--reasoning-parser minimax_m2_append_think`. Those are **vLLM** flags and crash `llama-server` with `invalid argument`. In llama.cpp, `--jinja` handles tool calls via the GGUF's chat template and `--reasoning-format auto` handles the reasoning output.
+
+**CUDA 13.2 warning:** [Unsloth's model card](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF) warns that running these GGUFs on CUDA 13.2 produces gibberish output. This deployment uses the Vulkan backend so that path is avoided, but be aware if you repoint the container image at a CUDA build.
+
+### Observability
+
+With `llamacpp_log_disable: false` in inventory + `--metrics` in the profile's extra_args:
+
+- **Journal**: each request emits `prompt eval time = ... tokens per second` (prefill) and `eval time = ... tokens per second` (decode) lines — tail with `journalctl --user -u llamacpp-server -f`
+- **`/metrics`** (Prometheus): cumulative counters `llamacpp:prompt_tokens_total`, `llamacpp:tokens_predicted_total`, `llamacpp:prompt_seconds_total`, etc. Running-avg gauges `llamacpp:prompt_tokens_seconds` and `llamacpp:predicted_tokens_seconds`
+- **`/slots`**: current slot state (processing/idle, `n_decoded`, `n_remain`, active `params`)
+- **`/props`**: full server config including `build_info`, `chat_template`, `model_alias`
 
 ### Context Size vs. Memory (122B model, 77GB)
 
@@ -245,6 +296,7 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 | Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | Q4_K_XL | **22.8** |
 | Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~84 GB | Q3_K_XL | **~22** |
+| MiniMax-M2.7 (229B) | MoE, 10B active | ~108 GB | UD-IQ4_XS | **TBD** |
 
 ### vLLM (ROCm/TheROCk, --enforce-eager + TunableOp)
 
