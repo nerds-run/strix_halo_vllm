@@ -100,6 +100,48 @@
               - "llamacpp_model_profile == 'big'"
             fail_msg: "llamacpp_service defaults are malformed"
 
+        - name: "Assert super profile has required Nemotron-3-Super launch config"
+          ansible.builtin.assert:
+            that:
+              - "llamacpp_model_profiles.super.repo == 'unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF'"
+              - "'UD-Q3_K_XL' in llamacpp_model_profiles.super.file"
+              - "llamacpp_model_profiles.super.temp | float == 1.0"
+              - "llamacpp_model_profiles.super.top_p | float == 0.95"
+              - "llamacpp_model_profiles.super.top_k | int == 0"
+              - "llamacpp_model_profiles.super.jinja | bool"
+              - "llamacpp_model_profiles.super.cache_type_k in ['q4_0', 'q8_0']"
+              - "llamacpp_model_profiles.super.cache_type_v in ['q4_0', 'q8_0']"
+              - "'--reasoning-format auto' in llamacpp_model_profiles.super.extra_args"
+            fail_msg: "super profile is missing Nemotron-3-Super required launch params"
+
+        # These three are pinned to exact values, not ranges: each is a measured
+        # tuning result that a well-meaning edit could silently undo.
+        - name: "Assert super profile keeps its measured tuning values"
+          ansible.builtin.assert:
+            that:
+              # Full native 1M window. Verified ~73GiB total on hardware; KV is
+              # only 2.25GiB (8 of 89 layers), so 1M is ~free vs 512K.
+              - "llamacpp_model_profiles.super.ctx_size | int == 1048576"
+              # gfx1151 prefill peak: 311 t/s. 1024 → 169, 4096 → 282 (regresses).
+              - "llamacpp_model_profiles.super.ubatch_size | int == 2048"
+              # 8GB prefix-reuse pool — safe at ~63GB resident, unlike minimax.
+              - "'--cache-ram 8192' in llamacpp_model_profiles.super.extra_args"
+            fail_msg: >-
+              super profile tuning values were changed — these are measured
+              optima, not defaults. Re-benchmark before altering.
+
+        - name: "Assert --special is never passed (breaks the tool-call parser)"
+          ansible.builtin.assert:
+            that:
+              - "'--special' not in (item.value.extra_args | default([]))"
+            fail_msg: >-
+              {{ item.key }} passes --special, which leaks <|im_end|> into the
+              assistant stream as literal text and breaks tool-call parsing
+            quiet: true
+          loop: "{{ llamacpp_model_profiles | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
         - name: "Assert minimax profile has required MiniMax-M2.7 launch config"
           ansible.builtin.assert:
             that:
@@ -128,19 +170,124 @@
           loop_control:
             label: "{{ item.key }}"
 
-    - name: "Validate openwebui_ui mode-aware URL resolution"
+    # Renders the real Quadlet template for every profile. This is the only
+    # test that exercises the Jinja itself — where this project's documented
+    # whitespace/continuation pitfalls actually live.
+    - name: "Validate llamacpp Quadlet template renders correctly"
       block:
-        - name: "Test llamacpp mode URL resolution"
-          ansible.builtin.set_fact:
-            _test_url: >-
-              {{ ''
-                 if ('' | length > 0)
-                 else ('http://127.0.0.1:8080/v1')
-                 if ('llamacpp' == 'llamacpp')
-                 else ('http://127.0.0.1:8000/v1') }}
+        # These tasks build throwaway fixtures, so they report changed_when:
+        # false — otherwise molecule's idempotence stage fails on every run.
+        - name: "Create render scratch dir"
+          ansible.builtin.tempfile:
+            state: directory
+            suffix: quadlet-render
+          register: _render_dir
+          changed_when: false
 
-        - name: "Assert llamacpp URL resolves to port 8080"
+        - name: "Render Quadlet for each profile"
+          ansible.builtin.template:
+            src: "{{ playbook_dir }}/../../roles/llamacpp_service/templates/llamacpp-server.container.j2"
+            dest: "{{ _render_dir.path }}/{{ item.key }}.container"
+            mode: "0600"
+          changed_when: false
+          vars:
+            llamacpp_model_profile: "{{ item.key }}"
+            llamacpp_active: "{{ item.value }}"
+            llamacpp_service_model_dir_expanded: "/tmp/models"
+            llamacpp_service_repo_dir: "{{ item.value.repo | regex_replace('/', '_') }}"
+          loop: "{{ llamacpp_model_profiles | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: "Read rendered units"
+          ansible.builtin.slurp:
+            src: "{{ _render_dir.path }}/{{ item.key }}.container"
+          register: _rendered
+          loop: "{{ llamacpp_model_profiles | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: "Assert each rendered unit is structurally sound"
           ansible.builtin.assert:
             that:
-              - "'8080' in _test_url"
-            fail_msg: "URL resolution for llamacpp mode failed: {{ _test_url }}"
+              # The Exec line must exist and name the profile's own GGUF.
+              - "'Exec=llama-server' in _text"
+              - "item.item.value.file in _text"
+              # ctx/batch/ubatch must reach the command line.
+              - "('--ctx-size ' ~ item.item.value.ctx_size) in _text"
+              - >-
+                (item.item.value.ubatch_size is not defined)
+                or (('-ub ' ~ item.item.value.ubatch_size) in _text)
+              # repeat_penalty 0 must OMIT the flag, not pass a literal 0.
+              - >-
+                ('--repeat-penalty' in _text)
+                == ((item.item.value.repeat_penalty | default(0) | float) > 0)
+              # Never emit --special (breaks tool-call parsing).
+              - "'--special' not in _text"
+              # The command must terminate with the alias line, proving the
+              # whole backslash-continued block survived rendering intact.
+              # Compares against llamacpp_model_profile rather than item.key:
+              # include_vars above outranks task vars, so the template always
+              # sees the default profile name. Per-profile identity is already
+              # covered by the `file` assertion.
+              - "('--alias ' ~ llamacpp_model_profile) in _text"
+              # Every Exec line except the terminator keeps its trailing
+              # backslash. A dropped one silently truncates the command.
+              - "_bad_cont | length == 0"
+            fail_msg: >-
+              Rendered Quadlet for profile '{{ item.item.key }}' is malformed.
+              Exec lines missing a continuation backslash: {{ _bad_cont }}
+            quiet: true
+          vars:
+            _text: "{{ item.content | b64decode }}"
+            # Regex lives in its own scalar: nesting it as a Jinja string
+            # literal collapses the escaping into an invalid character class.
+            _bs_rx: >-
+              [\\]$
+            # Double-quoted so YAML turns \n into a real newline before Jinja
+            # sees it — a folded scalar leaves it literal and the split no-ops.
+            _exec_lines: "{{ (item.content | b64decode).split('Exec=')[1].split('\n[Service]')[0].split('\n') }}"
+            # Drop blanks, then the final line (the --alias terminator, which
+            # legitimately has no continuation backslash).
+            _bad_cont: "{{ (_exec_lines | reject('equalto', '') | list)[:-1] | reject('search', _bs_rx) | list }}"
+          loop: "{{ _rendered.results }}"
+          loop_control:
+            label: "{{ item.item.key }}"
+
+        - name: "Remove render scratch dir"
+          ansible.builtin.file:
+            path: "{{ _render_dir.path }}"
+            state: absent
+          changed_when: false
+
+    - name: "Validate openwebui_ui mode-aware URL resolution"
+      block:
+        # Mirrors the expression in roles/openwebui_ui/tasks/main.yml. Checks
+        # every mode, and that an explicit override always wins.
+        - name: "Resolve backend URL per mode"
+          ansible.builtin.set_fact:
+            _resolved: >-
+              {{ _resolved | default({}) | combine({item.mode ~ '/' ~ (item.override | length | string): (
+                   item.override
+                   if (item.override | length > 0)
+                   else ('http://127.0.0.1:' ~ (llamacpp_port | default(8080) | string) ~ '/v1')
+                   if (item.mode == 'llamacpp')
+                   else ('http://127.0.0.1:' ~ (vllm_port | default(8000) | string) ~ '/v1')
+                 )}) }}
+          loop:
+            - {mode: "llamacpp", override: ""}
+            - {mode: "service", override: ""}
+            - {mode: "both", override: ""}
+            - {mode: "llamacpp", override: "http://example.invalid/v1"}
+          loop_control:
+            label: "{{ item.mode }}{{ ' (override)' if item.override else '' }}"
+
+        - name: "Assert each mode maps to the correct backend port"
+          ansible.builtin.assert:
+            that:
+              - "_resolved['llamacpp/0'] == 'http://127.0.0.1:8080/v1'"
+              - "_resolved['service/0'] == 'http://127.0.0.1:8000/v1'"
+              - "_resolved['both/0'] == 'http://127.0.0.1:8000/v1'"
+              # An explicit base URL must win over mode-based resolution.
+              - "_resolved['llamacpp/25'] == 'http://example.invalid/v1'"
+            fail_msg: "openwebui_ui URL resolution is wrong: {{ _resolved }}"

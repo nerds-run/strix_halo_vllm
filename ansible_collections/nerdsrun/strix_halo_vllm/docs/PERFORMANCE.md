@@ -145,16 +145,52 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 | Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **~95** |
 | Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
-| Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~84 GB | Q3_K_XL | **~22** |
+| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **15.6** |
 | MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **~22 fresh / ~17 at 40K ctx** |
 
 ### Vulkan-Specific Tuning
 
-- **`-b 512`** (batch size, logical): Default. Per-profile override in `llamacpp_model_profiles.<profile>.batch_size` (e.g. `super` uses `2048`, `minimax` uses `4096` for faster prefill on long prompts)
-- **`-ub 512`** (ubatch, physical): Default. Set `llamacpp_ubatch_size: 1024` or per-profile `ubatch_size` for **~+30% prefill throughput** on Vulkan/RADV (gfx1151-specific optimization — pure prefill lever, decode is unaffected)
+- **`-b 512`** (batch size, logical): Default. Per-profile override in `llamacpp_model_profiles.<profile>.batch_size` (e.g. `super` and `minimax` both use `4096` for faster prefill on long prompts)
+- **`-ub 512`** (ubatch, physical): Default. Set `llamacpp_ubatch_size` globally or per-profile `ubatch_size` — this is the single biggest prefill lever on Vulkan/RADV (gfx1151-specific; decode is unaffected). Measured sweep on the `super` profile with 1.6K-token prompts:
+
+  | `-ub` | Prefill t/s |
+  |---|---|
+  | 1024 | 169 |
+  | 1536 | 283 |
+  | **2048** | **311** ← peak |
+  | 4096 | 282 ← regresses |
+
+  **2048 is the gfx1151 sweet spot.** Above it, throughput drops — likely iGPU cache thrash or memory-bandwidth saturation on the wider ops in RDNA3.5. The older `1024` recommendation leaves ~45% of prefill throughput on the table.
+
+  Re-verified on hardware at `-ub 2048` (3 cold runs per size, `cache_prompt: false`):
+
+  | Prompt size | Prefill t/s (median) |
+  |---|---|
+  | 1.6K | 324 (334 peak) |
+  | 6K | 357 |
+  | 12K | 356 |
+
+  Throughput **plateaus around 6K** and holds flat through 12K — it does not keep climbing with prompt length. Below ~1K tokens, fixed per-request overhead dominates and the effective rate falls off sharply (real traffic shows 70-100 t/s on sub-150-token prompts), which is expected and not a tuning problem.
+
+  Note that `-ub` also sets the compute buffer size (~14.1 GiB at 2048), so it is the main non-weight memory consumer — see the `super` breakdown below.
 - **`--no-mmap`**: Required on Strix Halo unified memory — prevents crashes
 - **`-fa 1`** (flash attention): Required for stability on gfx1151. Combined with quantized KV cache (both k and v must be the same quant), llama.cpp v4100+ uses a DP4A integer-dot-product fast path for Vulkan (see [PR #20797](https://github.com/ggml-org/llama.cpp/pull/20797))
 - **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context. Note: mismatched k/v quants (e.g. k=q8_0 v=q4_0) disable the DP4A fast path — keep them matched
+
+### Sizing `--cache-ram` (prompt-cache pool)
+
+`--cache-reuse 256` gives automatic prefix-KV reuse across requests sharing a ≥256-token prefix — a large win on agent workloads where system prompts and tool schemas repeat. Those snapshots live in an in-memory pool whose size is capped by `--cache-ram`, and **that pool is additive on top of weights + KV**. llama.cpp's default is 8 GB, which is not always safe on a 128 GB unified-memory box.
+
+Size it against **total resident usage before the pool** — weights + KV + compute buffers — not weights alone, and not a figure that already includes the pool:
+
+| Resident before pool | `--cache-ram` | Rationale |
+|---|---|---|
+| **~100+ GB** (`minimax`: ~108 GB weights, tight even before buffers) | `2048` or smaller | Two OOM incidents traced directly to the 8 GB default — the snapshot-save path had nowhere to grow |
+| **~70-80 GiB** (`super`: 58.3 GiB weights + 2.25 GiB KV + 14.1 GiB compute at `-ub 2048` ≈ 73 GiB) | `8192` | Lands at ~81 GiB with the pool, leaving ~44 GiB spare. The wider pool pays for itself: every reused prefix skips a full prefill |
+
+The failure mode is not gradual — the pool grows as snapshots accumulate, so a model that starts fine can OOM-kill the service well into a session. When in doubt on a tight fit, cap low.
+
+`--slot-save-path` is unrelated to this pool: it backs explicit `POST /slots/{id}?action=save|restore` API calls and is never auto-populated by `--cache-reuse`.
 
 ### Host-Side Tuning (gpu_tuning role)
 
@@ -168,12 +204,42 @@ The `gpu_tuning` role writes two things to persist across reboots:
 The `nemotron` and `super` profiles use NVIDIA's hybrid Mamba-Transformer architectures:
 
 - **Nemotron-3-Nano-30B-A3B** — Mamba blocks + MoE (128 experts, 6 active per token). Coding/agentic focus.
-- **Nemotron-3-Super-120B-A12B** — LatentMoE: Mamba-2 + MoE + Attention layers. Reasoning/planning focus. Multi-Token Prediction (MTP) layers may be present in the GGUF but `--speculative-config` support for this arch is not yet wired up in llama.cpp.
+- **NVIDIA-Nemotron-3-Super-120B-A12B** — LatentMoE: Mamba-2 + MoE + Attention layers. Reasoning, planning, agentic tool-use. Runs at the **full native 1,048,576-token context** by default. Multi-Token Prediction (MTP) layers may be present in the GGUF but `--speculative-config` support for this arch is not yet wired up in llama.cpp.
 
 **Requirements:**
 
 - llama.cpp build **≥8351** — fixes a `mamba-base.cpp` assertion that crashes earlier builds ([ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570))
-- `super` needs ~84 GB resident at Q3_K_XL — do **not** run alongside other containerized models on a 128 GB system
+- `super` runs in ~73 GiB total at UD-Q3_K_XL with the full 1M context. Measured breakdown from the running server:
+
+  | Component | Size | Scales with |
+  |---|---|---|
+  | Model buffers (Vulkan0 + host + CPU) | 58.3 GiB | — |
+  | KV cache, q4_0 | **2.25 GiB** | context |
+  | Compute buffers (Vulkan0 + host) | 14.1 GiB | **ubatch**, not context |
+
+  **The KV cache is the small part.** Only **8 of 89 layers** carry KV at all — the rest are constant-state Mamba-2 / MoE — so a 1M-token window costs 2.25 GiB, which is why 1M is essentially free versus 512K. The 14.1 GiB compute buffer is a function of `-ub 2048`, so it's the ubatch setting that dominates non-weight memory here, not the context length. Budget accordingly: raising `-ub` costs memory, extending context barely does.
+
+**Decode throughput (measured, 3 runs per depth, `cache_prompt: false`):**
+
+| Context depth | Decode tok/s |
+|---|---|
+| ~23 tok | 15.68 |
+| ~8K | 15.51 |
+| ~32K | 15.46 |
+
+Decode is **flat with context** — a 32K context costs ~1.4% versus an empty one. This follows from the same property that makes 1M context cheap: only 8 of 89 layers do attention, so the per-token cost is dominated by the constant-state Mamba-2 / MoE layers. Contrast `minimax`, a conventional MoE, which drops from ~22 to ~17 tok/s between fresh and 40K context.
+
+The practical consequence: **`super` is the right choice for genuinely long-context work**, even though its fresh-context decode is slower than a comparable dense-attention model. It does not degrade as the conversation grows.
+
+> Earlier revisions of this table listed `~22` tok/s for `super`. That figure was an estimate carried over from the profile's introduction and was never measured; the real value is 15.6.
+
+**Tool calling / reasoning:**
+
+- NVIDIA's official spec (vLLM/SGLang) uses `--tool-call-parser qwen3_coder` plus a custom `super_v3` reasoning-parser plugin. **Neither is supported by `llama-server`** — passing them crashes the server with `invalid argument`.
+- The profile uses `--jinja` (so the GGUF's bundled chat template handles tool-call JSON) and `--reasoning-format auto`, which surfaces `<think>` blocks in the dedicated `reasoning_content` response field.
+- **Do not add `--special`.** It was tried for `<think>`/`</think>` visibility but leaks `<|im_end|>` into the assistant stream as literal text, which breaks the tool-call parser. `--reasoning-format auto` already exposes the reasoning separately, so it buys nothing.
+- NVIDIA mandates **`temperature=1.0`, `top_p=0.95`** across reasoning, tool calling, and chat. The profile reflects this.
+- Per-request reasoning controls (`enable_thinking`, `low_effort`) are passed via `chat_template_kwargs` in the OpenAI-compatible API body, e.g. `extra_body={"chat_template_kwargs": {"enable_thinking": true, "low_effort": true}}`.
 
 ### MiniMax-M2.7 (minimax profile)
 
@@ -295,7 +361,7 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 | Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE, 3B active | ~20 GB | Q4_K_XL | **~95** |
 | Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | Q4_K_XL | **22.8** |
-| Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~84 GB | Q3_K_XL | **~22** |
+| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~63 GB | UD-Q3_K_XL | **15.6** |
 | MiniMax-M2.7 (229B) | MoE, 10B active | ~108 GB | UD-IQ4_XS | **TBD** |
 
 ### vLLM (ROCm/TheROCk, --enforce-eager + TunableOp)

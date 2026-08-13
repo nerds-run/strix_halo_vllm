@@ -79,13 +79,13 @@ Pin the amdgpu (gfx1151) iGPU to a high-performance state so Vulkan compute work
 | `llamacpp_host` | string | `"0.0.0.0"` | llama.cpp bind address |
 | `llamacpp_port` | int | `8080` | llama.cpp listen port |
 | `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `nemotron`, `super`, or `minimax` |
-| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions. Per-profile overrides available for: `batch_size`, `ubatch_size`, `cache_type_k`, `cache_type_v`, `extra_args` |
+| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions. Per-profile keys: `repo`, `file`, `include`, `ctx_size`, `temp`, `top_p`, `top_k`, `min_p`, `jinja`, `repeat_penalty`, `batch_size`, `ubatch_size`, `cache_type_k`, `cache_type_v`, `extra_args`. A `repeat_penalty` of `0` omits the flag entirely rather than passing `--repeat-penalty 0` |
 | `llamacpp_model_dir` | string | `"~/models"` | Directory for GGUF model storage |
 | `llamacpp_ngl` | int | `999` | GPU layers to offload (999 = all) |
 | `llamacpp_flash_attn` | bool | `true` | Enable flash attention |
 | `llamacpp_no_mmap` | bool | `true` | Disable mmap (required for Strix Halo stability) |
 | `llamacpp_batch_size` | int | `512` | Logical batch size for prompt processing (per-profile `batch_size` overrides) |
-| `llamacpp_ubatch_size` | int | `0` | Physical (micro) batch size. `0` lets llama-server pick (default 512); `1024` improves prefill throughput on Vulkan/RADV at the cost of some GPU scratch memory |
+| `llamacpp_ubatch_size` | int | `0` | Physical (micro) batch size. `0` lets llama-server pick (default 512). **`2048` is the measured gfx1151 prefill peak** (311 t/s vs 169 at 1024); 4096 regresses. Also sets the compute-buffer size (~14 GiB at 2048), which is the main non-weight memory cost — see [PERFORMANCE.md](PERFORMANCE.md#vulkan-specific-tuning) |
 | `llamacpp_thinking_enabled` | bool | `true` | Enable thinking/reasoning mode |
 | `llamacpp_log_disable` | bool | `true` | Pass `--log-disable` to llama-server (reduces log noise). Set `false` to stream per-request `prompt eval time` / `eval time` to the journal |
 | `llamacpp_cache_type_k` | string | `""` | KV cache key quantization (e.g. `q8_0`, `q4_0`) — per-profile `cache_type_k` overrides |
@@ -117,6 +117,14 @@ Pin the amdgpu (gfx1151) iGPU to a high-performance state so Vulkan compute work
 | `openwebui_openai_api_base_url` | string | `""` (auto-resolved) | Backend API URL (auto-detected from `strix_halo_mode`) |
 | `openwebui_openai_api_key` | string | `"local-dev-key"` | API key for backend connection |
 | `openwebui_container_name` | string | `"open-webui"` | Container name |
+
+## Verify Variables
+
+The `verify` role is tagged `never` and runs on demand only (`mise run verify`).
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `verify_log_lines` | int | `50` | Journal lines to pull per service when reporting deployment status |
 
 ## Uninstall Variables
 
