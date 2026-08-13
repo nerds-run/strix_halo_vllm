@@ -165,6 +165,21 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 - **`-fa 1`** (flash attention): Required for stability on gfx1151. Combined with quantized KV cache (both k and v must be the same quant), llama.cpp v4100+ uses a DP4A integer-dot-product fast path for Vulkan (see [PR #20797](https://github.com/ggml-org/llama.cpp/pull/20797))
 - **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context. Note: mismatched k/v quants (e.g. k=q8_0 v=q4_0) disable the DP4A fast path — keep them matched
 
+### Sizing `--cache-ram` (prompt-cache pool)
+
+`--cache-reuse 256` gives automatic prefix-KV reuse across requests sharing a ≥256-token prefix — a large win on agent workloads where system prompts and tool schemas repeat. Those snapshots live in an in-memory pool whose size is capped by `--cache-ram`, and **that pool is additive on top of weights + KV**. llama.cpp's default is 8 GB, which is not always safe on a 128 GB unified-memory box.
+
+Size it against the model's resident footprint:
+
+| Model footprint | `--cache-ram` | Rationale |
+|---|---|---|
+| **~100+ GB** (e.g. `minimax`, ~108 GB) | `2048` or smaller | Two OOM incidents traced directly to the 8 GB default — the snapshot-save path had nowhere to grow |
+| **~60-80 GB** (e.g. `super`, ~63 GB + ~14 GB KV at 1M ctx) | `8192` | ~48 GB stays free. The wider pool pays for itself: every reused prefix skips a full prefill |
+
+The failure mode is not gradual — the pool grows as snapshots accumulate, so a model that starts fine can OOM-kill the service well into a session. When in doubt on a tight fit, cap low.
+
+`--slot-save-path` is unrelated to this pool: it backs explicit `POST /slots/{id}?action=save|restore` API calls and is never auto-populated by `--cache-reuse`.
+
 ### Host-Side Tuning (gpu_tuning role)
 
 The `gpu_tuning` role writes two things to persist across reboots:
