@@ -100,6 +100,48 @@
               - "llamacpp_model_profile == 'big'"
             fail_msg: "llamacpp_service defaults are malformed"
 
+        - name: "Assert super profile has required Nemotron-3-Super launch config"
+          ansible.builtin.assert:
+            that:
+              - "llamacpp_model_profiles.super.repo == 'unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF'"
+              - "'UD-Q3_K_XL' in llamacpp_model_profiles.super.file"
+              - "llamacpp_model_profiles.super.temp | float == 1.0"
+              - "llamacpp_model_profiles.super.top_p | float == 0.95"
+              - "llamacpp_model_profiles.super.top_k | int == 0"
+              - "llamacpp_model_profiles.super.jinja | bool"
+              - "llamacpp_model_profiles.super.cache_type_k in ['q4_0', 'q8_0']"
+              - "llamacpp_model_profiles.super.cache_type_v in ['q4_0', 'q8_0']"
+              - "'--reasoning-format auto' in llamacpp_model_profiles.super.extra_args"
+            fail_msg: "super profile is missing Nemotron-3-Super required launch params"
+
+        # These three are pinned to exact values, not ranges: each is a measured
+        # tuning result that a well-meaning edit could silently undo.
+        - name: "Assert super profile keeps its measured tuning values"
+          ansible.builtin.assert:
+            that:
+              # Full native 1M window. Measured ~76GB total (model + q4_0 KV) —
+              # effectively free vs 512K on the hybrid LatentMoE arch.
+              - "llamacpp_model_profiles.super.ctx_size | int == 1048576"
+              # gfx1151 prefill peak: 311 t/s. 1024 → 169, 4096 → 282 (regresses).
+              - "llamacpp_model_profiles.super.ubatch_size | int == 2048"
+              # 8GB prefix-reuse pool — safe at ~63GB resident, unlike minimax.
+              - "'--cache-ram 8192' in llamacpp_model_profiles.super.extra_args"
+            fail_msg: >-
+              super profile tuning values were changed — these are measured
+              optima, not defaults. Re-benchmark before altering.
+
+        - name: "Assert --special is never passed (breaks the tool-call parser)"
+          ansible.builtin.assert:
+            that:
+              - "'--special' not in (item.value.extra_args | default([]))"
+            fail_msg: >-
+              {{ item.key }} passes --special, which leaks <|im_end|> into the
+              assistant stream as literal text and breaks tool-call parsing
+            quiet: true
+          loop: "{{ llamacpp_model_profiles | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
         - name: "Assert minimax profile has required MiniMax-M2.7 launch config"
           ansible.builtin.assert:
             that:

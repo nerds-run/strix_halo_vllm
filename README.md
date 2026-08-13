@@ -83,10 +83,10 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 | `coder` | Qwen3-Coder-30B-A3B | ~20 GB | 3B | ~83 | Coding, tool-use, agentic |
 | `fast` | Qwen3.5-35B-A3B | ~20 GB | 3B | ~59 | Fast general + vision |
 | `nemotron` | Nemotron-3-Nano-30B-A3B | ~20 GB | 3B | ~95 | Coding, agentic, reasoning |
-| `super` | Nemotron-3-Super-120B-A12B | ~84 GB | 12B | ~22 | Reasoning, planning, orchestration |
+| `super` | NVIDIA-Nemotron-3-Super-120B-A12B | ~63 GB | 12B | ~22 | Reasoning, planning, tool-calling (1M ctx native) |
 | `minimax` | MiniMax-M2.7 (229B MoE) | ~108 GB | 10B | TBD | Long-context agentic, tool-use, reasoning |
 
-> **Note:** The `nemotron` and `super` profiles require llama.cpp build **≥8351** (fixes [ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570) — mamba-base.cpp assertion crash). Both are hybrid Mamba-Transformer architectures. The `super` profile uses ~84 GB at Q3_K_XL — do not run alongside other models on 128 GB systems.
+> **Note:** The `nemotron` and `super` profiles require llama.cpp build **≥8351** (fixes [ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570) — mamba-base.cpp assertion crash). Both are hybrid Mamba-Transformer architectures. The `super` profile runs at the **full native 1,048,576-token context** (~76 GB total — model + KV) on a 128 GB Strix Halo. The hybrid LatentMoE design keeps KV growth nearly flat with context (Mamba-2 layers have constant state, only attention layers scale), so 1M fits with ~48 GB to spare for cache-reuse and other workloads. Tool calling rides on `--jinja` + the GGUF's chat template; the vLLM-only `--tool-call-parser qwen3_coder` / `--reasoning-parser super_v3` flags are NOT supported by `llama-server` and will crash it.
 >
 > **MiniMax-M2.7:** Ships at UD-IQ4_XS (~108 GB) — the tightest fit on 128 GB unified memory. Do not run alongside other models. Tool calling rides on `--jinja` + the chat template baked into the GGUF, with `--reasoning-format auto` to surface the model's reasoning blocks (llama.cpp does not support the vLLM-style `--tool-call-parser` / `--reasoning-parser` flags referenced in the MiniMax docs). Per [Unsloth docs](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF), do **NOT** run these GGUFs on CUDA 13.2 (produces gibberish) — this deployment uses Vulkan, so no action needed.
 

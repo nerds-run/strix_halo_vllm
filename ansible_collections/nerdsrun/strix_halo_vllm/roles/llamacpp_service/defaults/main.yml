@@ -18,9 +18,15 @@ llamacpp_port: 8080
 # coder:    Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
 # fast:     Qwen3.5-35B-A3B — fast reasoning/vision/coding (~20GB, ~50-55 tok/s)
 # nemotron: Nemotron-3-Nano-30B-A3B — hybrid Mamba-Transformer MoE, coding/agentic/reasoning (~20GB)
-# super:    Nemotron-3-Super-120B-A12B — hybrid LatentMoE (Mamba-2+MoE+Attn), reasoning/planning (~84GB)
-#           WARNING: ~84GB at Q4 leaves minimal headroom on 128GB — do not run alongside other models
+# super:    Nemotron-3-Super-120B-A12B — hybrid LatentMoE (Mamba-2+MoE+Attn), reasoning/planning (~63GB)
+#           NOTE: GGUF dropped to UD-Q3_K_XL (~63GB) so the long context fits on 128GB
+#           NOTE: Runs at the full native 1M context (ctx_size 1048576) — measured
+#           ~76GB total (model + q4_0 KV) on a 128GB box, see the profile comments
 #           NOTE: Requires llama.cpp build ≥8351 (mamba-base.cpp assertion fix, issue #20570)
+#           Tool-call: vLLM uses --tool-call-parser qwen3_coder + super_v3 reasoning parser
+#           plugin; llama-server has neither, so we use --jinja and let the GGUF chat
+#           template handle tool calls. Reasoning toggled per-request via
+#           chat_template_kwargs.enable_thinking / low_effort.
 # minimax:  MiniMax-M2.7 — 229B MoE / 10B active, long-context agentic + reasoning (~108GB)
 #           WARNING: ~108GB at UD-IQ4_XS — tightest fit on 128GB, do not run alongside other models
 #           NOTE: Vulkan backend only — do NOT use CUDA 13.2 (produces gibberish per Unsloth docs)
@@ -79,28 +85,69 @@ llamacpp_model_profiles:
       - "--reasoning on"
   super:
     # Hybrid LatentMoE (Mamba-2 + MoE + Attention), Multi-Token Prediction
-    # 120B total / 12B active per token — requires ~84GB at Q4_K_XL
-    # WARNING: Leaves minimal headroom on 128GB — do not run alongside other models
+    # 120B total / 12B active per token — UD-Q3_K_XL is ~63GB (native 1M ctx)
+    # Repo: NVIDIA-prefixed name republished by Unsloth (the legacy name 404s)
     # Requires llama.cpp build ≥8351 (mamba-base.cpp assertion fix, issue #20570)
+    # Sampling: NVIDIA mandates temp=1.0, top_p=0.95 for ALL tasks (chat / tool /
+    #   reasoning). top_k disabled (=0) — spec is silent so we don't override.
+    # Tool calling: vLLM uses --tool-call-parser qwen3_coder + a custom super_v3
+    #   reasoning-parser plugin; both are unsupported by llama-server. The GGUF
+    #   ships the official chat template so --jinja + --reasoning-format auto
+    #   surfaces tool-call JSON and <think> blocks natively.
+    # NOTE: --special was tried for <think>/</think> visibility but it leaked
+    #   <|im_end|> into the assistant stream as literal text, which crashed the
+    #   tool-call parser. --reasoning-format auto already exposes <think> blocks
+    #   via the dedicated `reasoning_content` field, so --special is unnecessary.
+    # Context: native 1M tokens — set to 1048576 (full window). Measured cost
+    #   on a 128GB box: ~76GB used at 1M, ~77GB at 512K (yes, 1M was effectively
+    #   free vs 512K). The hybrid LatentMoE arch is what lets this happen — most
+    #   of the 120B params live in constant-state Mamba-2 / MoE layers; only the
+    #   handful of attention layers carry ctx-scaling KV, so q4_0 KV at 1M lands
+    #   around ~14GB total. Leaves ~48GB free for cache-reuse, buffers, other
+    #   containers. No reason to dial back unless you're stacking workloads.
     # TODO: MTP (Multi-Token Prediction) layers may be in GGUF — enable with
     #       --speculative-config flags once llama.cpp supports MTP for this arch
-    repo: "unsloth/Nemotron-3-Super-120B-A12B-GGUF"
+    repo: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF"
     file: "UD-Q3_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q3_K_XL-00001-of-00003.gguf"
     include: "*UD-Q3_K_XL*"
-    ctx_size: 131072
-    temp: 0.6
+    ctx_size: 1048576
+    temp: 1.0
     top_p: 0.95
-    top_k: 20
+    top_k: 0
     min_p: 0.0
     jinja: true
-    repeat_penalty: 1.05
-    batch_size: 2048
+    repeat_penalty: 0
+    batch_size: 4096
+    # Empirical sweep on the super profile (1.6K-token prompts):
+    #   ubatch=1024 → 169 t/s prefill (strix-halo-guide-validated)
+    #   ubatch=1536 → 283 t/s prefill
+    #   ubatch=2048 → 311 t/s prefill  ← peak, scales to 356 t/s @ 6K prompts
+    #   ubatch=4096 → 282 t/s prefill  ← regressed (likely iGPU cache thrash
+    #                                    or memory-bandwidth saturation at the
+    #                                    wider ops on gfx1151's RDNA3.5).
+    # 2048 is the iGPU sweet spot. Don't push higher without re-measuring.
+    ubatch_size: 2048
     cache_type_k: "q4_0"
     cache_type_v: "q4_0"
     extra_args:
-      - "--reasoning-format deepseek"
-      - "--reasoning auto"
-      - "--reasoning-budget 256"
+      - "--reasoning-format auto"
+      - "--cache-reuse 256"
+      # 8GB prefix-reuse pool — quadrupled from the minimax default of 2GB
+      # because the super profile at 1M ctx leaves ~48GB free, and agentic
+      # loops with shared system prompts get a big win from a wider snapshot
+      # cache (every reused prefix skips a 148 tok/s prefill).
+      - "--cache-ram 8192"
+      # NOTE: --mlock was tried but is unusable in this deployment. The rootless
+      # user's RLIMIT_MEMLOCK is 8MB (PAM 25-pw-rlimits.conf hard cap), so the
+      # 63GB model can't be locked. llama.cpp prints a warning per buffer and
+      # carries on. Raising it requires a root /etc/security/limits.d/ drop-in
+      # plus session re-login — too much yak-shaving for a stability win we
+      # can't even measure (48GB free headroom, no swap pressure observed).
+      # 8 HTTP worker threads (default is 4) — handles Open WebUI + a CLI agent
+      # hitting the API concurrently without queue contention. Strix Halo has
+      # 16 cores / 32 threads, so 8 HTTP workers is well within budget.
+      - "--threads-http 8"
+      - "--metrics"
       - "-np 1"
   minimax:
     # MiniMax-M2.7 — 229B MoE / 10B active per token
@@ -136,6 +183,9 @@ llamacpp_model_profiles:
     # Physical ubatch 1024 (up from llama.cpp's default 512) — strix-halo-guide
     # benchmarks +22% pp128 on Vulkan/RADV for gfx1151. Pure prefill lever,
     # decode is unaffected.
+    # NOT bumped to 2048 despite the super-profile sweep favoring it: at ~108GB
+    # resident this profile has no headroom for the wider compute buffers, and
+    # the sweep was measured on super (63GB). Re-measure here before changing.
     ubatch_size: 1024
     cache_type_k: "q4_0"
     cache_type_v: "q4_0"
