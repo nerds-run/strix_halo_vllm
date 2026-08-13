@@ -119,8 +119,8 @@
         - name: "Assert super profile keeps its measured tuning values"
           ansible.builtin.assert:
             that:
-              # Full native 1M window. Measured ~76GB total (model + q4_0 KV) —
-              # effectively free vs 512K on the hybrid LatentMoE arch.
+              # Full native 1M window. Verified ~73GiB total on hardware; KV is
+              # only 2.25GiB (8 of 89 layers), so 1M is ~free vs 512K.
               - "llamacpp_model_profiles.super.ctx_size | int == 1048576"
               # gfx1151 prefill peak: 311 t/s. 1024 → 169, 4096 → 282 (regresses).
               - "llamacpp_model_profiles.super.ubatch_size | int == 2048"

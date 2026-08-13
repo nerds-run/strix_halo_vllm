@@ -157,10 +157,22 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
   |---|---|
   | 1024 | 169 |
   | 1536 | 283 |
-  | **2048** | **311** ← peak (scales to 356 t/s at 6K prompts) |
+  | **2048** | **311** ← peak |
   | 4096 | 282 ← regresses |
 
-  **2048 is the gfx1151 sweet spot.** Above it, throughput drops — likely iGPU cache thrash or memory-bandwidth saturation on the wider ops in RDNA3.5. Re-measure before deviating; the older `1024` recommendation leaves ~45% of prefill throughput on the table.
+  **2048 is the gfx1151 sweet spot.** Above it, throughput drops — likely iGPU cache thrash or memory-bandwidth saturation on the wider ops in RDNA3.5. The older `1024` recommendation leaves ~45% of prefill throughput on the table.
+
+  Re-verified on hardware at `-ub 2048` (3 cold runs per size, `cache_prompt: false`):
+
+  | Prompt size | Prefill t/s (median) |
+  |---|---|
+  | 1.6K | 324 (334 peak) |
+  | 6K | 357 |
+  | 12K | 356 |
+
+  Throughput **plateaus around 6K** and holds flat through 12K — it does not keep climbing with prompt length. Below ~1K tokens, fixed per-request overhead dominates and the effective rate falls off sharply (real traffic shows 70-100 t/s on sub-150-token prompts), which is expected and not a tuning problem.
+
+  Note that `-ub` also sets the compute buffer size (~14.1 GiB at 2048), so it is the main non-weight memory consumer — see the `super` breakdown below.
 - **`--no-mmap`**: Required on Strix Halo unified memory — prevents crashes
 - **`-fa 1`** (flash attention): Required for stability on gfx1151. Combined with quantized KV cache (both k and v must be the same quant), llama.cpp v4100+ uses a DP4A integer-dot-product fast path for Vulkan (see [PR #20797](https://github.com/ggml-org/llama.cpp/pull/20797))
 - **KV cache quantization** (`--cache-type-k q8_0 --cache-type-v q8_0`): Saves ~50% KV memory for longer context. Note: mismatched k/v quants (e.g. k=q8_0 v=q4_0) disable the DP4A fast path — keep them matched
@@ -174,7 +186,7 @@ Size it against the model's resident footprint:
 | Model footprint | `--cache-ram` | Rationale |
 |---|---|---|
 | **~100+ GB** (e.g. `minimax`, ~108 GB) | `2048` or smaller | Two OOM incidents traced directly to the 8 GB default — the snapshot-save path had nowhere to grow |
-| **~60-80 GB** (e.g. `super`, ~63 GB + ~14 GB KV at 1M ctx) | `8192` | ~48 GB stays free. The wider pool pays for itself: every reused prefix skips a full prefill |
+| **~60-80 GB** (e.g. `super`, ~73 GiB total at 1M ctx) | `8192` | ~50 GiB stays free. The wider pool pays for itself: every reused prefix skips a full prefill |
 
 The failure mode is not gradual — the pool grows as snapshots accumulate, so a model that starts fine can OOM-kill the service well into a session. When in doubt on a tight fit, cap low.
 
@@ -197,7 +209,15 @@ The `nemotron` and `super` profiles use NVIDIA's hybrid Mamba-Transformer archit
 **Requirements:**
 
 - llama.cpp build **≥8351** — fixes a `mamba-base.cpp` assertion that crashes earlier builds ([ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570))
-- `super` needs ~63 GB resident at UD-Q3_K_XL. Measured KV growth on the hybrid LatentMoE arch is nearly flat with context — at 1M ctx the total footprint is ~76 GB (model + KV at q4_0), basically identical to 512K. Most params live in constant-state Mamba-2 / MoE layers; only the few attention layers carry ctx-scaling KV. Plenty of headroom on 128 GB to leave Open WebUI or other small containers running alongside.
+- `super` runs in ~73 GiB total at UD-Q3_K_XL with the full 1M context. Measured breakdown from the running server:
+
+  | Component | Size | Scales with |
+  |---|---|---|
+  | Model buffers (Vulkan0 + host + CPU) | 58.3 GiB | — |
+  | KV cache, q4_0 | **2.25 GiB** | context |
+  | Compute buffers (Vulkan0 + host) | 14.1 GiB | **ubatch**, not context |
+
+  **The KV cache is the small part.** Only **8 of 89 layers** carry KV at all — the rest are constant-state Mamba-2 / MoE — so a 1M-token window costs 2.25 GiB, which is why 1M is essentially free versus 512K. The 14.1 GiB compute buffer is a function of `-ub 2048`, so it's the ubatch setting that dominates non-weight memory here, not the context length. Budget accordingly: raising `-ub` costs memory, extending context barely does.
 
 **Tool calling / reasoning:**
 

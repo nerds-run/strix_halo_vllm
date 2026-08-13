@@ -21,7 +21,7 @@ llamacpp_port: 8080
 # super:    Nemotron-3-Super-120B-A12B — hybrid LatentMoE (Mamba-2+MoE+Attn), reasoning/planning (~63GB)
 #           NOTE: GGUF dropped to UD-Q3_K_XL (~63GB) so the long context fits on 128GB
 #           NOTE: Runs at the full native 1M context (ctx_size 1048576) — measured
-#           ~76GB total (model + q4_0 KV) on a 128GB box, see the profile comments
+#           ~73GiB total on a 128GB box (KV is only 2.25GiB — see profile comments)
 #           NOTE: Requires llama.cpp build ≥8351 (mamba-base.cpp assertion fix, issue #20570)
 #           Tool-call: vLLM uses --tool-call-parser qwen3_coder + super_v3 reasoning parser
 #           plugin; llama-server has neither, so we use --jinja and let the GGUF chat
@@ -98,13 +98,16 @@ llamacpp_model_profiles:
     #   <|im_end|> into the assistant stream as literal text, which crashed the
     #   tool-call parser. --reasoning-format auto already exposes <think> blocks
     #   via the dedicated `reasoning_content` field, so --special is unnecessary.
-    # Context: native 1M tokens — set to 1048576 (full window). Measured cost
-    #   on a 128GB box: ~76GB used at 1M, ~77GB at 512K (yes, 1M was effectively
-    #   free vs 512K). The hybrid LatentMoE arch is what lets this happen — most
-    #   of the 120B params live in constant-state Mamba-2 / MoE layers; only the
-    #   handful of attention layers carry ctx-scaling KV, so q4_0 KV at 1M lands
-    #   around ~14GB total. Leaves ~48GB free for cache-reuse, buffers, other
-    #   containers. No reason to dial back unless you're stacking workloads.
+    # Context: native 1M tokens — set to 1048576 (full window). Verified on
+    #   hardware at 1M ctx, ~73GiB total:
+    #     model buffers   58.3 GiB
+    #     KV cache q4_0    2.25 GiB  <- only 8 of 89 layers carry KV
+    #     compute buffers 14.1 GiB   <- driven by -ub 2048, NOT by ctx
+    #   The hybrid LatentMoE arch is what makes 1M essentially free: the other
+    #   81 layers are constant-state Mamba-2 / MoE, so extending context costs
+    #   almost nothing. Non-weight memory is dominated by the ubatch compute
+    #   buffer instead — raising -ub is the expensive knob, not ctx_size.
+    #   Leaves ~50GiB free for cache-reuse and other containers.
     # TODO: MTP (Multi-Token Prediction) layers may be in GGUF — enable with
     #       --speculative-config flags once llama.cpp supports MTP for this arch
     repo: "unsloth/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF"
@@ -121,11 +124,16 @@ llamacpp_model_profiles:
     # Empirical sweep on the super profile (1.6K-token prompts):
     #   ubatch=1024 → 169 t/s prefill (strix-halo-guide-validated)
     #   ubatch=1536 → 283 t/s prefill
-    #   ubatch=2048 → 311 t/s prefill  ← peak, scales to 356 t/s @ 6K prompts
+    #   ubatch=2048 → 311 t/s prefill  ← peak
     #   ubatch=4096 → 282 t/s prefill  ← regressed (likely iGPU cache thrash
     #                                    or memory-bandwidth saturation at the
     #                                    wider ops on gfx1151's RDNA3.5).
-    # 2048 is the iGPU sweet spot. Don't push higher without re-measuring.
+    # Re-verified at ub=2048 on hardware (3 cold runs each, cache_prompt off):
+    #   1.6K prompt → 324 t/s median (334 peak)
+    #   6K   prompt → 357 t/s median
+    #   12K  prompt → 356 t/s median  ← plateau; does not keep climbing
+    # 2048 is the iGPU sweet spot. Don't push higher without re-measuring —
+    # and note -ub is also what sets the ~14GiB compute buffer.
     ubatch_size: 2048
     cache_type_k: "q4_0"
     cache_type_v: "q4_0"
