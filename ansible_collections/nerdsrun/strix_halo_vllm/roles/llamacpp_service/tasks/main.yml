@@ -29,6 +29,28 @@
   tags:
     - llamacpp
 
+# Stops before a ~104GB download and a guaranteed-to-crash server start.
+# A profile opts in by setting `unsupported_reason`; clearing the gate is an
+# explicit, per-run choice so the block can't rot into a silent no-op once
+# upstream support lands.
+- name: Refuse to deploy a profile whose architecture is unsupported
+  ansible.builtin.fail:
+    msg: |
+      Profile '{{ llamacpp_model_profile }}' is gated and will not deploy.
+
+      Reason: {{ llamacpp_active.unsupported_reason }}
+
+      This is a known limitation, not a misconfiguration. The profile is
+      defined in full so it is ready the moment upstream support lands.
+
+      To attempt it anyway (expect llama-server to fail at model load):
+        -e llamacpp_allow_unsupported=true
+  when:
+    - llamacpp_active.unsupported_reason is defined
+    - not (llamacpp_allow_unsupported | default(false) | bool)
+  tags:
+    - llamacpp
+
 # ------------------------------------------------------------------
 # 2. Expand paths
 # ------------------------------------------------------------------

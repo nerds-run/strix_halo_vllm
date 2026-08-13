@@ -141,16 +141,35 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 
 | Model | Architecture | Active Params | Size | Quant | tok/s |
 |---|---|---|---|---|---|
-| Qwen3-Coder-30B-A3B | MoE | 3B | 17 GB | Q4_K_XL | **83.4** |
-| Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **~95** |
-| Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
-| Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
-| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **15.6** |
-| MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **~22 fresh / ~17 at 40K ctx** |
+| Qwen3-Coder-30B-A3B | MoE | 3B | 17 GB | Q4_K_XL | **96.6** |
+| Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **71.1** |
+| NVIDIA-Nemotron-3.5-Lightning-30B-A3B | Hybrid Mamba-2 + MoE + Attn | 3B | ~35 GB | Q8_0 | **56.2** |
+| Qwen3-Coder-Next-80B-A3B | MoE + hybrid linear attention | 3B | ~85 GB | Q8_0 | **42.7 fresh / 38.1 at 32K** |
+| Ling-3.0-flash (124B, `bailingmoe3`) † | MoE + hybrid KDA/MLA | 5.1B | ~73 GB | Q4_K_M | **46.9** |
+| Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **62.1** |
+| Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **23.3** |
+| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **18.8** |
+| MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **28.1 fresh / 24.5 at 8K / 17.9 at 32K** |
+
+† `Ling-3.0-flash` is **not a profile in this collection**. It requires a community fork of llama.cpp (`aetherbird/llama.cpp`, branch `bailingmoe3-support`) because the `bailingmoe3` architecture is unsupported upstream. Listed here for comparison only; see the expedition report for methodology and caveats.
 
 ### Vulkan-Specific Tuning
 
-- **`-b 512`** (batch size, logical): Default. Per-profile override in `llamacpp_model_profiles.<profile>.batch_size` (e.g. `super` and `minimax` both use `4096` for faster prefill on long prompts)
+- **`-b 4096`** (batch size, logical): Raised from llama.cpp's 512 default. **Must be >= ubatch** — llama.cpp clamps the micro-batch to the logical batch, so `-b 512 -ub 2048` silently runs at 512. Per-profile override via `llamacpp_model_profiles.<profile>.batch_size`.
+- **Whole-fleet re-baseline (build 10400, `-b 4096`, llama-bench, r=2).** Every profile was re-measured after the image pin; `-ub 2048` beat the 512 default on long-prompt prefill for all of them, with decode unaffected:
+
+  | Profile | tg128 | pp4096 @ub512 | pp4096 @ub2048 | prefill gain |
+  |---|---|---|---|---|
+  | `coder` | 96.6 | 1185.5 | 1297.7 | +9% |
+  | `fast` | 62.1 | 1104.7 | 1191.6 | +8% |
+  | `nemotron` | 71.1 | 1226.8 | **1709.3** | **+39%** |
+  | `lightning` | 56.2 | 1202.2 | **1727.2** | **+44%** |
+  | `super` | 18.8 | 223.2 | 282.7 | +27% |
+  | `big` | 23.3 | 342.7 | 454.8 | +33% |
+
+  This is why `llamacpp_ubatch_size` now defaults to **2048** and `llamacpp_batch_size` to **4096**.
+
+  > **Several published tok/s figures were wrong and are corrected above.** `nemotron` was listed as `~95` and measures **71.1** (−25%) — it was an unmeasured estimate from the same commit as the `super` figure already corrected earlier. `coder` was understated at 83.4 (actual **96.6**), `super` at 15.6 (actual **18.8**), `lightning` at 51.4 (actual **56.2**). Some of the gain is the newer build; the `nemotron` error was never a measurement at all.
 - **`-ub 512`** (ubatch, physical): Default. Set `llamacpp_ubatch_size` globally or per-profile `ubatch_size` — this is the single biggest prefill lever on Vulkan/RADV (gfx1151-specific; decode is unaffected). Measured sweep on the `super` profile with 1.6K-token prompts:
 
   | `-ub` | Prefill t/s |
@@ -160,7 +179,17 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
   | **2048** | **311** ← peak |
   | 4096 | 282 ← regresses |
 
-  **2048 is the gfx1151 sweet spot.** Above it, throughput drops — likely iGPU cache thrash or memory-bandwidth saturation on the wider ops in RDNA3.5. The older `1024` recommendation leaves ~45% of prefill throughput on the table.
+  **2048 is the peak for `super`.** Above it throughput drops — likely iGPU cache thrash or memory-bandwidth saturation on the wider ops in RDNA3.5. The older `1024` recommendation leaves ~45% of prefill throughput on the table.
+
+  > **The optimum is architecture-dependent, not a gfx1151 constant.** An earlier revision called 2048 "the gfx1151 sweet spot". Measurement contradicts that, and there is now a clear split:
+  >
+  > | Architecture family | Best `-ub` | Evidence |
+  > |---|---|---|
+  > | Qwen3 / Qwen3.5 / Nemotron (`qwen3moe`, `qwen35moe`, `nemotron_h_moe`) | **2048** | +8% to +44% prefill across six profiles |
+  > | `bailingmoe3` (Ling-3.0-flash) | **default (512)** | 2048 costs ~18% prefill |
+  > | `deepseek4` (DeepSeek-V4-Flash) | **1024** | 2048 costs **22%** prefill (82.1 vs 104.8 t/s at pp4096) |
+  >
+  > Both *novel* architectures reject the value that every mainstream one prefers. Sweep per profile before assuming it transfers — it takes one `llama-bench` run. `-b` must also be raised alongside `-ub`: llama.cpp clamps the micro-batch to the logical batch, so `-b 512 -ub 2048` silently does nothing.
 
   Re-verified on hardware at `-ub 2048` (3 cold runs per size, `cache_prompt: false`):
 
@@ -241,6 +270,87 @@ The practical consequence: **`super` is the right choice for genuinely long-cont
 - NVIDIA mandates **`temperature=1.0`, `top_p=0.95`** across reasoning, tool calling, and chat. The profile reflects this.
 - Per-request reasoning controls (`enable_thinking`, `low_effort`) are passed via `chat_template_kwargs` in the OpenAI-compatible API body, e.g. `extra_body={"chat_template_kwargs": {"enable_thinking": true, "low_effort": true}}`.
 
+### Nemotron-3.5-Lightning (lightning profile)
+
+Measured on hardware at `-c 262144` with `parallel_slots: 2`, Q8_0, 3 cold runs per point (`cache_prompt: false`):
+
+| Metric | Value |
+|---|---|
+| Decode @ ~23 tok ctx | **51.43 tok/s** |
+| Decode @ 8K ctx | 51.13 tok/s |
+| Decode @ 32K ctx | 49.99 tok/s |
+| Prefill @ 1.6K prompt | **1246 t/s** |
+| Prefill @ 6K prompt | **1455 t/s** |
+| Total resident | **~38 GiB** |
+| Live slot config | `n_slots = 2, n_ctx_slot = 131072` |
+
+**Decode is flat with context** (−2.8% from empty to 32K), the same hybrid-architecture property that makes `super`'s 1M window cheap.
+
+**Prefill is ~4× `super`** (1455 vs 357 t/s at 6K) — 3B active params per token versus 12B.
+
+**The Q8 quant costs roughly half the decode speed.** `nemotron` (Nano) does ~95 tok/s at Q4_K_XL; this profile does 51.4 at Q8_0. Decode is memory-bandwidth-bound, and Q8_0 moves ~1.75× the bytes, predicting ~54 tok/s — the measurement matches. The quant was chosen for output fidelity in tool-calling, not throughput. **If the executor tier needs to be faster, move this profile to Q4/Q5** and expect roughly nemotron-class decode.
+
+**Memory:** ~38 GiB total leaves ~87 GiB free, so the 262144 default is conservative and can be raised. It co-resides with `super` (~73 GiB) but **not** with `coder-next` (~85 GiB) or `minimax` (~108 GiB).
+
+**Slots subdivide context.** `-np 2` at `-c 262144` yields a 131072-token window per request, confirmed live. Raise `ctx_size` alongside `parallel_slots` if each request needs the full window.
+
+### Big-coder head-to-head: coder-next vs minimax
+
+Both measured on llama.cpp build 10400, same harness, cold prefill.
+
+| | coder-next (Q8_0) | minimax (UD-IQ4_XS) | delta |
+|---|---|---|---|
+| Decode, fresh | **42.7** | 28.1 | **+52%** |
+| Decode @ 8K | **41.3** | 24.5 | **+69%** |
+| Decode @ 32K | **38.1** | 17.9 | **+113%** |
+| Prefill @ 6K | **688 t/s** | 316 t/s | **+118%** |
+| Resident | **87 GiB** | 110 GiB | 23 GiB smaller |
+| Context **per request** | **131072** (262144 ÷ 2 slots) | 81920 (1 slot) | **1.6×** |
+| Context aggregate | 262144 across 2 slots | 81920 | 3.2× |
+
+**`coder-next` wins every throughput axis and is smaller.** Caveats worth stating plainly:
+
+- The two ran at different context/slot settings (262144 across 2 slots vs 81920 on 1 slot). Slot count has little effect on single-request decode and allocated context does not change decode rate, so the throughput rows are broadly fair — but it is not a controlled A/B.
+- **Read the per-request context row, not the aggregate, when choosing for long sessions.** `parallel_slots: 2` subdivides `ctx_size`, so a single agent conversation on `coder-next` gets 131072 tokens, not 262144. To give one request the full window, set `parallel_slots: 1` or raise `ctx_size` — at 87 GiB resident there is headroom for the latter.
+- **Throughput is not the deciding metric.** `minimax` is the empirical incumbent for the big-coder slot on the basis of output quality on real delegated tickets. Speed says `coder-next` deserves the trial; only cost-per-merged-ticket settles it.
+- `coder-next` is Q8_0 (near-lossless) against minimax's IQ4_XS, so it is also carrying a quant-fidelity advantage into any quality comparison — which cuts in its favour for tool-call formatting, but means the two are not matched on precision either.
+
+### Qwen3-Coder-Next (coder-next profile)
+
+Measured on hardware at `-c 262144`, `parallel_slots: 2`, Q8_0. Values are medians of the per-request timings llama.cpp logs (n≥2 per point).
+
+Measured on llama.cpp build **10400** with the profile's `batch_size: 4096` /
+`ubatch_size: 2048`:
+
+| Metric | Value |
+|---|---|
+| Decode, fresh ctx | **42.7 tok/s** |
+| Decode @ 8K | 41.3 tok/s |
+| Decode @ 32K | **38.1 tok/s** |
+| Prefill @ 1.6K | 721 t/s |
+| Prefill @ 6K | 688 t/s |
+| Total resident | **87 GiB** |
+| Live slot config | `n_slots = 2, n_ctx_slot = 131072` |
+
+**Q8_0 clears the bar — keep it.** The threshold for falling back to Q6_K (65.6 GB) was 30 tok/s; this sustains 41.3 at 8K. Q6_K remains documented as a fallback but is not needed.
+
+**Batch tuning is mandatory on build 10400.** At the llama.cpp defaults (`b=512, ub=512`) this profile loses about a third of its decode:
+
+| Config | Decode fresh / 8K / 32K | Prefill 1.6K / 6K |
+|---|---|---|
+| `b512 / ub512` (defaults) | 28.2 / 27.6 / 25.3 | 703 / **814** |
+| **`b4096 / ub2048`** (profile) | **42.7 / 41.3 / 38.1** | **721** / 688 |
+
+Tuning buys **+51% decode fresh and +50% at 32K** for −15% prefill at 6K. Decode dominates agentic latency, so the trade is worth taking — but if a workload is overwhelmingly prompt-ingestion, the defaults give better 6K prefill.
+
+**The ubatch optimum is model-dependent, not a property of gfx1151.** `ub=2048` is the peak for this profile and for `super`, but it *costs* the `bailingmoe3` (Ling) architecture ~18% prefill on the same GPU, where the default was better. Re-measure per profile rather than copying the value across.
+
+> **Superseded figures.** Earlier revisions listed 42.3 / 40.9 / **27.5** tok/s and described a **−35%** decode falloff to 32K as an architectural trait of Qwen3-Next's hybrid linear attention, contrasted against the Nemotron profiles. Those numbers were taken on build **8985** at default batch settings. Build-matched at 10400 the falloff is **−11%** (42.7 → 38.1), so the architectural claim was overstated — most of the apparent weakness was toolchain and batch configuration, not attention design.
+
+**Total size does not predict MoE decode speed — active params do.** `coder-next` (80B total) runs at 42.3 fresh against `lightning`'s (30B total) 51.4, despite being 2.4× the weights. Both activate 3B per token, so they land in the same band; the gap is architecture, not scale. Quant width still matters *within* a given active-param count, which is why Q8 vs Q4 moves `lightning` but total-size scaling does not.
+
+**Memory:** 87 GiB at the full 262144 context leaves ~38 GiB free. It does **not** co-reside with `lightning` (~38 GiB) — together they exactly exhaust 125 GiB.
+
 ### MiniMax-M2.7 (minimax profile)
 
 MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at `UD-IQ4_XS` (~108 GB). This is the tightest fit in 128 GB unified memory — leave `strix_halo_mode: "llamacpp"` as the only active backend and do not run Open WebUI or other containerized models alongside it.
@@ -258,7 +368,19 @@ MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at 
 - `--metrics` — enables Prometheus `/metrics` endpoint for dashboards
 - `-np 1` — single request slot; 108 GB model + KV cache leaves no room for concurrency
 
-**Observed performance (ctx 80K, post-GPU-pin + kernel tuning):**
+**Benchmarked on llama.cpp build 10400** (`-c 81920`, 1 slot, UD-IQ4_XS), 3 cold runs per point with `cache_prompt: false`:
+
+| Metric | Value |
+|---|---|
+| Decode, fresh ctx | **28.14 tok/s** |
+| Decode @ 8K | 24.47 tok/s |
+| Decode @ 32K | **17.87 tok/s** |
+| Prefill @ 1.6K | 325 t/s |
+| Prefill @ 6K | 316 t/s |
+
+The earlier hand-observed figures below understated fresh decode (20-22 vs 28.1 measured). Part of that gap is the toolchain: those numbers were taken on build 8985, and this run is on 10400. The deep-context figure held up well (17-18 estimated vs 17.87 measured).
+
+<details><summary>Earlier hand-observed figures (build 8985, kept for comparison)</summary>
 
 | Position | Decode tok/s |
 |---|---|
@@ -267,6 +389,8 @@ MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at 
 | Deep (35-45K) | 17-18 |
 | Cache-reuse hit | 27-28 (effective-zero position) |
 | Peak prefill (>10K prompt) | 200-285 tok/s |
+
+</details>
 
 Summary-reset recovers decode by ~3 tok/s — the agent client is responsible for summarizing (llama.cpp doesn't auto-summarize).
 

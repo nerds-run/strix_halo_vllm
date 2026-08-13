@@ -5,7 +5,23 @@
 # Container image: llama.cpp with Vulkan (RADV) backend for Strix Halo.
 # Uses Vulkan instead of ROCm/HIP to work around the Qwen 3.5 hang bug
 # (https://github.com/ROCm/ROCm/issues/6027).
-llamacpp_image: "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv"
+# PINNED BY DIGEST — do not switch back to the bare `:vulkan-radv` tag.
+#
+# That tag is a MOVING tag: upstream repushes it, sometimes several times a day
+# (observed 2026-08-13 at 02:35 and again at 05:56). A silent move cost the
+# coder-next profile ~33% of its decode at default batch settings, with no error
+# and no log line — the only symptom was slower inference. Pinning makes the
+# build a deliberate choice rather than a function of when you last deployed.
+#
+# Digest below == llama.cpp build 10400, which every benchmark in
+# docs/PERFORMANCE.md was measured against.
+#
+# To move to a newer build:
+#   1. podman pull docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv
+#   2. podman inspect ...:vulkan-radv --format '{{.Digest}}'
+#   3. update the digest here, then RE-BENCHMARK — batch/ubatch optima and
+#      absolute throughput both move between builds.
+llamacpp_image: "docker.io/kyuz0/amd-strix-halo-toolboxes@sha256:41f76c4c9b58353fbb4258bb5ec7e089f3f8494c10d07190ef061a147dd7c8ad"
 llamacpp_container_name: "llamacpp-server"
 llamacpp_enabled: true
 llamacpp_host: "0.0.0.0"
@@ -18,6 +34,9 @@ llamacpp_port: 8080
 # coder:    Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
 # fast:     Qwen3.5-35B-A3B — fast reasoning/vision/coding (~20GB, ~50-55 tok/s)
 # nemotron: Nemotron-3-Nano-30B-A3B — hybrid Mamba-Transformer MoE, coding/agentic/reasoning (~20GB)
+# lightning: NVIDIA-Nemotron-3.5-Lightning-30B-A3B — successor to nemotron (~35GB at Q8_0)
+#           Fast agentic executor: tool use, code review, high-volume delegation
+#           NOTE: -np defaults to 2 (parallel_slots) — this is the high-volume tier
 # super:    Nemotron-3-Super-120B-A12B — hybrid LatentMoE (Mamba-2+MoE+Attn), reasoning/planning (~63GB)
 #           NOTE: GGUF dropped to UD-Q3_K_XL (~63GB) so the long context fits on 128GB
 #           NOTE: Runs at the full native 1M context (ctx_size 1048576) — measured
@@ -27,9 +46,17 @@ llamacpp_port: 8080
 #           plugin; llama-server has neither, so we use --jinja and let the GGUF chat
 #           template handle tool calls. Reasoning toggled per-request via
 #           chat_template_kwargs.enable_thinking / low_effort.
+# coder-next: Qwen3-Coder-Next-80B-A3B — agentic coding delegation worker (~85GB at Q8_0)
+#           Challenger to minimax for the big-coder slot; NON-thinking model
+#           WARNING: ~85GB + KV — do not run alongside other models
 # minimax:  MiniMax-M2.7 — 229B MoE / 10B active, long-context agentic + reasoning (~108GB)
 #           WARNING: ~108GB at UD-IQ4_XS — tightest fit on 128GB, do not run alongside other models
 #           NOTE: Vulkan backend only — do NOT use CUDA 13.2 (produces gibberish per Unsloth docs)
+# deepseek: DeepSeek-V4-Flash-0731 — 284B MoE / 13B active (~104GB at UD-IQ3_XXS)
+#           EXPERIMENTAL and GATED: the deepseek4 arch has no Vulkan
+#           implementation upstream, so it cannot run on this backend yet.
+#           Defined in full so it is ready when support lands. Bypass the
+#           gate with -e llamacpp_allow_unsupported=true (it will crash).
 llamacpp_model_profile: "big"
 
 llamacpp_model_profiles:
@@ -83,6 +110,43 @@ llamacpp_model_profiles:
     extra_args:
       - "--reasoning-format deepseek"
       - "--reasoning on"
+  lightning:
+    # NVIDIA-Nemotron-3.5-Lightning-30B-A3B — released 2026-08-11.
+    # Successor family to the `nemotron` (Nano) profile: same 30B-A3B size
+    # class, hybrid Mamba-2 + MoE + Attention. GGUF arch is `nemotron_h_moe`.
+    # Verified present in the toolbox image's llama.cpp build 8985, so no new
+    # build gate beyond the existing ≥8351 note for the hybrid Mamba archs.
+    # Quant: Q8_0 (35.0 GB, single file at repo root — no quant subdirectory,
+    #   same shape as the `nemotron` profile). Near-lossless; at this size the
+    #   128 GB box has abundant headroom, so there is no reason to go lower.
+    # Sampling: NVIDIA's card specifies temperature 1.0 / top_p 0.95.
+    # Reasoning is toggleable per-request via chat_template_kwargs
+    #   (enable_thinking), same mechanism as the super profile.
+    # Context: native 1M. Defaulted to 262144 rather than the full window —
+    #   the Mamba-2 state is constant-size but the select Attention layers
+    #   still allocate KV against -c, and this profile is meant to run
+    #   alongside a big coder rather than alone. Raise ctx_size if it runs solo.
+    # License: OpenMDW-1.1 (https://openmdw.ai/license/1-1/)
+    repo: "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF"
+    file: "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
+    include: "*Q8_0*"
+    ctx_size: 262144
+    temp: 1.0
+    top_p: 0.95
+    top_k: 0
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 0
+    # High-volume executor tier — two concurrent slots by default so a CLI
+    # agent and Open WebUI don't queue behind each other. Tunable to 4; each
+    # slot carves its own KV region out of ctx_size, so raising this without
+    # raising ctx_size shrinks the per-slot window.
+    parallel_slots: 2
+    cache_type_k: "q8_0"
+    cache_type_v: "q8_0"
+    extra_args:
+      - "--reasoning-format auto"
+      - "--metrics"
   super:
     # Hybrid LatentMoE (Mamba-2 + MoE + Attention), Multi-Token Prediction
     # 120B total / 12B active per token — UD-Q3_K_XL is ~63GB (native 1M ctx)
@@ -157,6 +221,58 @@ llamacpp_model_profiles:
       - "--threads-http 8"
       - "--metrics"
       - "-np 1"
+  coder-next:
+    # Qwen3-Coder-Next-80B-A3B — 80B total / 3B active, MoE with hybrid
+    # linear attention. GGUF arch is `qwen3next`.
+    # Repo: the published name is `unsloth/Qwen3-Coder-Next-GGUF` — there is
+    #   NO size suffix in it. `unsloth/Qwen3-Coder-Next-80B-A3B-GGUF` 404s.
+    # Quant: Q8_0 (84.8 GB across 3 shards in a Q8_0/ subdirectory). Chosen
+    #   deliberately over IQ4 — this profile is a tool-calling delegation
+    #   worker, where the failure mode that matters is quant-induced
+    #   malformed tool-call JSON, not a benchmark point. Q6_K (65.6 GB) is
+    #   the documented fallback if Q8 throughput disappoints.
+    # Build gate: `qwen3next` is present in llama.cpp build 8985 (the pinned
+    #   toolbox image). Vulkan support for the arch's GATED_DELTA_NET op
+    #   landed in ggml-org/llama.cpp#20334.
+    # NOTE: this model is NON-THINKING — its card states it never emits
+    #   <think></think> blocks. --reasoning-format auto is kept for
+    #   consistency with the other profiles but is a no-op here; do not
+    #   "fix" it by copying reasoning settings from the super profile.
+    # Context: 262144, the full native window. The hybrid linear attention
+    #   keeps KV cost low and ~25GB of post-weights headroom holds it.
+    # WARNING: ~85GB resident + KV — do not run alongside other models.
+    repo: "unsloth/Qwen3-Coder-Next-GGUF"
+    file: "Q8_0/Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf"
+    include: "*Q8_0*"
+    ctx_size: 262144
+    temp: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 1.05
+    # Batch/ubatch are NOT optional here — on llama.cpp build 10400 this profile
+    # loses ~33% of its decode at the defaults (b=512, ub=512). Measured on
+    # gfx1151, 3 cold runs per point:
+    #   b512/ub512   -> decode 28.2 / 27.6 / 25.3  (fresh / 8K / 32K)
+    #                   prefill 703 @1.6K, 814 @6K
+    #   b4096/ub2048 -> decode 42.7 / 41.3 / 38.1
+    #                   prefill 721 @1.6K, 688 @6K
+    # Tuning buys +51% decode fresh and +50% at 32K, for -15% prefill at 6K.
+    # Decode dominates agentic latency, so take the trade. Note ub=2048 helps
+    # HERE but hurt the Ling/bailingmoe3 model on the same GPU — the optimum is
+    # model-dependent, not a gfx1151 constant. Re-measure per profile.
+    batch_size: 4096
+    ubatch_size: 2048
+    # Delegation worker — 2 slots so a coding agent and a reviewer can run
+    # concurrently. Tunable to 4 for multi-agent delegation workloads; slots
+    # subdivide ctx_size, so raise ctx_size alongside it.
+    parallel_slots: 2
+    cache_type_k: "q8_0"
+    cache_type_v: "q8_0"
+    extra_args:
+      - "--reasoning-format auto"
+      - "--metrics"
   minimax:
     # MiniMax-M2.7 — 229B MoE / 10B active per token
     # UD-IQ4_XS weights alone are ~108GB — tightest fit in 128GB unified memory
@@ -205,7 +321,85 @@ llamacpp_model_profiles:
       - "--metrics"
       - "-np 1"
 
+  deepseek:
+    # DeepSeek-V4-Flash-0731 — 284B total / 13B active, MoE with hybrid
+    # CSA/HCA sparse attention. GGUF arch is `deepseek4`, native ctx 1M.
+    #
+    # EXPERIMENTAL — GATED. Two independent blockers, both verified:
+    #
+    # 1. NOT RUNNABLE ON VULKAN. The DSv4 ops (LIGHTNING_INDEXER,
+    #    DSV4_HC_PRE/COMB/POST) have no Vulkan implementation upstream. A
+    #    GitHub code search for "DSV4" in ggml/src/ggml-vulkan returns 0
+    #    hits; the same search in ggml/src/ggml-metal returns 6. Support
+    #    exists for Metal (#26459, #25893) and SYCL (#26568) only. The arch
+    #    itself landed in #24162 (2026-06-29) and the Flash-0731 chat
+    #    template in #26398 (2026-08-03), but neither helps the Vulkan path.
+    #    Confirmed against the pinned image: `deepseek4` is absent from
+    #    build 8985's libllama.so while `minimax-m2`/`qwen3moe` are present.
+    #    No toolbox image can fix this until Vulkan kernels are written.
+    #
+    # 2. THE SPEC'D QUANT DOES NOT FIT. UD-Q3_K_XL is 128.2 GB on HF, not
+    #    the ~103 GB the task assumed — that figure matches UD-IQ3_XXS
+    #    (104.2 GB). 128.2 GB is ~119 GiB against 125 GiB total RAM, before
+    #    compute buffers or KV, so UD-Q3_K_XL cannot load on this box at
+    #    any context length. UD-IQ3_XXS is the largest tier that fits and
+    #    is what this profile uses. This substitution is deliberate and
+    #    documented rather than silent.
+    #
+    # UNGATED 2026-08-13 — IT RUNS. Verified on hardware with the pinned image
+    #   (build 10400): loads all four shards at ~101 GiB resident and generates
+    #   coherent output, thinking blocks included, at **12.9 tok/s** decode /
+    #   11.0 t/s prefill on a short prompt.
+    #
+    #   This contradicts the earlier gate rationale, which is kept below for
+    #   the record. The reasoning was: a GitHub code search finds DSV4 ops
+    #   (LIGHTNING_INDEXER, DSV4_HC_*) in ggml-metal and ggml-sycl but not
+    #   ggml-vulkan, so the model "cannot run" here. That inference was wrong.
+    #   Either the ops landed without matching that search, or llama.cpp falls
+    #   back transparently. The 12.9 tok/s is low for 13B active params at
+    #   IQ3 (~33 t/s would be the bandwidth estimate), which is consistent
+    #   with a partial CPU fallback — but that is inference, not measurement.
+    #
+    # WARNING: at 12.9 tok/s this is the slowest profile here by a wide margin
+    #   (coder-next 42.7, Ling 46.9). Treat as experimental/capability-probing
+    #   rather than a working tier.
+    # WARNING: IQ3 quant — tool-call reliability is more fragile at 3-bit.
+    #   Unsloth's UD dynamic quants keep attention layers higher-precision,
+    #   but this is untested here. No battery has been run against it.
+    # ctx 131072 with q8_0 KV per spec; neither validated at that size (the
+    #   verification run used -c 4096).
+    # ubatch 1024, NOT the fleet default of 2048 — measured on build 10400
+    # (llama-bench, -b 4096, -fa 1, r=2). Long-prompt prefill (pp4096):
+    #   ub 512  -> 100.98 t/s
+    #   ub 1024 -> 104.75 t/s  <- best
+    #   ub 2048 ->  82.10 t/s  <- the fleet default, -22%
+    # Decode is flat across all three (13.07-13.08), as everywhere else.
+    # This is the second novel architecture to reject 2048 (bailingmoe3 /
+    # Ling-3.0-flash was the first). Mainstream Qwen/Nemotron profiles all
+    # prefer 2048; both new-architecture models do not. Do not assume.
+    repo: "unsloth/DeepSeek-V4-Flash-0731-GGUF"
+    file: "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
+    include: "*UD-IQ3_XXS*"
+    ubatch_size: 1024
+    ctx_size: 131072
+    temp: 0.6
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 0
+    cache_type_k: "q8_0"
+    cache_type_v: "q8_0"
+    extra_args:
+      - "--reasoning-format auto"
+      - "--metrics"
+      - "-np 1"
+
 llamacpp_model_dir: "~/models"
+
+# Set true to bypass the unsupported-architecture gate (see the `deepseek`
+# profile). Deploys anyway; expect llama-server to fail at model load.
+llamacpp_allow_unsupported: false
 
 # --------------------------------------------------------------------------
 # Shared inference flags (apply to all profiles)
@@ -213,11 +407,20 @@ llamacpp_model_dir: "~/models"
 llamacpp_ngl: 999
 llamacpp_flash_attn: true
 llamacpp_no_mmap: true
-llamacpp_batch_size: 512
-# Physical (micro) batch size — 0 lets llama-server pick the default (currently 512).
-# Raising to 1024+ improves prefill throughput on Vulkan/RADV at the cost of some
-# GPU scratch memory. Per-profile override via llamacpp_model_profiles.<p>.ubatch_size.
-llamacpp_ubatch_size: 0
+# Logical batch. Must be >= ubatch: llama.cpp clamps the micro-batch to this, so
+# `-b 512 -ub 2048` silently runs at 512. Raised from llama.cpp's 512 default.
+llamacpp_batch_size: 4096
+# Physical (micro) batch size — the single biggest prefill lever on Vulkan/RADV.
+# 2048 measured as the best value for every profile swept on build 10400
+# (b=4096, llama-bench, r=2), long-prompt prefill gain over the 512 default:
+#   coder +9%   fast +8%    nemotron +39%
+#   lightning +44%  super +27%  big +33%
+# Decode (tg128) is unaffected in all cases — within run-to-run noise.
+# NOT universal: the bailingmoe3 (Ling-3.0-flash) architecture regressed ~18%
+# at 2048 and preferred the default, so sweep before assuming this transfers to
+# a new architecture. Per-profile override via
+# llamacpp_model_profiles.<p>.ubatch_size (minimax pins 1024).
+llamacpp_ubatch_size: 2048
 llamacpp_thinking_enabled: true
 llamacpp_log_disable: true
 llamacpp_extra_args: []
