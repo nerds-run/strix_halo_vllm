@@ -326,9 +326,12 @@ llamacpp_model_profiles:
     # ctx 131072 with q8_0 KV per spec; both unvalidated for the same reason.
     unsupported_reason: >-
       DeepSeek-V4's CSA/HCA attention ops (LIGHTNING_INDEXER, DSV4_HC_*)
-      have no Vulkan implementation upstream — only Metal and SYCL. The
-      arch `deepseek4` is absent from the pinned image's llama.cpp build
-      8985. llama-server will fail at model load on this backend.
+      appear to have no Vulkan implementation upstream — a code search finds
+      them in ggml-metal and ggml-sycl but not ggml-vulkan. Note that build
+      10400 DOES register the `deepseek4` architecture (8985 did not), so
+      the model may now load and then fail or fall back to CPU on those ops
+      rather than being rejected outright. Unverified either way: confirming
+      requires a ~104GB download. Clear this gate to find out.
     repo: "unsloth/DeepSeek-V4-Flash-0731-GGUF"
     file: "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
     include: "*UD-IQ3_XXS*"

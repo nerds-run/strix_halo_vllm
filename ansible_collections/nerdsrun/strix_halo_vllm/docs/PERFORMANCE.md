@@ -148,7 +148,7 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 | Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
 | NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **15.6** |
-| MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **~22 fresh / ~17 at 40K ctx** |
+| MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **28.1 fresh / 24.5 at 8K / 17.9 at 32K** |
 
 ### Vulkan-Specific Tuning
 
@@ -267,6 +267,25 @@ Measured on hardware at `-c 262144` with `parallel_slots: 2`, Q8_0, 3 cold runs 
 
 **Slots subdivide context.** `-np 2` at `-c 262144` yields a 131072-token window per request, confirmed live. Raise `ctx_size` alongside `parallel_slots` if each request needs the full window.
 
+### Big-coder head-to-head: coder-next vs minimax
+
+Both measured on llama.cpp build 10400, same harness, cold prefill.
+
+| | coder-next (Q8_0) | minimax (UD-IQ4_XS) | delta |
+|---|---|---|---|
+| Decode, fresh | **42.3** | 28.1 | **+50%** |
+| Decode @ 8K | **40.9** | 24.5 | **+67%** |
+| Decode @ 32K | **27.5** | 17.9 | **+54%** |
+| Prefill @ 6K | **840 t/s** | 316 t/s | **+166%** |
+| Resident | **87 GiB** | 110 GiB | 23 GiB smaller |
+| Context served | 262144 | 81920 | 3.2× |
+
+**`coder-next` wins every throughput axis and is smaller.** Caveats worth stating plainly:
+
+- The two ran at different context/slot settings (262144/2 slots vs 81920/1 slot). Slot count has little effect on single-request decode, and allocated context does not change decode rate, so the comparison is broadly fair — but it is not a controlled A/B.
+- **Throughput is not the deciding metric.** `minimax` is the empirical incumbent for the big-coder slot on the basis of output quality on real delegated tickets. Speed says `coder-next` deserves the trial; only cost-per-merged-ticket settles it.
+- `coder-next` is Q8_0 (near-lossless) against minimax's IQ4_XS, so it is also carrying a quant-fidelity advantage into any quality comparison — which cuts in its favour for tool-call formatting, but means the two are not matched on precision either.
+
 ### Qwen3-Coder-Next (coder-next profile)
 
 Measured on hardware at `-c 262144`, `parallel_slots: 2`, Q8_0. Values are medians of the per-request timings llama.cpp logs (n≥2 per point).
@@ -307,7 +326,19 @@ MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at 
 - `--metrics` — enables Prometheus `/metrics` endpoint for dashboards
 - `-np 1` — single request slot; 108 GB model + KV cache leaves no room for concurrency
 
-**Observed performance (ctx 80K, post-GPU-pin + kernel tuning):**
+**Benchmarked on llama.cpp build 10400** (`-c 81920`, 1 slot, UD-IQ4_XS), 3 cold runs per point with `cache_prompt: false`:
+
+| Metric | Value |
+|---|---|
+| Decode, fresh ctx | **28.14 tok/s** |
+| Decode @ 8K | 24.47 tok/s |
+| Decode @ 32K | **17.87 tok/s** |
+| Prefill @ 1.6K | 325 t/s |
+| Prefill @ 6K | 316 t/s |
+
+The earlier hand-observed figures below understated fresh decode (20-22 vs 28.1 measured). Part of that gap is the toolchain: those numbers were taken on build 8985, and this run is on 10400. The deep-context figure held up well (17-18 estimated vs 17.87 measured).
+
+<details><summary>Earlier hand-observed figures (build 8985, kept for comparison)</summary>
 
 | Position | Decode tok/s |
 |---|---|
@@ -316,6 +347,8 @@ MiniMax-M2.7 is a 229B-parameter MoE with 10B active per token, shipped here at 
 | Deep (35-45K) | 17-18 |
 | Cache-reuse hit | 27-28 (effective-zero position) |
 | Peak prefill (>10K prompt) | 200-285 tok/s |
+
+</details>
 
 Summary-reset recovers decode by ~3 tok/s — the agent client is responsible for summarizing (llama.cpp doesn't auto-summarize).
 
