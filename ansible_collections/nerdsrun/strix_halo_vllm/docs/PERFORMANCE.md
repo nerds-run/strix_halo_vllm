@@ -181,12 +181,12 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 
 `--cache-reuse 256` gives automatic prefix-KV reuse across requests sharing a ≥256-token prefix — a large win on agent workloads where system prompts and tool schemas repeat. Those snapshots live in an in-memory pool whose size is capped by `--cache-ram`, and **that pool is additive on top of weights + KV**. llama.cpp's default is 8 GB, which is not always safe on a 128 GB unified-memory box.
 
-Size it against the model's resident footprint:
+Size it against **total resident usage before the pool** — weights + KV + compute buffers — not weights alone, and not a figure that already includes the pool:
 
-| Model footprint | `--cache-ram` | Rationale |
+| Resident before pool | `--cache-ram` | Rationale |
 |---|---|---|
-| **~100+ GB** (e.g. `minimax`, ~108 GB) | `2048` or smaller | Two OOM incidents traced directly to the 8 GB default — the snapshot-save path had nowhere to grow |
-| **~60-80 GB** (e.g. `super`, ~73 GiB total at 1M ctx) | `8192` | ~50 GiB stays free. The wider pool pays for itself: every reused prefix skips a full prefill |
+| **~100+ GB** (`minimax`: ~108 GB weights, tight even before buffers) | `2048` or smaller | Two OOM incidents traced directly to the 8 GB default — the snapshot-save path had nowhere to grow |
+| **~70-80 GiB** (`super`: 58.3 GiB weights + 2.25 GiB KV + 14.1 GiB compute at `-ub 2048` ≈ 73 GiB) | `8192` | Lands at ~81 GiB with the pool, leaving ~44 GiB spare. The wider pool pays for itself: every reused prefix skips a full prefill |
 
 The failure mode is not gradual — the pool grows as snapshots accumulate, so a model that starts fine can OOM-kill the service well into a session. When in doubt on a tight fit, cap low.
 
