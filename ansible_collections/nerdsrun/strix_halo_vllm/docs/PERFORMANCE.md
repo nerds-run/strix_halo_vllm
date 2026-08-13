@@ -181,7 +181,15 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 
   **2048 is the peak for `super`.** Above it throughput drops — likely iGPU cache thrash or memory-bandwidth saturation on the wider ops in RDNA3.5. The older `1024` recommendation leaves ~45% of prefill throughput on the table.
 
-  > **The optimum is model-dependent, not a gfx1151 constant.** An earlier revision of this document called 2048 "the gfx1151 sweet spot". Subsequent measurement contradicts that: `ub=2048` is the peak for `super` and is worth **+51% decode** on `coder-next`, but it *costs* the `bailingmoe3` (Ling-3.0-flash) architecture ~18% prefill on the same GPU, where the llama.cpp default was better. Sweep per profile rather than copying the value across. `-b` must also be raised alongside `-ub` — llama.cpp clamps the micro-batch to the logical batch, so `-b 512 -ub 2048` silently does nothing.
+  > **The optimum is architecture-dependent, not a gfx1151 constant.** An earlier revision called 2048 "the gfx1151 sweet spot". Measurement contradicts that, and there is now a clear split:
+  >
+  > | Architecture family | Best `-ub` | Evidence |
+  > |---|---|---|
+  > | Qwen3 / Qwen3.5 / Nemotron (`qwen3moe`, `qwen35moe`, `nemotron_h_moe`) | **2048** | +8% to +44% prefill across six profiles |
+  > | `bailingmoe3` (Ling-3.0-flash) | **default (512)** | 2048 costs ~18% prefill |
+  > | `deepseek4` (DeepSeek-V4-Flash) | **1024** | 2048 costs **22%** prefill (82.1 vs 104.8 t/s at pp4096) |
+  >
+  > Both *novel* architectures reject the value that every mainstream one prefers. Sweep per profile before assuming it transfers — it takes one `llama-bench` run. `-b` must also be raised alongside `-ub`: llama.cpp clamps the micro-batch to the logical batch, so `-b 512 -ub 2048` silently does nothing.
 
   Re-verified on hardware at `-ub 2048` (3 cold runs per size, `cache_prompt: false`):
 

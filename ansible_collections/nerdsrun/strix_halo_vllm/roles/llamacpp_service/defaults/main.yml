@@ -368,9 +368,19 @@ llamacpp_model_profiles:
     #   but this is untested here. No battery has been run against it.
     # ctx 131072 with q8_0 KV per spec; neither validated at that size (the
     #   verification run used -c 4096).
+    # ubatch 1024, NOT the fleet default of 2048 — measured on build 10400
+    # (llama-bench, -b 4096, -fa 1, r=2). Long-prompt prefill (pp4096):
+    #   ub 512  -> 100.98 t/s
+    #   ub 1024 -> 104.75 t/s  <- best
+    #   ub 2048 ->  82.10 t/s  <- the fleet default, -22%
+    # Decode is flat across all three (13.07-13.08), as everywhere else.
+    # This is the second novel architecture to reject 2048 (bailingmoe3 /
+    # Ling-3.0-flash was the first). Mainstream Qwen/Nemotron profiles all
+    # prefer 2048; both new-architecture models do not. Do not assume.
     repo: "unsloth/DeepSeek-V4-Flash-0731-GGUF"
     file: "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
     include: "*UD-IQ3_XXS*"
+    ubatch_size: 1024
     ctx_size: 131072
     temp: 0.6
     top_p: 0.95
