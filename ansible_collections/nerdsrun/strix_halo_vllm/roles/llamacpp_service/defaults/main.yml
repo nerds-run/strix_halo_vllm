@@ -5,7 +5,23 @@
 # Container image: llama.cpp with Vulkan (RADV) backend for Strix Halo.
 # Uses Vulkan instead of ROCm/HIP to work around the Qwen 3.5 hang bug
 # (https://github.com/ROCm/ROCm/issues/6027).
-llamacpp_image: "docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv"
+# PINNED BY DIGEST — do not switch back to the bare `:vulkan-radv` tag.
+#
+# That tag is a MOVING tag: upstream repushes it, sometimes several times a day
+# (observed 2026-08-13 at 02:35 and again at 05:56). A silent move cost the
+# coder-next profile ~33% of its decode at default batch settings, with no error
+# and no log line — the only symptom was slower inference. Pinning makes the
+# build a deliberate choice rather than a function of when you last deployed.
+#
+# Digest below == llama.cpp build 10400, which every benchmark in
+# docs/PERFORMANCE.md was measured against.
+#
+# To move to a newer build:
+#   1. podman pull docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv
+#   2. podman inspect ...:vulkan-radv --format '{{.Digest}}'
+#   3. update the digest here, then RE-BENCHMARK — batch/ubatch optima and
+#      absolute throughput both move between builds.
+llamacpp_image: "docker.io/kyuz0/amd-strix-halo-toolboxes@sha256:41f76c4c9b58353fbb4258bb5ec7e089f3f8494c10d07190ef061a147dd7c8ad"
 llamacpp_container_name: "llamacpp-server"
 llamacpp_enabled: true
 llamacpp_host: "0.0.0.0"

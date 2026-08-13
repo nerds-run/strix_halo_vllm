@@ -283,11 +283,13 @@ Both measured on llama.cpp build 10400, same harness, cold prefill.
 | Decode @ 32K | **38.1** | 17.9 | **+113%** |
 | Prefill @ 6K | **688 t/s** | 316 t/s | **+118%** |
 | Resident | **87 GiB** | 110 GiB | 23 GiB smaller |
-| Context served | 262144 | 81920 | 3.2× |
+| Context **per request** | **131072** (262144 ÷ 2 slots) | 81920 (1 slot) | **1.6×** |
+| Context aggregate | 262144 across 2 slots | 81920 | 3.2× |
 
 **`coder-next` wins every throughput axis and is smaller.** Caveats worth stating plainly:
 
-- The two ran at different context/slot settings (262144/2 slots vs 81920/1 slot). Slot count has little effect on single-request decode, and allocated context does not change decode rate, so the comparison is broadly fair — but it is not a controlled A/B.
+- The two ran at different context/slot settings (262144 across 2 slots vs 81920 on 1 slot). Slot count has little effect on single-request decode and allocated context does not change decode rate, so the throughput rows are broadly fair — but it is not a controlled A/B.
+- **Read the per-request context row, not the aggregate, when choosing for long sessions.** `parallel_slots: 2` subdivides `ctx_size`, so a single agent conversation on `coder-next` gets 131072 tokens, not 262144. To give one request the full window, set `parallel_slots: 1` or raise `ctx_size` — at 87 GiB resident there is headroom for the latter.
 - **Throughput is not the deciding metric.** `minimax` is the empirical incumbent for the big-coder slot on the basis of output quality on real delegated tickets. Speed says `coder-next` deserves the trial; only cost-per-merged-ticket settles it.
 - `coder-next` is Q8_0 (near-lossless) against minimax's IQ4_XS, so it is also carrying a quant-fidelity advantage into any quality comparison — which cuts in its favour for tool-call formatting, but means the two are not matched on precision either.
 
