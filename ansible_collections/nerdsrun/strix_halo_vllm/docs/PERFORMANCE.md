@@ -144,6 +144,7 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 | Qwen3-Coder-30B-A3B | MoE | 3B | 17 GB | Q4_K_XL | **83.4** |
 | Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **~95** |
 | NVIDIA-Nemotron-3.5-Lightning-30B-A3B | Hybrid Mamba-2 + MoE + Attn | 3B | ~35 GB | Q8_0 | **51.4** |
+| Qwen3-Coder-Next-80B-A3B | MoE + hybrid linear attention | 3B | ~85 GB | Q8_0 | **42.3 fresh / 27.5 at 32K** |
 | Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
 | NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **15.6** |
@@ -265,6 +266,29 @@ Measured on hardware at `-c 262144` with `parallel_slots: 2`, Q8_0, 3 cold runs 
 **Memory:** ~38 GiB total leaves ~87 GiB free, so the 262144 default is conservative and can be raised. It co-resides with `super` (~73 GiB) but **not** with `coder-next` (~85 GiB) or `minimax` (~108 GiB).
 
 **Slots subdivide context.** `-np 2` at `-c 262144` yields a 131072-token window per request, confirmed live. Raise `ctx_size` alongside `parallel_slots` if each request needs the full window.
+
+### Qwen3-Coder-Next (coder-next profile)
+
+Measured on hardware at `-c 262144`, `parallel_slots: 2`, Q8_0. Values are medians of the per-request timings llama.cpp logs (n≥2 per point).
+
+| Metric | Value |
+|---|---|
+| Decode, fresh ctx | **42.3 tok/s** |
+| Decode @ 8K | 40.9 tok/s |
+| Decode @ 32K | **27.5 tok/s** |
+| Prefill @ 1.6K | 717 t/s |
+| Prefill @ 6K | **840 t/s** |
+| Prefill @ 8K | 828 t/s |
+| Total resident | **87 GiB** |
+| Live slot config | `n_slots = 2, n_ctx_slot = 131072` |
+
+**Q8_0 clears the bar — keep it.** The threshold for falling back to Q6_K (65.6 GB) was 30 tok/s; this sustains 40.9 at 8K. Q6_K remains documented as a fallback but is not needed.
+
+**Decode degrades with context here — unlike the Nemotron hybrids.** 42.3 → 27.5 between fresh and 32K is a **−35%** falloff. Compare `lightning` and `super`, which are essentially flat (−2.8% and −1.4% out to 32K) because their Mamba-2 layers carry constant state. Qwen3-Next's hybrid linear attention reduces KV cost but does not make it context-independent. **For long-running agent sessions that accumulate context, this is the single most important difference between `coder-next` and the Nemotron profiles** — budget for roughly two-thirds throughput once a session passes ~30K.
+
+**Total size does not predict MoE decode speed — active params do.** `coder-next` (80B total) runs at 42.3 fresh against `lightning`'s (30B total) 51.4, despite being 2.4× the weights. Both activate 3B per token, so they land in the same band; the gap is architecture, not scale. Quant width still matters *within* a given active-param count, which is why Q8 vs Q4 moves `lightning` but total-size scaling does not.
+
+**Memory:** 87 GiB at the full 262144 context leaves ~38 GiB free. It does **not** co-reside with `lightning` (~38 GiB) — together they exactly exhaust 125 GiB.
 
 ### MiniMax-M2.7 (minimax profile)
 
