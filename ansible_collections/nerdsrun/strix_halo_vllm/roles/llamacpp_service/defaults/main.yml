@@ -30,6 +30,9 @@ llamacpp_port: 8080
 #           plugin; llama-server has neither, so we use --jinja and let the GGUF chat
 #           template handle tool calls. Reasoning toggled per-request via
 #           chat_template_kwargs.enable_thinking / low_effort.
+# coder-next: Qwen3-Coder-Next-80B-A3B — agentic coding delegation worker (~85GB at Q8_0)
+#           Challenger to minimax for the big-coder slot; NON-thinking model
+#           WARNING: ~85GB + KV — do not run alongside other models
 # minimax:  MiniMax-M2.7 — 229B MoE / 10B active, long-context agentic + reasoning (~108GB)
 #           WARNING: ~108GB at UD-IQ4_XS — tightest fit on 128GB, do not run alongside other models
 #           NOTE: Vulkan backend only — do NOT use CUDA 13.2 (produces gibberish per Unsloth docs)
@@ -197,6 +200,45 @@ llamacpp_model_profiles:
       - "--threads-http 8"
       - "--metrics"
       - "-np 1"
+  coder-next:
+    # Qwen3-Coder-Next-80B-A3B — 80B total / 3B active, MoE with hybrid
+    # linear attention. GGUF arch is `qwen3next`.
+    # Repo: the published name is `unsloth/Qwen3-Coder-Next-GGUF` — there is
+    #   NO size suffix in it. `unsloth/Qwen3-Coder-Next-80B-A3B-GGUF` 404s.
+    # Quant: Q8_0 (84.8 GB across 3 shards in a Q8_0/ subdirectory). Chosen
+    #   deliberately over IQ4 — this profile is a tool-calling delegation
+    #   worker, where the failure mode that matters is quant-induced
+    #   malformed tool-call JSON, not a benchmark point. Q6_K (65.6 GB) is
+    #   the documented fallback if Q8 throughput disappoints.
+    # Build gate: `qwen3next` is present in llama.cpp build 8985 (the pinned
+    #   toolbox image). Vulkan support for the arch's GATED_DELTA_NET op
+    #   landed in ggml-org/llama.cpp#20334.
+    # NOTE: this model is NON-THINKING — its card states it never emits
+    #   <think></think> blocks. --reasoning-format auto is kept for
+    #   consistency with the other profiles but is a no-op here; do not
+    #   "fix" it by copying reasoning settings from the super profile.
+    # Context: 262144, the full native window. The hybrid linear attention
+    #   keeps KV cost low and ~25GB of post-weights headroom holds it.
+    # WARNING: ~85GB resident + KV — do not run alongside other models.
+    repo: "unsloth/Qwen3-Coder-Next-GGUF"
+    file: "Q8_0/Qwen3-Coder-Next-Q8_0-00001-of-00003.gguf"
+    include: "*Q8_0*"
+    ctx_size: 262144
+    temp: 0.7
+    top_p: 0.8
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 1.05
+    # Delegation worker — 2 slots so a coding agent and a reviewer can run
+    # concurrently. Tunable to 4 for multi-agent delegation workloads; slots
+    # subdivide ctx_size, so raise ctx_size alongside it.
+    parallel_slots: 2
+    cache_type_k: "q8_0"
+    cache_type_v: "q8_0"
+    extra_args:
+      - "--reasoning-format auto"
+      - "--metrics"
   minimax:
     # MiniMax-M2.7 — 229B MoE / 10B active per token
     # UD-IQ4_XS weights alone are ~108GB — tightest fit in 128GB unified memory
