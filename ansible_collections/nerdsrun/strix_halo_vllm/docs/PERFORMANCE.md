@@ -143,6 +143,7 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 |---|---|---|---|---|---|
 | Qwen3-Coder-30B-A3B | MoE | 3B | 17 GB | Q4_K_XL | **83.4** |
 | Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **~95** |
+| NVIDIA-Nemotron-3.5-Lightning-30B-A3B | Hybrid Mamba-2 + MoE + Attn | 3B | ~35 GB | Q8_0 | **51.4** |
 | Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
 | NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **15.6** |
@@ -240,6 +241,30 @@ The practical consequence: **`super` is the right choice for genuinely long-cont
 - **Do not add `--special`.** It was tried for `<think>`/`</think>` visibility but leaks `<|im_end|>` into the assistant stream as literal text, which breaks the tool-call parser. `--reasoning-format auto` already exposes the reasoning separately, so it buys nothing.
 - NVIDIA mandates **`temperature=1.0`, `top_p=0.95`** across reasoning, tool calling, and chat. The profile reflects this.
 - Per-request reasoning controls (`enable_thinking`, `low_effort`) are passed via `chat_template_kwargs` in the OpenAI-compatible API body, e.g. `extra_body={"chat_template_kwargs": {"enable_thinking": true, "low_effort": true}}`.
+
+### Nemotron-3.5-Lightning (lightning profile)
+
+Measured on hardware at `-c 262144` with `parallel_slots: 2`, Q8_0, 3 cold runs per point (`cache_prompt: false`):
+
+| Metric | Value |
+|---|---|
+| Decode @ ~23 tok ctx | **51.43 tok/s** |
+| Decode @ 8K ctx | 51.13 tok/s |
+| Decode @ 32K ctx | 49.99 tok/s |
+| Prefill @ 1.6K prompt | **1246 t/s** |
+| Prefill @ 6K prompt | **1455 t/s** |
+| Total resident | **~38 GiB** |
+| Live slot config | `n_slots = 2, n_ctx_slot = 131072` |
+
+**Decode is flat with context** (−2.8% from empty to 32K), the same hybrid-architecture property that makes `super`'s 1M window cheap.
+
+**Prefill is ~4× `super`** (1455 vs 357 t/s at 6K) — 3B active params per token versus 12B.
+
+**The Q8 quant costs roughly half the decode speed.** `nemotron` (Nano) does ~95 tok/s at Q4_K_XL; this profile does 51.4 at Q8_0. Decode is memory-bandwidth-bound, and Q8_0 moves ~1.75× the bytes, predicting ~54 tok/s — the measurement matches. The quant was chosen for output fidelity in tool-calling, not throughput. **If the executor tier needs to be faster, move this profile to Q4/Q5** and expect roughly nemotron-class decode.
+
+**Memory:** ~38 GiB total leaves ~87 GiB free, so the 262144 default is conservative and can be raised. It co-resides with `super` (~73 GiB) but **not** with `coder-next` (~85 GiB) or `minimax` (~108 GiB).
+
+**Slots subdivide context.** `-np 2` at `-c 262144` yields a 131072-token window per request, confirmed live. Raise `ctx_size` alongside `parallel_slots` if each request needs the full window.
 
 ### MiniMax-M2.7 (minimax profile)
 
