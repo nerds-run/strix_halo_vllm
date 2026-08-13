@@ -145,7 +145,7 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 | Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **~95** |
 | Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
-| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **~22** |
+| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **15.6** |
 | MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **~22 fresh / ~17 at 40K ctx** |
 
 ### Vulkan-Specific Tuning
@@ -218,6 +218,20 @@ The `nemotron` and `super` profiles use NVIDIA's hybrid Mamba-Transformer archit
   | Compute buffers (Vulkan0 + host) | 14.1 GiB | **ubatch**, not context |
 
   **The KV cache is the small part.** Only **8 of 89 layers** carry KV at all — the rest are constant-state Mamba-2 / MoE — so a 1M-token window costs 2.25 GiB, which is why 1M is essentially free versus 512K. The 14.1 GiB compute buffer is a function of `-ub 2048`, so it's the ubatch setting that dominates non-weight memory here, not the context length. Budget accordingly: raising `-ub` costs memory, extending context barely does.
+
+**Decode throughput (measured, 3 runs per depth, `cache_prompt: false`):**
+
+| Context depth | Decode tok/s |
+|---|---|
+| ~23 tok | 15.68 |
+| ~8K | 15.51 |
+| ~32K | 15.46 |
+
+Decode is **flat with context** — a 32K context costs ~1.4% versus an empty one. This follows from the same property that makes 1M context cheap: only 8 of 89 layers do attention, so the per-token cost is dominated by the constant-state Mamba-2 / MoE layers. Contrast `minimax`, a conventional MoE, which drops from ~22 to ~17 tok/s between fresh and 40K context.
+
+The practical consequence: **`super` is the right choice for genuinely long-context work**, even though its fresh-context decode is slower than a comparable dense-attention model. It does not degrade as the conversation grows.
+
+> Earlier revisions of this table listed `~22` tok/s for `super`. That figure was an estimate carried over from the profile's introduction and was never measured; the real value is 15.6.
 
 **Tool calling / reasoning:**
 
@@ -347,7 +361,7 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 | Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE, 3B active | ~20 GB | Q4_K_XL | **~95** |
 | Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | Q4_K_XL | **22.8** |
-| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~63 GB | UD-Q3_K_XL | **~22** |
+| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~63 GB | UD-Q3_K_XL | **15.6** |
 | MiniMax-M2.7 (229B) | MoE, 10B active | ~108 GB | UD-IQ4_XS | **TBD** |
 
 ### vLLM (ROCm/TheROCk, --enforce-eager + TunableOp)

@@ -177,7 +177,7 @@ mise run deploy:llamacpp          # 122B model (default, ~22 tok/s)
 mise run deploy:llamacpp:coder    # Coder 30B (~83 tok/s)
 mise run deploy:llamacpp:fast     # Fast 35B (~59 tok/s)
 mise run deploy:llamacpp:nemotron # Nemotron Nano 30B (~95 tok/s, hybrid Mamba-Transformer)
-mise run deploy:llamacpp:super    # NVIDIA-Nemotron-3-Super 120B (~22 tok/s, needs ≥8351, ~63 GB, native 1M ctx, tool-calling via --jinja)
+mise run deploy:llamacpp:super    # NVIDIA-Nemotron-3-Super 120B (15.6 tok/s, needs ≥8351, ~63 GB, native 1M ctx, tool-calling via --jinja)
 mise run deploy:llamacpp:minimax  # MiniMax-M2.7 229B/10B (~108 GB, long-context agentic + tool-use)
 
 # --- vLLM (ROCm) ---
