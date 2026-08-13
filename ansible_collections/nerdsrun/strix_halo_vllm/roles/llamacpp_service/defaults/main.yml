@@ -18,6 +18,9 @@ llamacpp_port: 8080
 # coder:    Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
 # fast:     Qwen3.5-35B-A3B — fast reasoning/vision/coding (~20GB, ~50-55 tok/s)
 # nemotron: Nemotron-3-Nano-30B-A3B — hybrid Mamba-Transformer MoE, coding/agentic/reasoning (~20GB)
+# lightning: NVIDIA-Nemotron-3.5-Lightning-30B-A3B — successor to nemotron (~35GB at Q8_0)
+#           Fast agentic executor: tool use, code review, high-volume delegation
+#           NOTE: -np defaults to 2 (parallel_slots) — this is the high-volume tier
 # super:    Nemotron-3-Super-120B-A12B — hybrid LatentMoE (Mamba-2+MoE+Attn), reasoning/planning (~63GB)
 #           NOTE: GGUF dropped to UD-Q3_K_XL (~63GB) so the long context fits on 128GB
 #           NOTE: Runs at the full native 1M context (ctx_size 1048576) — measured
@@ -83,6 +86,43 @@ llamacpp_model_profiles:
     extra_args:
       - "--reasoning-format deepseek"
       - "--reasoning on"
+  lightning:
+    # NVIDIA-Nemotron-3.5-Lightning-30B-A3B — released 2026-08-11.
+    # Successor family to the `nemotron` (Nano) profile: same 30B-A3B size
+    # class, hybrid Mamba-2 + MoE + Attention. GGUF arch is `nemotron_h_moe`.
+    # Verified present in the toolbox image's llama.cpp build 8985, so no new
+    # build gate beyond the existing ≥8351 note for the hybrid Mamba archs.
+    # Quant: Q8_0 (35.0 GB, single file at repo root — no quant subdirectory,
+    #   same shape as the `nemotron` profile). Near-lossless; at this size the
+    #   128 GB box has abundant headroom, so there is no reason to go lower.
+    # Sampling: NVIDIA's card specifies temperature 1.0 / top_p 0.95.
+    # Reasoning is toggleable per-request via chat_template_kwargs
+    #   (enable_thinking), same mechanism as the super profile.
+    # Context: native 1M. Defaulted to 262144 rather than the full window —
+    #   the Mamba-2 state is constant-size but the select Attention layers
+    #   still allocate KV against -c, and this profile is meant to run
+    #   alongside a big coder rather than alone. Raise ctx_size if it runs solo.
+    # License: OpenMDW-1.1 (https://openmdw.ai/license/1-1/)
+    repo: "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF"
+    file: "NVIDIA-Nemotron-3.5-Lightning-30B-A3B-Q8_0.gguf"
+    include: "*Q8_0*"
+    ctx_size: 262144
+    temp: 1.0
+    top_p: 0.95
+    top_k: 0
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 0
+    # High-volume executor tier — two concurrent slots by default so a CLI
+    # agent and Open WebUI don't queue behind each other. Tunable to 4; each
+    # slot carves its own KV region out of ctx_size, so raising this without
+    # raising ctx_size shrinks the per-slot window.
+    parallel_slots: 2
+    cache_type_k: "q8_0"
+    cache_type_v: "q8_0"
+    extra_args:
+      - "--reasoning-format auto"
+      - "--metrics"
   super:
     # Hybrid LatentMoE (Mamba-2 + MoE + Attention), Multi-Token Prediction
     # 120B total / 12B active per token — UD-Q3_K_XL is ~63GB (native 1M ctx)

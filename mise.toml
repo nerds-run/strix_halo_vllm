@@ -126,6 +126,10 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY 
 description = "Deploy llama.cpp — nemotron profile (Nemotron-3-Nano-30B-A3B, coding/agentic)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=nemotron"
 
+[tasks."deploy:llamacpp:lightning"]
+description = "Deploy llama.cpp — lightning profile (Nemotron-3.5-Lightning-30B-A3B, fast agentic executor)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=lightning"
+
 [tasks."deploy:llamacpp:super"]
 description = "Deploy llama.cpp — super profile (Nemotron-3-Super-120B-A12B, reasoning/planning)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=super"

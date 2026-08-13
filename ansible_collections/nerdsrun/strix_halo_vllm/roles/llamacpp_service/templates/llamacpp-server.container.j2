@@ -48,6 +48,9 @@ Exec=llama-server \
 {% if _cache_v | length > 0 %}
   --cache-type-v {{ _cache_v }} \
 {% endif -%}
+{% if llamacpp_active.parallel_slots is defined %}
+  -np {{ llamacpp_active.parallel_slots }} \
+{% endif -%}
 {% if not llamacpp_thinking_enabled %}
   --chat-template-kwargs '{"enable_thinking":false}' \
 {% endif -%}

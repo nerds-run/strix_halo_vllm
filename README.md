@@ -51,6 +51,7 @@ mise run deploy:llamacpp          # llama.cpp Vulkan — 122B model (default)
 mise run deploy:llamacpp:coder    # llama.cpp — Coder 30B profile
 mise run deploy:llamacpp:fast     # llama.cpp — Fast 35B profile
 mise run deploy:llamacpp:nemotron # llama.cpp — Nemotron Nano 30B profile
+mise run deploy:llamacpp:lightning # llama.cpp — Nemotron 3.5 Lightning 30B profile
 mise run deploy:llamacpp:super    # llama.cpp — Nemotron Super 120B profile
 mise run deploy:llamacpp:minimax  # llama.cpp — MiniMax-M2.7 229B profile
 mise run deploy:all               # full site.yml deployment
@@ -83,10 +84,13 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 | `coder` | Qwen3-Coder-30B-A3B | ~20 GB | 3B | ~83 | Coding, tool-use, agentic |
 | `fast` | Qwen3.5-35B-A3B | ~20 GB | 3B | ~59 | Fast general + vision |
 | `nemotron` | Nemotron-3-Nano-30B-A3B | ~20 GB | 3B | ~95 | Coding, agentic, reasoning |
+| `lightning` | NVIDIA-Nemotron-3.5-Lightning-30B-A3B | ~35 GB | 3B | TBD | Fast agentic executor — tool use, code review, high-volume delegation |
 | `super` | NVIDIA-Nemotron-3-Super-120B-A12B | ~63 GB | 12B | **15.6** | Reasoning, planning, tool-calling (1M ctx native) |
 | `minimax` | MiniMax-M2.7 (229B MoE) | ~108 GB | 10B | TBD | Long-context agentic, tool-use, reasoning |
 
 > **Note:** The `nemotron` and `super` profiles require llama.cpp build **≥8351** (fixes [ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570) — mamba-base.cpp assertion crash). Both are hybrid Mamba-Transformer architectures. The `super` profile runs at the **full native 1,048,576-token context** in ~73 GiB total on a 128 GB Strix Halo. The hybrid LatentMoE design means only 8 of 89 layers carry KV at all (the rest are constant-state Mamba-2 / MoE), so a 1M-token window costs just 2.25 GiB of KV cache — 1M is effectively free versus 512K. Non-weight memory is dominated by the ~14 GiB ubatch compute buffer instead, leaving ~50 GiB spare. Tool calling rides on `--jinja` + the GGUF's chat template; the vLLM-only `--tool-call-parser qwen3_coder` / `--reasoning-parser super_v3` flags are NOT supported by `llama-server` and will crash it.
+>
+> **Nemotron-3.5-Lightning (`lightning`):** Released 2026-08-11; the successor family to the `nemotron` (Nano) profile, same 30B-A3B size class. Hybrid Mamba-2 + MoE + Attention (GGUF arch `nemotron_h_moe`), up to 1M native context, [OpenMDW-1.1](https://openmdw.ai/license/1-1/) license. **Build requirement:** the arch is present in llama.cpp build **8985**, which the pinned `kyuz0/amd-strix-halo-toolboxes:vulkan-radv` image ships — verified by inspecting the image's `libllama.so`, so no gate beyond the existing ≥8351 note applies. Ships at **Q8_0 (35.0 GB)**: near-lossless, and at this size the 128 GB box has abundant headroom, so there is no reason to quantize harder. Context defaults to **262144**, not the full 1M — the Mamba-2 state is constant-size, but the select Attention layers still allocate KV against `-c`, and this profile is intended to run *alongside* a big coder rather than alone. Raise `ctx_size` if it runs solo. Parallel slots default to **2** via the per-profile `parallel_slots` variable (tunable to 4); note that slots subdivide `ctx_size`, so raising slots without raising context shrinks the per-slot window.
 >
 > **MiniMax-M2.7:** Ships at UD-IQ4_XS (~108 GB) — the tightest fit on 128 GB unified memory. Do not run alongside other models. Tool calling rides on `--jinja` + the chat template baked into the GGUF, with `--reasoning-format auto` to surface the model's reasoning blocks (llama.cpp does not support the vLLM-style `--tool-call-parser` / `--reasoning-parser` flags referenced in the MiniMax docs). Per [Unsloth docs](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF), do **NOT** run these GGUFs on CUDA 13.2 (produces gibberish) — this deployment uses Vulkan, so no action needed.
 
@@ -148,6 +152,7 @@ Open WebUI auto-connects to whichever backend is deployed. The container-to-cont
 | `mise run deploy:llamacpp:coder` | Deploy llama.cpp coder profile |
 | `mise run deploy:llamacpp:fast` | Deploy llama.cpp fast profile |
 | `mise run deploy:llamacpp:nemotron` | Deploy llama.cpp nemotron profile |
+| `mise run deploy:llamacpp:lightning` | Deploy llama.cpp lightning profile |
 | `mise run deploy:llamacpp:super` | Deploy llama.cpp super profile |
 | `mise run deploy:llamacpp:minimax` | Deploy llama.cpp minimax profile |
 | `mise run deploy:all` | Full deployment |
