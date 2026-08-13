@@ -173,18 +173,18 @@
               - "llamacpp_model_profiles.deepseek.cache_type_k == 'q8_0'"
               - "llamacpp_model_profiles.deepseek.cache_type_v == 'q8_0'"
               - "'--reasoning-format auto' in llamacpp_model_profiles.deepseek.extra_args"
-              # The gate itself: deepseek must stay marked unsupported until
-              # Vulkan kernels for the DSv4 ops exist upstream.
-              - "llamacpp_model_profiles.deepseek.unsupported_reason is defined"
             fail_msg: "deepseek profile is missing required DeepSeek-V4-Flash launch params or its unsupported gate"
 
-        - name: "Assert only deepseek is gated, and the gate defaults to closed"
+        # deepseek was ungated on 2026-08-13 after it was verified to run.
+        # The guard mechanism stays in the role for future use; no profile
+        # currently sets unsupported_reason, and the override stays off.
+        - name: "Assert no profile is gated, and the override defaults to off"
           ansible.builtin.assert:
             that:
               - >-
                 (llamacpp_model_profiles | dict2items
                  | selectattr('value.unsupported_reason', 'defined')
-                 | map(attribute='key') | list) == ['deepseek']
+                 | map(attribute='key') | list) == []
               - "not (llamacpp_allow_unsupported | bool)"
             fail_msg: >-
               Unexpected gated-profile set

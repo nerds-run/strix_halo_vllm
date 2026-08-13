@@ -346,21 +346,28 @@ llamacpp_model_profiles:
     #    is what this profile uses. This substitution is deliberate and
     #    documented rather than silent.
     #
-    # KV bytes/token is NOT reported because it is not measurable: the arch
-    #   will not load, so there are no llama.cpp load logs to read it from.
-    #   Estimating it from the architecture and presenting it as measured
-    #   would be worse than reporting the gap. Re-measure once Vulkan
-    #   support ships, then raise ctx_size to the value the headroom allows.
+    # UNGATED 2026-08-13 — IT RUNS. Verified on hardware with the pinned image
+    #   (build 10400): loads all four shards at ~101 GiB resident and generates
+    #   coherent output, thinking blocks included, at **12.9 tok/s** decode /
+    #   11.0 t/s prefill on a short prompt.
     #
-    # ctx 131072 with q8_0 KV per spec; both unvalidated for the same reason.
-    unsupported_reason: >-
-      DeepSeek-V4's CSA/HCA attention ops (LIGHTNING_INDEXER, DSV4_HC_*)
-      appear to have no Vulkan implementation upstream — a code search finds
-      them in ggml-metal and ggml-sycl but not ggml-vulkan. Note that build
-      10400 DOES register the `deepseek4` architecture (8985 did not), so
-      the model may now load and then fail or fall back to CPU on those ops
-      rather than being rejected outright. Unverified either way: confirming
-      requires a ~104GB download. Clear this gate to find out.
+    #   This contradicts the earlier gate rationale, which is kept below for
+    #   the record. The reasoning was: a GitHub code search finds DSV4 ops
+    #   (LIGHTNING_INDEXER, DSV4_HC_*) in ggml-metal and ggml-sycl but not
+    #   ggml-vulkan, so the model "cannot run" here. That inference was wrong.
+    #   Either the ops landed without matching that search, or llama.cpp falls
+    #   back transparently. The 12.9 tok/s is low for 13B active params at
+    #   IQ3 (~33 t/s would be the bandwidth estimate), which is consistent
+    #   with a partial CPU fallback — but that is inference, not measurement.
+    #
+    # WARNING: at 12.9 tok/s this is the slowest profile here by a wide margin
+    #   (coder-next 42.7, Ling 46.9). Treat as experimental/capability-probing
+    #   rather than a working tier.
+    # WARNING: IQ3 quant — tool-call reliability is more fragile at 3-bit.
+    #   Unsloth's UD dynamic quants keep attention layers higher-precision,
+    #   but this is untested here. No battery has been run against it.
+    # ctx 131072 with q8_0 KV per spec; neither validated at that size (the
+    #   verification run used -c 4096).
     repo: "unsloth/DeepSeek-V4-Flash-0731-GGUF"
     file: "UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf"
     include: "*UD-IQ3_XXS*"
