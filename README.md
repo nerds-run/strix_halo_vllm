@@ -55,6 +55,7 @@ mise run deploy:llamacpp:lightning # llama.cpp — Nemotron 3.5 Lightning 30B pr
 mise run deploy:llamacpp:super    # llama.cpp — Nemotron Super 120B profile
 mise run deploy:llamacpp:coder-next # llama.cpp — Qwen3-Coder-Next 80B profile
 mise run deploy:llamacpp:minimax  # llama.cpp — MiniMax-M2.7 229B profile
+mise run deploy:llamacpp:deepseek # llama.cpp — DeepSeek-V4-Flash (gated, see note)
 mise run deploy:all               # full site.yml deployment
 
 # 5. Verify
@@ -89,6 +90,7 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 | `super` | NVIDIA-Nemotron-3-Super-120B-A12B | ~63 GB | 12B | **15.6** | Reasoning, planning, tool-calling (1M ctx native) |
 | `coder-next` | Qwen3-Coder-Next-80B-A3B | ~85 GB | 3B | TBD | Agentic coding delegation worker (challenger to minimax) |
 | `minimax` | MiniMax-M2.7 (229B MoE) | ~108 GB | 10B | TBD | Long-context agentic, tool-use, reasoning |
+| `deepseek` ⚠️ | DeepSeek-V4-Flash-0731 (284B MoE) | ~104 GB | 13B | TBD | Max-capability agentic coding, long-context — **gated, see note** |
 
 > **Note:** The `nemotron` and `super` profiles require llama.cpp build **≥8351** (fixes [ggml-org/llama.cpp#20570](https://github.com/ggml-org/llama.cpp/issues/20570) — mamba-base.cpp assertion crash). Both are hybrid Mamba-Transformer architectures. The `super` profile runs at the **full native 1,048,576-token context** in ~73 GiB total on a 128 GB Strix Halo. The hybrid LatentMoE design means only 8 of 89 layers carry KV at all (the rest are constant-state Mamba-2 / MoE), so a 1M-token window costs just 2.25 GiB of KV cache — 1M is effectively free versus 512K. Non-weight memory is dominated by the ~14 GiB ubatch compute buffer instead, leaving ~50 GiB spare. Tool calling rides on `--jinja` + the GGUF's chat template; the vLLM-only `--tool-call-parser qwen3_coder` / `--reasoning-parser super_v3` flags are NOT supported by `llama-server` and will crash it.
 >
@@ -97,6 +99,13 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 > **Qwen3-Coder-Next (`coder-next`):** 80B total / 3B active, MoE with hybrid linear attention (GGUF arch `qwen3next`), 256K native context. Published as **`unsloth/Qwen3-Coder-Next-GGUF`** — there is no size suffix in the repo name. Ships at **Q8_0 (84.8 GB, 3 shards)**: near-lossless, chosen deliberately over IQ4 because this profile is a tool-calling delegation worker where the failure mode that matters is quant-induced malformed tool-call JSON, not a benchmark point. **Q6_K (65.6 GB) is the documented fallback** if Q8 throughput disappoints. Context defaults to the **full native 262144** — hybrid linear attention keeps KV cheap and ~25 GB of post-weights headroom holds it. Parallel slots default to **2** (`parallel_slots`), tunable to 4 for multi-agent delegation. **This model is non-thinking** — its card states it never emits `<think>` blocks, so `--reasoning-format auto` is a no-op here and is kept only for consistency. **~85 GB resident + KV — do not run alongside other models.** This profile is a *challenger* to `minimax`, which remains the incumbent big coder until A/B'd on real tickets.
 >
 > **MiniMax-M2.7:** Ships at UD-IQ4_XS (~108 GB) — the tightest fit on 128 GB unified memory. Do not run alongside other models. Tool calling rides on `--jinja` + the chat template baked into the GGUF, with `--reasoning-format auto` to surface the model's reasoning blocks (llama.cpp does not support the vLLM-style `--tool-call-parser` / `--reasoning-parser` flags referenced in the MiniMax docs). Per [Unsloth docs](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF), do **NOT** run these GGUFs on CUDA 13.2 (produces gibberish) — this deployment uses Vulkan, so no action needed.
+>
+> **DeepSeek-V4-Flash (`deepseek`) — ⚠️ EXPERIMENTAL, GATED, DOES NOT CURRENTLY RUN.** 284B total / 13B active, MoE with hybrid CSA/HCA sparse attention (GGUF arch `deepseek4`), architecture supports up to 1M context. The profile is defined in full and `mise run deploy:llamacpp:deepseek` resolves it end to end, but the deploy **stops at a guard task** rather than downloading ~104 GB and starting a server that cannot load. Two independent blockers:
+>
+> 1. **No Vulkan implementation.** DeepSeek-V4's attention ops (`LIGHTNING_INDEXER`, `DSV4_HC_PRE`/`COMB`/`POST`) exist upstream for **Metal and SYCL only**. A GitHub code search for `DSV4` under `ggml/src/ggml-vulkan` returns **0 hits**; the same search under `ggml/src/ggml-metal` returns **6**. The architecture itself landed in [#24162](https://github.com/ggml-org/llama.cpp/pull/24162) (2026-06-29) and the Flash-0731 chat template in [#26398](https://github.com/ggml-org/llama.cpp/pull/26398) (2026-08-03), but neither helps this backend. Confirmed against the pinned image: `deepseek4` is absent from build 8985's `libllama.so` while `minimax-m2` and `qwen3moe` are present. **No toolbox image upgrade fixes this** — it needs Vulkan kernels to be written upstream. There is therefore no "minimum build ≥N" to quote for Vulkan yet.
+> 2. **The commonly-cited quant does not fit.** `UD-Q3_K_XL` is **128.2 GB** on Hugging Face — roughly 119 GiB against 125 GiB of total system RAM, before compute buffers or KV. It cannot load at any context length. The frequently-quoted "~103 GB" figure corresponds to **`UD-IQ3_XXS` (104.2 GB)**, which is the largest tier that actually fits and is what this profile uses. This substitution is deliberate and flagged rather than silent.
+>
+> Defaults are `-c 131072` with **KV cache quantization on by default** (`-ctk q8_0 -ctv q8_0`) per spec — both **unvalidated**, because the model cannot be loaded to validate them. **KV bytes-per-token is not reported for this architecture**: it is read from llama.cpp's load logs, and there are none. An estimate presented as a measurement would be worse than the gap. Once Vulkan support ships, measure it and raise `ctx_size` to what the headroom allows. Note also that **tool-call reliability is more fragile at 3-bit**; Unsloth's UD dynamic quants mitigate this by keeping attention layers at higher precision. To attempt the deploy anyway: `-e llamacpp_allow_unsupported=true`.
 
 ---
 
@@ -160,6 +169,7 @@ Open WebUI auto-connects to whichever backend is deployed. The container-to-cont
 | `mise run deploy:llamacpp:super` | Deploy llama.cpp super profile |
 | `mise run deploy:llamacpp:coder-next` | Deploy llama.cpp coder-next profile |
 | `mise run deploy:llamacpp:minimax` | Deploy llama.cpp minimax profile |
+| `mise run deploy:llamacpp:deepseek` | Deploy llama.cpp deepseek profile (gated — see note) |
 | `mise run deploy:all` | Full deployment |
 | `mise run verify` | Run verification checks |
 | `mise run uninstall` | Remove all components |
