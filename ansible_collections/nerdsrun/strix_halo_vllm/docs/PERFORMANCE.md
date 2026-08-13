@@ -141,21 +141,35 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 
 | Model | Architecture | Active Params | Size | Quant | tok/s |
 |---|---|---|---|---|---|
-| Qwen3-Coder-30B-A3B | MoE | 3B | 17 GB | Q4_K_XL | **83.4** |
-| Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **~95** |
-| NVIDIA-Nemotron-3.5-Lightning-30B-A3B | Hybrid Mamba-2 + MoE + Attn | 3B | ~35 GB | Q8_0 | **51.4** |
+| Qwen3-Coder-30B-A3B | MoE | 3B | 17 GB | Q4_K_XL | **96.6** |
+| Nemotron-3-Nano-30B-A3B | Hybrid Mamba-Transformer MoE | 3B | ~20 GB | Q4_K_XL | **71.1** |
+| NVIDIA-Nemotron-3.5-Lightning-30B-A3B | Hybrid Mamba-2 + MoE + Attn | 3B | ~35 GB | Q8_0 | **56.2** |
 | Qwen3-Coder-Next-80B-A3B | MoE + hybrid linear attention | 3B | ~85 GB | Q8_0 | **42.7 fresh / 38.1 at 32K** |
 | Ling-3.0-flash (124B, `bailingmoe3`) † | MoE + hybrid KDA/MLA | 5.1B | ~73 GB | Q4_K_M | **46.9** |
-| Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **59.4** |
-| Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **22.8** |
-| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **15.6** |
+| Qwen3.5-35B-A3B | MoE | 3B | 21 GB | Q4_K_XL | **62.1** |
+| Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **23.3** |
+| NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **18.8** |
 | MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **28.1 fresh / 24.5 at 8K / 17.9 at 32K** |
 
 † `Ling-3.0-flash` is **not a profile in this collection**. It requires a community fork of llama.cpp (`aetherbird/llama.cpp`, branch `bailingmoe3-support`) because the `bailingmoe3` architecture is unsupported upstream. Listed here for comparison only; see the expedition report for methodology and caveats.
 
 ### Vulkan-Specific Tuning
 
-- **`-b 512`** (batch size, logical): Default. Per-profile override in `llamacpp_model_profiles.<profile>.batch_size` (e.g. `super` and `minimax` both use `4096` for faster prefill on long prompts)
+- **`-b 4096`** (batch size, logical): Raised from llama.cpp's 512 default. **Must be >= ubatch** — llama.cpp clamps the micro-batch to the logical batch, so `-b 512 -ub 2048` silently runs at 512. Per-profile override via `llamacpp_model_profiles.<profile>.batch_size`.
+- **Whole-fleet re-baseline (build 10400, `-b 4096`, llama-bench, r=2).** Every profile was re-measured after the image pin; `-ub 2048` beat the 512 default on long-prompt prefill for all of them, with decode unaffected:
+
+  | Profile | tg128 | pp4096 @ub512 | pp4096 @ub2048 | prefill gain |
+  |---|---|---|---|---|
+  | `coder` | 96.6 | 1185.5 | 1297.7 | +9% |
+  | `fast` | 62.1 | 1104.7 | 1191.6 | +8% |
+  | `nemotron` | 71.1 | 1226.8 | **1709.3** | **+39%** |
+  | `lightning` | 56.2 | 1202.2 | **1727.2** | **+44%** |
+  | `super` | 18.8 | 223.2 | 282.7 | +27% |
+  | `big` | 23.3 | 342.7 | 454.8 | +33% |
+
+  This is why `llamacpp_ubatch_size` now defaults to **2048** and `llamacpp_batch_size` to **4096**.
+
+  > **Several published tok/s figures were wrong and are corrected above.** `nemotron` was listed as `~95` and measures **71.1** (−25%) — it was an unmeasured estimate from the same commit as the `super` figure already corrected earlier. `coder` was understated at 83.4 (actual **96.6**), `super` at 15.6 (actual **18.8**), `lightning` at 51.4 (actual **56.2**). Some of the gain is the newer build; the `nemotron` error was never a measurement at all.
 - **`-ub 512`** (ubatch, physical): Default. Set `llamacpp_ubatch_size` globally or per-profile `ubatch_size` — this is the single biggest prefill lever on Vulkan/RADV (gfx1151-specific; decode is unaffected). Measured sweep on the `super` profile with 1.6K-token prompts:
 
   | `-ub` | Prefill t/s |

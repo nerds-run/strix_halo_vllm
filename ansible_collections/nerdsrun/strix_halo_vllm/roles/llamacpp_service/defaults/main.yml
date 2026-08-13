@@ -390,11 +390,20 @@ llamacpp_allow_unsupported: false
 llamacpp_ngl: 999
 llamacpp_flash_attn: true
 llamacpp_no_mmap: true
-llamacpp_batch_size: 512
-# Physical (micro) batch size — 0 lets llama-server pick the default (currently 512).
-# Raising to 1024+ improves prefill throughput on Vulkan/RADV at the cost of some
-# GPU scratch memory. Per-profile override via llamacpp_model_profiles.<p>.ubatch_size.
-llamacpp_ubatch_size: 0
+# Logical batch. Must be >= ubatch: llama.cpp clamps the micro-batch to this, so
+# `-b 512 -ub 2048` silently runs at 512. Raised from llama.cpp's 512 default.
+llamacpp_batch_size: 4096
+# Physical (micro) batch size — the single biggest prefill lever on Vulkan/RADV.
+# 2048 measured as the best value for every profile swept on build 10400
+# (b=4096, llama-bench, r=2), long-prompt prefill gain over the 512 default:
+#   coder +9%   fast +8%    nemotron +39%
+#   lightning +44%  super +27%  big +33%
+# Decode (tg128) is unaffected in all cases — within run-to-run noise.
+# NOT universal: the bailingmoe3 (Ling-3.0-flash) architecture regressed ~18%
+# at 2048 and preferred the default, so sweep before assuming this transfers to
+# a new architecture. Per-profile override via
+# llamacpp_model_profiles.<p>.ubatch_size (minimax pins 1024).
+llamacpp_ubatch_size: 2048
 llamacpp_thinking_enabled: true
 llamacpp_log_disable: true
 llamacpp_extra_args: []

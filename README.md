@@ -82,12 +82,12 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 
 | Profile | Model | Size | Active Params | tok/s | Use Case |
 |---|---|---|---|---|---|
-| `big` (default) | Qwen3.5-122B-A10B | 77 GB | 10B | ~22 | Reasoning, vision, general |
-| `coder` | Qwen3-Coder-30B-A3B | ~20 GB | 3B | ~83 | Coding, tool-use, agentic |
-| `fast` | Qwen3.5-35B-A3B | ~20 GB | 3B | ~59 | Fast general + vision |
-| `nemotron` | Nemotron-3-Nano-30B-A3B | ~20 GB | 3B | ~95 | Coding, agentic, reasoning |
-| `lightning` | NVIDIA-Nemotron-3.5-Lightning-30B-A3B | ~35 GB | 3B | **51.4** | Fast agentic executor — tool use, code review, high-volume delegation |
-| `super` | NVIDIA-Nemotron-3-Super-120B-A12B | ~63 GB | 12B | **15.6** | Reasoning, planning, tool-calling (1M ctx native) |
+| `big` (default) | Qwen3.5-122B-A10B | 77 GB | 10B | **23.3** | Reasoning, vision, general |
+| `coder` | Qwen3-Coder-30B-A3B | ~20 GB | 3B | **96.6** | Coding, tool-use, agentic |
+| `fast` | Qwen3.5-35B-A3B | ~20 GB | 3B | **62.1** | Fast general + vision |
+| `nemotron` | Nemotron-3-Nano-30B-A3B | ~20 GB | 3B | **71.1** | Coding, agentic, reasoning |
+| `lightning` | NVIDIA-Nemotron-3.5-Lightning-30B-A3B | ~35 GB | 3B | **56.2** | Fast agentic executor — tool use, code review, high-volume delegation |
+| `super` | NVIDIA-Nemotron-3-Super-120B-A12B | ~63 GB | 12B | **18.8** | Reasoning, planning, tool-calling (1M ctx native) |
 | `coder-next` | Qwen3-Coder-Next-80B-A3B | ~85 GB | 3B | **42.7 fresh / 38.1 at 32K** | Agentic coding delegation worker (challenger to minimax) |
 | `minimax` | MiniMax-M2.7 (229B MoE) | ~108 GB | 10B | **28.1 fresh / 17.9 at 32K** | Long-context agentic, tool-use, reasoning |
 | `deepseek` ⚠️ | DeepSeek-V4-Flash-0731 (284B MoE) | ~104 GB | 13B | TBD | Max-capability agentic coding, long-context — **gated, see note** |
@@ -98,7 +98,7 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 >
 > At ~38 GiB it comfortably co-resides with `super` (~73 GiB) — but **not** with `coder-next` (~85 GiB) or `minimax` (~108 GiB), which would exceed 125 GiB together.
 >
-> **On the Q8 choice and speed:** measured decode is **51.4 tok/s**, against `nemotron`'s ~95 — but that gap is the quant, not the model. Decode here is memory-bandwidth-bound, and Q8_0 moves ~1.75× the bytes of `nemotron`'s Q4_K_XL, which predicts ~54 tok/s. The measurement lands right on that. **If you want the executor tier faster, drop this profile to a Q4/Q5 tier** and expect roughly nemotron-class decode; Q8 buys output fidelity, not throughput. Prefill, by contrast, is enormous — **1246 t/s at 1.6K and 1455 t/s at 6K prompts**, ~4× the `super` profile, because only 3B params are active per token.
+> **On the Q8 choice and speed:** measured decode is **56.2 tok/s** against `nemotron`'s **71.1** — a 21% gap, not the ~50% an earlier revision of this note claimed. That earlier analysis was anchored on a `~95` figure for `nemotron` that turned out to be an unmeasured estimate; re-benchmarked, `nemotron` is 71.1. Bandwidth alone would predict worse: Q8_0 here is 32.59 GiB against `nemotron`'s 21.26 GiB (1.53×), implying ~46 tok/s. Lightning delivers 56.2, i.e. **~21% better than its byte count predicts** — the 3.5 architecture is more efficient per byte than Nano, so the quant is costing less than it appears. **A Q4/Q5 lightning is still worth trying if the executor tier needs speed**, but temper expectations: the realistic ceiling is Nano-class (~71), not the ~95 previously implied. Prefill is excellent — **1727 t/s at 4K prompts** with `-ub 2048` (up 44% from the llama.cpp default), roughly 6× the `super` profile, because only 3B params are active per token.
 >
 > **Qwen3-Coder-Next (`coder-next`):** 80B total / 3B active, MoE with hybrid linear attention (GGUF arch `qwen3next`), 256K native context. Published as **`unsloth/Qwen3-Coder-Next-GGUF`** — there is no size suffix in the repo name. Ships at **Q8_0 (84.8 GB, 3 shards)**: near-lossless, chosen deliberately over IQ4 because this profile is a tool-calling delegation worker where the failure mode that matters is quant-induced malformed tool-call JSON, not a benchmark point. **Measured: 42.7 tok/s fresh, 41.3 at 8K — Q8 clears the 30 tok/s bar, so it stays.** Q6_K (65.6 GB) remains documented as a fallback but is not needed. **Context falloff is mild:** decode holds **38.1 tok/s at 32K (−11%)**. Prefill is 688 t/s at 6K. **Requires `batch_size: 4096` / `ubatch_size: 2048`** — at llama.cpp defaults on build 10400 it loses ~33% decode. Resident footprint is **87 GiB** at the full 262144 context, which fits with ~38 GiB spare but does **not** co-reside with `lightning`. Context defaults to the **full native 262144** — hybrid linear attention keeps KV cheap and ~25 GB of post-weights headroom holds it. Parallel slots default to **2** (`parallel_slots`), tunable to 4 for multi-agent delegation. **Note that slots subdivide the window: at 2 slots each request gets 131072 tokens, not 262144** (confirmed live as `n_ctx_slot = 131072`). For a single agent that needs the full 256K, set `parallel_slots: 1` or raise `ctx_size`. **This model is non-thinking** — its card states it never emits `<think>` blocks, so `--reasoning-format auto` is a no-op here and is kept only for consistency. **~85 GB resident + KV — do not run alongside other models.** This profile is a *challenger* to `minimax`, which remains the incumbent big coder until A/B'd on real tickets.
 >
