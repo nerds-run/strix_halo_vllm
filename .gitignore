@@ -9,3 +9,6 @@ inventory/hosts.yml
 # Claude code ignores
 CLAUDE.md
 .claude/
+
+# Unrelated scratch: browser-OS build prompts, not part of this collection
+nerdsrun-os-chunks.md
