@@ -235,6 +235,19 @@ llamacpp_model_profiles:
     min_p: 0.0
     jinja: true
     repeat_penalty: 1.05
+    # Batch/ubatch are NOT optional here — on llama.cpp build 10400 this profile
+    # loses ~33% of its decode at the defaults (b=512, ub=512). Measured on
+    # gfx1151, 3 cold runs per point:
+    #   b512/ub512   -> decode 28.2 / 27.6 / 25.3  (fresh / 8K / 32K)
+    #                   prefill 703 @1.6K, 814 @6K
+    #   b4096/ub2048 -> decode 42.7 / 41.3 / 38.1
+    #                   prefill 721 @1.6K, 688 @6K
+    # Tuning buys +51% decode fresh and +50% at 32K, for -15% prefill at 6K.
+    # Decode dominates agentic latency, so take the trade. Note ub=2048 helps
+    # HERE but hurt the Ling/bailingmoe3 model on the same GPU — the optimum is
+    # model-dependent, not a gfx1151 constant. Re-measure per profile.
+    batch_size: 4096
+    ubatch_size: 2048
     # Delegation worker — 2 slots so a coding agent and a reviewer can run
     # concurrently. Tunable to 4 for multi-agent delegation workloads; slots
     # subdivide ctx_size, so raise ctx_size alongside it.
