@@ -77,6 +77,14 @@ lemonade_volumes:
   lemonade-data: /opt/lemonade/.cache/lemonade
   lemonade-config: /opt/lemonade/.config/lemonade
 
+# Expose the llamacpp_service GGUF tree to Lemonade, read-only. Lemonade
+# stores its own downloads in HF cache layout and cannot read the flat
+# --local-dir tree llamacpp_service builds, so without this a model served by
+# both stacks is on disk twice. Mounted models appear as `extra.NAME` and cost
+# nothing to add. Empty string disables the mount.
+lemonade_extra_models_host_dir: "{{ llamacpp_model_dir | default('~/models') }}"
+lemonade_extra_models_mount: "/models"
+
 # Backend binaries are fetched at run time, so the image itself is
 # GPU-agnostic and there is no rocm/vulkan image variant to choose. Installing
 # a backend downloads it plus its runtime: llamacpp:rocm pulls llama.cpp
@@ -104,6 +112,7 @@ lemonade_backends:
 lemonade_config:
   enable_dgpu_gtt: true
   llamacpp.backend: rocm
+  extra_models_dir: "{{ lemonade_extra_models_mount if lemonade_extra_models_host_dir | length > 0 else '' }}"
 
 # Pulled after the backends are installed. Names must match the catalog
 # exactly (`lemonade list`); the DS4 entry is registered under its quant, not

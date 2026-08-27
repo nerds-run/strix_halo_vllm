@@ -21,6 +21,9 @@ PublishPort={{ lemonade_port }}:13305
 {% for vol, dest in lemonade_volumes.items() %}
 Volume={{ vol }}:{{ dest }}
 {% endfor %}
+{% if lemonade_extra_models_host_dir | length > 0 %}
+Volume={{ lemonade_extra_models_host_dir | expanduser }}:{{ lemonade_extra_models_mount }}:ro
+{% endif %}
 {% if lemonade_podman_args | length > 0 %}
 PodmanArgs={{ lemonade_podman_args | join(' ') }}
 {% endif %}
