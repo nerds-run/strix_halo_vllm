@@ -16,3 +16,12 @@
     - role: nerdsrun.strix_halo_vllm.lemonade_service
       tags:
         - lemonade
+    # Open WebUI bakes its backend URL in at container creation, so it has to
+    # be told when the active stack changes — otherwise it keeps pointing at
+    # the llama.cpp port that Conflicts= now guarantees is dead. Runs only
+    # when ui_enabled; the role recreates the container if the URL drifted.
+    - role: nerdsrun.strix_halo_vllm.openwebui_ui
+      vars:
+        strix_halo_mode: lemonade
+      tags:
+        - ui

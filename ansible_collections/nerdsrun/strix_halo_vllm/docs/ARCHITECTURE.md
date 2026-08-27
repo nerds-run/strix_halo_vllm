@@ -22,7 +22,7 @@ ansible_collections/nerdsrun/strix_halo_vllm/
 │   ├── toolbox.yml        # Toolbox-only
 │   ├── service.yml        # Service-only (vLLM)
 │   ├── llamacpp.yml       # llama.cpp service (backend depends on profile)
-│   ├── lemonade.yml       # Lemonade Server (multi-model router)
+│   ├── lemonade.yml       # Lemonade Server (router) + repoints Open WebUI
 │   ├── verify.yml         # Verification only
 │   ├── uninstall.yml      # Complete teardown
 │   └── ui.yml             # Open WebUI management
@@ -82,7 +82,7 @@ with an actionable error message showing what was detected vs. what is required.
 | llamacpp_service | Profile-based Quadlet template; `hf download` handles idempotent GGUF caching. A profile may override the container image, devices, env and Podman args, so backend is a per-profile property |
 | lemonade_service | Quadlet template plus in-container state: config is diffed against `config.json` before/after and only restarts the service when it actually changed; backends re-report success when already present, so change is detected from the download line; models are pulled only when absent from `lemonade list --downloaded` |
 | model_cache | Check HuggingFace cache for existing models before downloading |
-| openwebui_ui | `podman container exists` check, skip if present |
+| openwebui_ui | `podman container exists` check, skip if present — except when the container's baked-in `OPENAI_API_BASE_URL` no longer matches the resolved backend, which forces a recreate. Chat history survives because it lives in a named volume |
 | verify | Read-only checks, no state changes |
 
 ## Security Posture

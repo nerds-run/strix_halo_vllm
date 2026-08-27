@@ -11,6 +11,8 @@
     openwebui_openai_api_base_url: >-
       {{ openwebui_openai_api_base_url
          if (openwebui_openai_api_base_url | default('') | length > 0)
+         else ('http://127.0.0.1:' + (lemonade_port | default(13305) | string) + '/v1')
+         if (strix_halo_mode | default('service') == 'lemonade')
          else ('http://127.0.0.1:' + (llamacpp_port | default(8080) | string) + '/v1')
          if (strix_halo_mode | default('service') == 'llamacpp')
          else ('http://127.0.0.1:' + (vllm_port | default(8000) | string) + '/v1') }}
@@ -43,6 +45,12 @@
       when: openwebui_ui_vol_exists.rc != 0
       changed_when: true
 
+    - name: Resolve API base URL for container networking
+      ansible.builtin.set_fact:
+        openwebui_ui_resolved_api_url: >-
+          {{ openwebui_openai_api_base_url
+             | regex_replace('(127\.0\.0\.1|localhost)', 'host.containers.internal') }}
+
     - name: Check if Open WebUI container already exists
       ansible.builtin.command:
         cmd: "podman container exists {{ openwebui_container_name }}"
@@ -50,11 +58,38 @@
       changed_when: false
       failed_when: false
 
-    - name: Resolve API base URL for container networking
-      ansible.builtin.set_fact:
-        openwebui_ui_resolved_api_url: >-
-          {{ openwebui_openai_api_base_url
-             | regex_replace('(127\.0\.0\.1|localhost)', 'host.containers.internal') }}
+    # The backend URL is baked into the container's environment at creation,
+    # so an existing container keeps pointing at whatever was active the day
+    # it was made. Switching stacks then leaves the UI talking to a port
+    # nothing listens on — it loads, lists no models, and every message fails.
+    # Nothing about that says "wrong backend", so detect the drift here.
+    - name: Read the backend URL the running container was created with
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          podman inspect {{ openwebui_container_name }} --format '{% raw %}{{range .Config.Env}}{{println .}}{{end}}{% endraw %}' \
+            | sed -n 's/^OPENAI_API_BASE_URL=//p'
+        executable: /bin/bash
+      register: openwebui_ui_current_url
+      when: openwebui_ui_exists.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Remove Open WebUI container when its backend URL is stale
+      ansible.builtin.command:
+        cmd: "podman rm -f {{ openwebui_container_name }}"
+      when:
+        - openwebui_ui_exists.rc == 0
+        - (openwebui_ui_current_url.stdout | default('') | trim) | length > 0
+        - (openwebui_ui_current_url.stdout | trim) != openwebui_ui_resolved_api_url
+      changed_when: true
+
+    - name: Re-check container existence after any stale removal
+      ansible.builtin.command:
+        cmd: "podman container exists {{ openwebui_container_name }}"
+      register: openwebui_ui_exists
+      changed_when: false
+      failed_when: false
 
     - name: Warn about disabled authentication
       ansible.builtin.debug:
