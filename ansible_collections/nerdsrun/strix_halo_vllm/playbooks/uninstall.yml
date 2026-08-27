@@ -110,12 +110,12 @@
       register: uninstall_lemonade_service
 
     - name: Remove Lemonade container
-      containers.podman.podman_container:
-        name: lemonade-server
-        state: absent
-      become: false
-      failed_when: false
+      ansible.builtin.command:
+        cmd: "podman rm -f lemonade-server"
       register: uninstall_lemonade_container
+      changed_when: uninstall_lemonade_container.rc == 0
+      failed_when: false
+      become: false
 
     - name: Track Lemonade container removal  # noqa: no-handler
       ansible.builtin.set_fact:
@@ -197,17 +197,17 @@
         # ~100 GB of downloaded models lives here. Only removed under the
         # same purge flag that drops the Open WebUI volume.
         - name: Remove Lemonade volumes
-          containers.podman.podman_volume:
-            name: "{{ item }}"
-            state: absent
-          become: false
-          failed_when: false
+          ansible.builtin.command:
+            cmd: "podman volume rm -f {{ item }}"
           loop:
             - lemonade-cache
             - lemonade-llama
             - lemonade-data
             - lemonade-config
           register: uninstall_lemonade_volumes
+          changed_when: uninstall_lemonade_volumes.rc == 0
+          failed_when: false
+          become: false
 
         - name: Track Lemonade volume removal  # noqa: no-handler
           ansible.builtin.set_fact:
