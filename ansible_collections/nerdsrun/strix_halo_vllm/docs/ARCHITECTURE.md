@@ -12,7 +12,7 @@ ansible_collections/nerdsrun/strix_halo_vllm/
 │   ├── gpu_tuning/        # amdgpu sysfs power profile pinning + boot-persist unit
 │   ├── toolbox_mode/      # Interactive toolbox container
 │   ├── podman_service/    # systemd Quadlet vLLM service (ROCm)
-│   ├── llamacpp_service/  # systemd Quadlet llama.cpp service (Vulkan)
+│   ├── llamacpp_service/  # systemd Quadlet llama.cpp service (Vulkan or ROCm)
 │   ├── model_cache/       # HuggingFace model prefetching (vLLM modes)
 │   ├── openwebui_ui/      # Optional Open WebUI chat frontend
 │   └── verify/            # Non-interactive deployment verification
@@ -20,7 +20,7 @@ ansible_collections/nerdsrun/strix_halo_vllm/
 │   ├── site.yml           # Full deployment
 │   ├── toolbox.yml        # Toolbox-only
 │   ├── service.yml        # Service-only (vLLM)
-│   ├── llamacpp.yml       # llama.cpp Vulkan service
+│   ├── llamacpp.yml       # llama.cpp service (backend depends on profile)
 │   ├── verify.yml         # Verification only
 │   ├── uninstall.yml      # Complete teardown
 │   └── ui.yml             # Open WebUI management
@@ -42,7 +42,7 @@ host_prereqs ──► kernel_tuning
      │
      ├──► podman_service    (when mode=service|both)     [ROCm, port 8000]
      │
-     ├──► llamacpp_service  (when mode=llamacpp)         [Vulkan, port 8080]
+     ├──► llamacpp_service  (when mode=llamacpp)         [Vulkan or ROCm, port 8080]
      │
      ├──► model_cache       (when mode!=llamacpp, prefetch enabled)
      │
@@ -75,7 +75,7 @@ with an actionable error message showing what was detected vs. what is required.
 | gpu_tuning | sysfs writes always re-apply (cheap, no-op if already at target); systemd unit template uses Ansible handler for reload |
 | toolbox_mode | `podman container inspect` to check existence, skip if present; firewalld rule when `firewall_open_vllm_port` |
 | podman_service | Quadlet template with `notify` handlers, only restarts on change |
-| llamacpp_service | Profile-based Quadlet template; `hf download` handles idempotent GGUF caching |
+| llamacpp_service | Profile-based Quadlet template; `hf download` handles idempotent GGUF caching. A profile may override the container image, devices, env and Podman args, so backend is a per-profile property |
 | model_cache | Check HuggingFace cache for existing models before downloading |
 | openwebui_ui | `podman container exists` check, skip if present |
 | verify | Read-only checks, no state changes |
@@ -84,7 +84,8 @@ with an actionable error message showing what was detected vs. what is required.
 
 - All containers run rootless via user-level Podman
 - systemd services use `scope: user` (no root)
-- `seccomp=unconfined` is required for ROCm (vLLM mode) but not for Vulkan (llama.cpp mode)
+- `seccomp=unconfined` is required for ROCm in **vLLM/toolbox** mode, and not for Vulkan (llama.cpp mode)
+- The **ROCm llama.cpp profiles** (`qwen38-fp4`, `deepseek-v4`) need `--ipc=host` instead — measured necessary AND sufficient; `seccomp=unconfined` was tested there and does **not** help. Without it the HSA runtime cannot map its shared-memory segments and model load dies with a misleading "Memory in use" error
 - API key authentication on vLLM endpoints (configurable); llama.cpp auth optional
 - Quadlet unit files deployed with `mode: 0600` (contain API keys/tokens)
 - Firewall rules opt-in only (`firewall_open_vllm_port` / `firewall_open_llamacpp_port: false` by default)

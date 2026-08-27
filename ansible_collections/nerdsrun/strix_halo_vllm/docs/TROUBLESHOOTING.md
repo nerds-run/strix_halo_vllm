@@ -395,7 +395,27 @@ ansible -i inventory all -m shell -a 'free -h | head -2'
 | `--max-model-len N` | `--ctx-size N` |
 | `--gpu-memory-utilization` | (vLLM-only) |
 
-When in doubt: `podman run --rm <image> llama-server --help 2>&1 | grep -i <flag_stem>` to verify a flag actually exists in the build.
+**Flags also differ between BUILDS, not just between engines.** This collection now pins three different images, and their CLI surfaces are not the same:
+
+| Image | Build | Note |
+|---|---|---|
+| `vulkan-radv` (default) | 10400 | has `--reasoning-preserve` |
+| `rocm-7.2.4-rocmfpx` (`qwen38-fp4`) | 211 | **rejects `--reasoning-preserve`** — cut from a much older base |
+| `rocm-7.2.4` (`deepseek-v4`) | 10217 | mainline; older than the Vulkan image |
+
+A flag that works on one profile can hard-fail another into a systemd restart loop. Note also that build numbers do **not** order across images — 10217 is mainline and 211 is a fork, so neither is "newer".
+
+When in doubt, verify against the image you are actually deploying:
+
+```bash
+podman run --rm <image> llama-server --help 2>&1 | grep -i <flag_stem>
+```
+
+After a failed start, clear the restart-loop state before retrying, or systemd refuses:
+
+```bash
+systemctl --user reset-failed llamacpp-server
+```
 
 ## GPU Perf Level Reverted After Reboot
 
@@ -412,6 +432,112 @@ sudo systemctl enable --now amdgpu-performance.service
 ```
 
 Re-run `mise run deploy:llamacpp` to reinstall/re-enable the unit idempotently.
+
+## ROCm profile dies at load: "Memory critical error ... Reason: Memory in use"
+
+Applies to the ROCm/HIP profiles (`qwen38-fp4`, `deepseek-v4`). Symptom:
+
+```
+Memory critical error by agent node-0 (Agent handle: 0x...) on address 0x... Reason: Memory in use.
+Module /opt/rocm-7.2.4/lib/librocroller.so.1.0.0
+Module /usr/local/lib64/libggml-hip.so.0.11.1
+```
+
+**Cause: the container has a private IPC namespace.** ROCm's HSA runtime allocates through shared-memory segments, and rootless Podman isolates IPC by default. Fix is one flag, carried by the profile as `podman_args: ["--ipc=host"]`.
+
+Isolated on hardware, one variable at a time:
+
+| Container flags | Result |
+|---|---|
+| none | HSA critical error |
+| `--security-opt seccomp=unconfined` | HSA critical error |
+| **`--ipc=host`** | **loads cleanly** |
+
+**The message sends you the wrong way.** "Memory in use" reads like OOM or a locked-memory cap, and these boxes *do* have `RLIMIT_MEMLOCK` at 8 MB soft and hard (`DefaultLimitMEMLOCK`), which neither rootless Podman nor a systemd user unit can raise. That limit is **not** the cause and no root change is needed. Do not go chasing it.
+
+---
+
+## Model loaded but throughput is 3-4x too low (it is silently on CPU)
+
+The single most expensive class of failure on this hardware, because **nothing errors**. The server starts, answers correctly, and is merely slow.
+
+**Diagnose with GTT, not `free`:**
+
+```bash
+cat /sys/class/drm/card*/device/mem_info_gtt_used
+cat /sys/class/drm/card*/device/mem_info_gtt_total
+```
+
+If `used` is near zero while a multi-GB model is loaded, the weights are not on the GPU. Three known causes:
+
+1. **`GGML_HIP_ENABLE_UNIFIED_MEMORY=1` on a large model.** Managed allocations never enter GTT and migrate on demand. Correct for `qwen38-fp4` (~14 GB); measured catastrophic for `deepseek-v4` (~97 GB) — GTT sat at **0 of 124 GiB** and decode fell to ~3.4 tok/s. It is a per-profile setting; do not promote it to a global.
+2. **llama.cpp autofit.** `-fit` reads `MemAvailable`, which is at its lowest immediately after unloading the previous model — i.e. exactly during a profile switch. It then silently places tensors on CPU. Pass `-fit off` on the large ROCm profiles.
+3. **`n_parallel` left on auto.** It picked 4 slots on a 128 GB box, reserving KV for four full-context slots, pinning 120 of 125 GB and collapsing `buff/cache` to ~1 GB. Pin `parallel_slots: 1` for anything large.
+
+**Always wait for GTT release between profile switches.** The driver frees buffers *after* the process exits, so poll rather than sleep:
+
+```bash
+systemctl --user stop llamacpp-server
+until [ "$(cat /sys/class/drm/card*/device/mem_info_gtt_used | head -1)" -lt 2000000000 ]; do sleep 4; done
+```
+
+Starting a large load against stale GTT is what triggers cause 2 above.
+
+---
+
+## Server aborts when sent an image
+
+```
+srv process_chun: image processed in 26 ms
+server-context.cpp:3192: fatal error ... ggml_abort
+```
+
+**Multimodal and MTP speculative decoding cannot be combined** on the current builds. The image decodes fine; the pairing aborts. Verified by running the same quant and projector with the speculative flags removed, which answers image questions correctly.
+
+`qwen38-fp4` therefore ships with no `mmproj_file`. **Use the `qwen38` profile for vision** — Vulkan, no speculation, full 262K context.
+
+---
+
+## Empty `content` in the response, with a populated `reasoning_content`
+
+Qwen3.8 defaults to thinking at `reasoning_effort: "xhigh"`. With a modest `max_tokens` the entire budget is spent reasoning and `content` comes back empty. **The model is not broken.**
+
+The chat template accepts **only** `xhigh`, `medium`, `low` — `"none"` raises. Options:
+
+```json
+{"chat_template_kwargs": {"reasoning_effort": "low"}}
+{"chat_template_kwargs": {"enable_thinking": false}}
+```
+
+`qwen38-fp4` ships with **thinking off by default** — it is the speed tier, and reasoning tokens count against `max_tokens`, so leaving it on truncates answers (`finish_reason: length`) instead of completing them (`stop`).
+
+**Re-enabling it per request has a trap.** Per-request `chat_template_kwargs` *merge over* the server-side ones rather than replacing them, so a pinned `enable_thinking: false` keeps winning unless overridden by name:
+
+| Per-request kwargs | reasoning_content |
+|---|---:|
+| none | 0 |
+| `{"reasoning_effort": "low"}` | **0 — silently inert** |
+| `{"enable_thinking": true}` | 210 chars |
+| `{"enable_thinking": true, "reasoning_effort": "low"}` | 441 chars |
+
+Always pass `enable_thinking: true` to turn it back on. The sibling `qwen38` profile leaves thinking enabled, so the capability tier and speed tier differ deliberately.
+
+---
+
+## Speculative decoding made it *slower*
+
+Expected, for some pairings, and it is arithmetic rather than a bug. Speculation wins only when a drafted token costs less than a target token. Compare **drafter size** against **target bytes read per token**:
+
+| Profile | Target reads/token | Drafter | Result |
+|---|---:|---:|---|
+| `qwen38-fp4` | ~13.7 GB | small MTP head | **2.4x faster** |
+| `deepseek-v4` | ~4.7 GB (13B active) | 10.15 GB DSpark | **2.5x slower** |
+
+Draft acceptance is not the tell — DeepSeek's was healthy at 0.82-0.84. The drafter simply could not pay for its own weight. `deepseek-v4` therefore ships with speculation off.
+
+Also: **never pair `draft-dspark` with `ngram-*` spec types** (destroys DSpark), and **never use a 2-bit drafter** (acceptance collapses and speculation loses ~40% against no drafter at all).
+
+---
 
 ## Complete Reset
 

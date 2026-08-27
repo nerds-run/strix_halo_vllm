@@ -172,13 +172,20 @@ See [Variables Reference](VARIABLES.md) for all options.
 Choose your deployment mode:
 
 ```bash
-# --- llama.cpp (Vulkan) --- recommended for Qwen 3.5 models
-mise run deploy:llamacpp          # 122B model (default, ~22 tok/s)
-mise run deploy:llamacpp:coder    # Coder 30B (~83 tok/s)
-mise run deploy:llamacpp:fast     # Fast 35B (~59 tok/s)
-mise run deploy:llamacpp:nemotron # Nemotron Nano 30B (~95 tok/s, hybrid Mamba-Transformer)
-mise run deploy:llamacpp:super    # NVIDIA-Nemotron-3-Super 120B (15.6 tok/s, needs ≥8351, ~63 GB, native 1M ctx, tool-calling via --jinja)
-mise run deploy:llamacpp:minimax  # MiniMax-M2.7 229B/10B (~108 GB, long-context agentic + tool-use)
+# --- llama.cpp (Vulkan backend, the pinned default image) ---
+mise run deploy:llamacpp          # `big` — Qwen3.5-122B-A10B (default, 23.3 tok/s)
+mise run deploy:llamacpp:coder    # Qwen3-Coder-30B-A3B (96.6 tok/s — fastest in the fleet)
+mise run deploy:llamacpp:fast     # Qwen3.5-35B-A3B (62.1 tok/s, general + vision)
+mise run deploy:llamacpp:nemotron # Nemotron-3-Nano-30B-A3B (71.1 tok/s, hybrid Mamba-Transformer)
+mise run deploy:llamacpp:lightning  # Nemotron-3.5-Lightning-30B-A3B (56.2 tok/s, agentic executor)
+mise run deploy:llamacpp:super    # Nemotron-3-Super-120B-A12B (18.8 tok/s, ~63 GB, native 1M ctx)
+mise run deploy:llamacpp:coder-next # Qwen3-Coder-Next-80B-A3B (42.7 tok/s, ~85 GB)
+mise run deploy:llamacpp:minimax  # MiniMax-M2.7 229B/10B (28.1 tok/s, ~108 GB — tightest fit)
+mise run deploy:llamacpp:qwen38   # Qwen3.8-27B dense VLM (12.3 tok/s, vision + 262K ctx)
+
+# --- llama.cpp (ROCm/HIP backend — these profiles override the image) ---
+mise run deploy:llamacpp:qwen38-fp4  # Qwen3.8-27B ROCmFP4 + MTP (29.1 tok/s on code, no vision)
+mise run deploy:llamacpp:deepseek-v4 # DeepSeek-V4-Flash-0731 284B (17.1 tok/s, full 1M ctx)
 
 # --- vLLM (ROCm) ---
 mise run deploy:toolbox           # Interactive toolbox
@@ -239,12 +246,21 @@ systemctl --user status llamacpp-server
 mise run logs:llamacpp
 
 # Switch model profiles
-mise run deploy:llamacpp          # 122B (default)
-mise run deploy:llamacpp:coder    # Coder 30B
-mise run deploy:llamacpp:fast     # Fast 35B
-mise run deploy:llamacpp:nemotron # Nemotron Nano 30B
-mise run deploy:llamacpp:super    # Nemotron Super 120B
-mise run deploy:llamacpp:minimax  # MiniMax-M2.7 229B
+mise run deploy:llamacpp             # `big` — 122B (default)
+mise run deploy:llamacpp:coder       # Coder 30B — fastest
+mise run deploy:llamacpp:fast        # Fast 35B
+mise run deploy:llamacpp:nemotron    # Nemotron Nano 30B
+mise run deploy:llamacpp:lightning   # Nemotron 3.5 Lightning 30B
+mise run deploy:llamacpp:super       # Nemotron Super 120B
+mise run deploy:llamacpp:coder-next  # Qwen3-Coder-Next 80B
+mise run deploy:llamacpp:minimax     # MiniMax-M2.7 229B
+mise run deploy:llamacpp:qwen38      # Qwen3.8-27B (vision, 262K ctx)
+mise run deploy:llamacpp:qwen38-fp4  # Qwen3.8-27B fast (ROCm, no vision)
+mise run deploy:llamacpp:deepseek-v4 # DeepSeek-V4-Flash 284B (ROCm, 1M ctx)
+
+# Only one profile serves at a time — they share the llamacpp-server unit and
+# port 8080, so deploying one replaces whatever was running. On a 128 GB box
+# that is a hard constraint for the large profiles, not a convention.
 
 # Test the API
 curl http://localhost:8080/v1/models

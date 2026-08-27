@@ -206,6 +206,170 @@
           loop_control:
             label: "{{ item.key }}"
 
+        # --- Documentation drift guard -----------------------------------
+        # This repo's docs carry measured numbers, so a profile that exists in
+        # code but not in the docs is a real defect, not a tidiness issue. This
+        # session began with exactly that drift (three profiles shipped with no
+        # mention in CLAUDE.md and stale TBDs in README).
+        - name: "Read the docs that must enumerate every profile"
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          register: _docs
+          loop:
+            - "{{ playbook_dir }}/../../../../../README.md"
+            - "{{ playbook_dir }}/../../../../../mise.toml"
+            - "{{ playbook_dir }}/../../docs/GETTING_STARTED.md"
+            - "{{ playbook_dir }}/../../docs/VARIABLES.md"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: "Assert every profile appears in README, mise.toml, GETTING_STARTED and VARIABLES"
+          ansible.builtin.assert:
+            that:
+              - "item.0.key in (item.1.content | b64decode)"
+            fail_msg: >-
+              Profile '{{ item.0.key }}' is defined in defaults but absent from
+              {{ item.1.item | basename }}. Every profile needs a deploy task
+              and a documented tok/s figure — silent profiles are how the
+              fleet's published numbers drifted out of date before.
+          loop: "{{ llamacpp_model_profiles | dict2items | product(_docs.results) | list }}"
+          loop_control:
+            label: "{{ item.0.key }} in {{ item.1.item | basename }}"
+
+        # --- Regression guards -------------------------------------------
+        # Every assertion below encodes a failure that actually happened on
+        # hardware and cost real debugging time. All of them failed SILENTLY:
+        # the server started, answered requests, and only throughput or a
+        # crash-on-a-specific-input revealed the problem. Do not relax one
+        # without re-measuring the thing it protects.
+
+        - name: "Assert the ROCm profiles declare the KFD device and --ipc=host"
+          ansible.builtin.assert:
+            that:
+              - "'/dev/kfd' in (item.value.devices | default([]))"
+              - "'--ipc=host' in (item.value.podman_args | default([]))"
+            fail_msg: >-
+              ROCm profile '{{ item.key }}' must add /dev/kfd and pass
+              --ipc=host. Without --ipc=host the HSA runtime cannot map its
+              shared-memory segments and model load dies with
+              "Memory critical error ... Reason: Memory in use", which reads
+              like an OOM and is not one.
+          loop: "{{ llamacpp_model_profiles | dict2items | selectattr('value.backend', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: "Assert unified memory is set for qwen38-fp4 and NOT for deepseek-v4"
+          ansible.builtin.assert:
+            that:
+              - "llamacpp_model_profiles['qwen38-fp4'].env.GGML_HIP_ENABLE_UNIFIED_MEMORY is defined"
+              - "llamacpp_model_profiles['deepseek-v4'].env.GGML_HIP_ENABLE_UNIFIED_MEMORY is not defined"
+            fail_msg: >-
+              GGML_HIP_ENABLE_UNIFIED_MEMORY is per-profile, not global. It is
+              correct for qwen38-fp4 (~14GB) and measured harmful for
+              deepseek-v4 (~97GB): managed allocations never enter GTT
+              (mem_info_gtt_used stayed at 0 of 124 GiB) and decode collapsed
+              to ~3.4 tok/s with no error logged.
+
+        - name: "Assert deepseek-v4 pins autofit off and a single slot"
+          ansible.builtin.assert:
+            that:
+              - "'-fit off' in llamacpp_model_profiles['deepseek-v4'].extra_args"
+              - "llamacpp_model_profiles['deepseek-v4'].parallel_slots | int == 1"
+            fail_msg: >-
+              deepseek-v4 needs -fit off and parallel_slots 1. Autofit reads
+              MemAvailable, which is lowest right after unloading the previous
+              model, and silently placed the whole 97GB on CPU (3.4 tok/s).
+              n_parallel auto picked 4 slots and pinned 120 of 125 GB.
+
+        - name: "Assert deepseek-v4 ships no speculative drafter"
+          ansible.builtin.assert:
+            that:
+              - "llamacpp_model_profiles['deepseek-v4'].draft_file is not defined"
+              - "llamacpp_model_profiles['deepseek-v4'].spec_type is not defined"
+            fail_msg: >-
+              deepseek-v4 must not enable DSpark. Measured a 2.5x LOSS (the
+              10.15GB drafter exceeds the ~4.7GB the target reads per token),
+              and on mainline it fails to load outright with
+              "key not found in model: dflash.attention.sliding_window_pattern".
+
+        - name: "Assert vision is on qwen38 and off qwen38-fp4"
+          ansible.builtin.assert:
+            that:
+              - "llamacpp_model_profiles['qwen38'].mmproj_file is defined"
+              - "llamacpp_model_profiles['qwen38-fp4'].mmproj_file is not defined"
+            fail_msg: >-
+              Vision belongs on qwen38 only. On qwen38-fp4 an image request
+              aborts the server (server-context.cpp:3192, ggml_abort) because
+              multimodal and MTP speculative decoding cannot be combined on
+              this build. The projector alone is fine; the pairing is not.
+
+        - name: "Assert --reasoning-preserve is never sent to the ROCmFPX fork"
+          ansible.builtin.assert:
+            that:
+              - "'--reasoning-preserve' not in (llamacpp_model_profiles['qwen38-fp4'].extra_args | join(' '))"
+              - "'--reasoning-preserve' not in (llamacpp_model_profiles['deepseek-v4'].extra_args | join(' '))"
+            fail_msg: >-
+              The ROCm images reject --reasoning-preserve outright
+              ("invalid argument"), and llama-server exits 1 into a systemd
+              restart loop. Flag sets differ per build; keep it on the Vulkan
+              profile only.
+
+        - name: "Assert list-valued include patterns exist where sidecars are needed"
+          ansible.builtin.assert:
+            that:
+              - "item.value.include is string or (item.value.include | length) > 0"
+              - >-
+                (item.value.mmproj_file is not defined)
+                or (item.value.include is not string)
+            fail_msg: >-
+              Profile '{{ item.key }}' declares a projector or drafter but a
+              single-string include, so the sidecar would never download.
+              Note hf takes ONE pattern per --include flag; passing several
+              after one flag silently reparses them as positional filenames
+              and drops --include entirely, exiting 0 with the wrong files.
+          loop: "{{ llamacpp_model_profiles | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: "Assert extra_args never duplicates a templated flag"
+          ansible.builtin.assert:
+            that:
+              - "'--parallel' not in (item.value.extra_args | default([]) | join(' '))"
+              - "'-np ' not in (item.value.extra_args | default([]) | join(' ') ~ ' ')"
+              - "'--ctx-size' not in (item.value.extra_args | default([]) | join(' '))"
+              - "'--mmproj' not in (item.value.extra_args | default([]) | join(' '))"
+              - "'--model-draft' not in (item.value.extra_args | default([]) | join(' '))"
+              - "'--chat-template-kwargs' not in (item.value.extra_args | default([]) | join(' '))"
+            fail_msg: >-
+              Profile '{{ item.key }}' sets a flag in extra_args that the
+              template already renders from a dedicated key. extra_args is
+              emitted LAST, so llama.cpp takes it as the final occurrence and
+              the dedicated key is silently ignored — the server then runs a
+              different config than the profile declares, with no warning.
+              This actually happened: --parallel 1 in extra_args overrode
+              parallel_slots 4 and the server served 1 slot.
+              Use parallel_slots / ctx_size / mmproj_file / draft_file /
+              chat_template_kwargs instead.
+          loop: "{{ llamacpp_model_profiles | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        - name: "Assert every speculative profile is fully specified"
+          ansible.builtin.assert:
+            that:
+              - "item.value.spec_type is defined"
+              - "item.value.draft_ngl is defined"
+              - "item.value.spec_n_max is defined"
+            fail_msg: >-
+              Profile '{{ item.key }}' sets draft_file but not the rest of the
+              speculative config. Without draft_ngl the draft head can land on
+              CPU and the entire speculative gain disappears; spec_n_max must
+              be pinned because the llama.cpp default is far down the wrong
+              side of the acceptance curve.
+          loop: "{{ llamacpp_model_profiles | dict2items | selectattr('value.draft_file', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.key }}"
+
     # Renders the real Quadlet template for every profile. This is the only
     # test that exercises the Jinja itself — where this project's documented
     # whitespace/continuation pitfalls actually live.
@@ -260,6 +424,38 @@
                 == ((item.item.value.repeat_penalty | default(0) | float) > 0)
               # Never emit --special (breaks tool-call parsing).
               - "'--special' not in _text"
+              # Per-profile image override must win over the global.
+              - >-
+                (item.item.value.image is not defined)
+                or (('Image=' ~ item.item.value.image) in _text)
+              # A profile's extra devices must all reach AddDevice lines.
+              - >-
+                (item.item.value.devices is not defined)
+                or (item.item.value.devices
+                    | reject('in', _text | regex_findall('AddDevice=(\\S+)'))
+                    | list | length == 0)
+              # podman_args must render as a PodmanArgs= line (ROCm needs
+              # --ipc=host; without it the HSA runtime fails to map memory).
+              - >-
+                (item.item.value.podman_args is not defined)
+                or (('PodmanArgs=' ~ (item.item.value.podman_args | join(' '))) in _text)
+              # A drafter must resolve against draft_repo when it lives in a
+              # different repo from the target, not against the target's dir.
+              - >-
+                (item.item.value.draft_file is not defined)
+                or (('--model-draft /models/'
+                     ~ ((item.item.value.draft_repo | default(item.item.value.repo)) | regex_replace('/', '_'))
+                     ~ '/' ~ item.item.value.draft_file) in _text)
+              # Speculation must never render half-configured.
+              - >-
+                ('--spec-type' in _text) == (item.item.value.draft_file is defined)
+              # The vision projector is rendered only where declared.
+              - >-
+                ('--mmproj' in _text) == (item.item.value.mmproj_file is defined)
+              # chat_template_kwargs must render as valid JSON on one flag.
+              - >-
+                (item.item.value.chat_template_kwargs is not defined)
+                or (("--chat-template-kwargs '" ~ (item.item.value.chat_template_kwargs | to_json) ~ "'") in _text)
               # The command must terminate with the alias line, proving the
               # whole backslash-continued block survived rendering intact.
               # Compares against llamacpp_model_profile rather than item.key:

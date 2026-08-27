@@ -117,12 +117,30 @@
   tags:
     - llamacpp
 
+# A profile's `include` is normally one glob for the chosen quant. Profiles that
+# also need sidecar files from the same repo — a vision projector, an MTP draft
+# model — set a list instead, and each pattern gets its own --include flag.
+#
+# The flag MUST be repeated. `--include "a" "b" "c"` looks like it works and
+# does not: hf's --include takes exactly one TEXT, so the trailing patterns are
+# reparsed as positional FILENAMES, which in turn makes hf discard --include
+# entirely ("Ignoring `--include` since filenames have being explicitly set").
+# The result is a silent partial download — the quant you actually wanted is
+# the one that goes missing, and the exit code is 0.
+- name: Normalise model include patterns to a list
+  ansible.builtin.set_fact:
+    llamacpp_service_includes: >-
+      {{ [llamacpp_active.include] if llamacpp_active.include is string
+         else llamacpp_active.include }}
+  tags:
+    - llamacpp
+
 - name: Download GGUF model from Hugging Face
   ansible.builtin.command:
     cmd: >-
       {{ llamacpp_service_hf_cli }} download {{ llamacpp_active.repo }}
       --local-dir {{ llamacpp_service_model_base }}
-      --include "{{ llamacpp_active.include }}"
+      {% for pat in llamacpp_service_includes %}--include "{{ pat }}" {% endfor %}
       {% if hf_token %}--token {{ hf_token }}{% endif %}
   become: false
   register: llamacpp_service_download
@@ -134,6 +152,26 @@
 # ------------------------------------------------------------------
 # 6. Deploy Quadlet unit
 # ------------------------------------------------------------------
+# Some profiles pair a target model from one repo with a speculative drafter
+# published in another (deepseek-v4 pairs Kevletesteur's requantized target
+# with unsloth's DSpark drafter). Fetch that separately when draft_repo is set.
+- name: Download speculative drafter from a separate Hugging Face repo
+  ansible.builtin.command:
+    cmd: >-
+      {{ llamacpp_service_hf_cli }} download {{ llamacpp_active.draft_repo }}
+      --local-dir {{ llamacpp_service_model_dir_expanded }}/{{ llamacpp_active.draft_repo | regex_replace('/', '_') }}
+      --include "{{ llamacpp_active.draft_file }}"
+      {% if hf_token %}--token {{ hf_token }}{% endif %}
+  become: false
+  register: llamacpp_service_draft_download
+  changed_when: "'Fetching' in (llamacpp_service_draft_download.stderr | default(''))"
+  no_log: "{{ hf_token | default('') | length > 0 }}"
+  when:
+    - llamacpp_active.draft_repo is defined
+    - llamacpp_active.draft_repo != llamacpp_active.repo
+  tags:
+    - llamacpp
+
 - name: Ensure systemd user Quadlet directory exists
   ansible.builtin.file:
     path: "{{ ansible_user_dir }}/.config/containers/systemd"
@@ -215,15 +253,15 @@
 - name: Display llama.cpp service information
   ansible.builtin.debug:
     msg: |
-      llama.cpp server is running as a systemd user service (Vulkan backend).
+      llama.cpp server is running as a systemd user service.
 
       Profile    : {{ llamacpp_model_profile }}
       Service    : {{ llamacpp_container_name }}
-      Image      : {{ llamacpp_image }}
+      Image      : {{ llamacpp_active.image | default(llamacpp_image) }}
       Model      : {{ llamacpp_active.repo }} ({{ llamacpp_active.file }})
       API        : http://{{ llamacpp_host }}:{{ llamacpp_port }}/v1
       Context    : {{ llamacpp_active.ctx_size }} tokens
-      Backend    : Vulkan (RADV) — bypasses ROCm/HIP hang on gfx1151
+      Backend    : {{ llamacpp_active.backend | default('Vulkan (RADV) — bypasses ROCm/HIP hang on gfx1151') }}
 
       Manage with:
         systemctl --user status {{ llamacpp_container_name }}
