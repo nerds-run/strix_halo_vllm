@@ -82,6 +82,9 @@ lemonade_volumes:
 # --local-dir tree llamacpp_service builds, so without this a model served by
 # both stacks is on disk twice. Mounted models appear as `extra.NAME` and cost
 # nothing to add. Empty string disables the mount.
+# A leading ~ is resolved against the MANAGED host's home in tasks/main.yml,
+# not with expanduser — that runs on the controller and would bake the
+# controller's home into the remote unit whenever the two users differ.
 lemonade_extra_models_host_dir: "{{ llamacpp_model_dir | default('~/models') }}"
 lemonade_extra_models_mount: "/models"
 
@@ -145,11 +148,21 @@ lemonade_required_models:
 lemonade_aliases:
   deepseek-v4: Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF
 
-# systemd cannot express Conflicts= across the user/system boundary, and both
-# stacks are user-scoped but independent, so nothing stops them from claiming
-# the GPU at once. The guard has to live in the play.
+# Every other GPU consumer in this collection. All are user-scoped Quadlet
+# units with no Conflicts= between them, so nothing stops two from claiming
+# the iGPU at once — the guard has to live in the play. vllm-server belongs
+# here as much as llamacpp-server: it owns /dev/dri and /dev/kfd too, and its
+# GTT would still be held during the drain check below.
+#
+# Each name here becomes a `Conflicts=<name>.service` line in the Lemonade
+# Quadlet AND is stopped at deploy time. Both are needed: stopping releases
+# GTT now, Conflicts= is what survives a reboot. Note that `systemctl disable`
+# is NOT the answer for these — Quadlet regenerates its units from [Install]
+# on every daemon-reload, `is-enabled` reports `generated`, and a disable call
+# is a silent no-op.
 lemonade_stop_conflicting_services:
   - llamacpp-server
+  - vllm-server
 
 # Seconds to wait for the driver to release GTT after stopping a conflicting
 # unit. Starting a large load against stale GTT is what triggers the autofit

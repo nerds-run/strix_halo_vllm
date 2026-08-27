@@ -91,6 +91,7 @@ with an actionable error message showing what was detected vs. what is required.
 - systemd services use `scope: user` (no root)
 - `seccomp=unconfined` is required for ROCm in **vLLM/toolbox** mode, and not for Vulkan (llama.cpp mode)
 - **Lemonade** (`lemonade_service`) drives ROCm too: same `/dev/kfd` + `--ipc=host` requirement, plus the host `render`/`video` GIDs resolved at run time via `GroupAdd=` (they are not stable across hosts)
+- **GPU exclusivity is a systemd property, not a convention**: the Lemonade Quadlet carries `Conflicts=` for every other GPU-owning user unit. `systemctl disable` is not usable here — Quadlet regenerates its units from `[Install]` on each daemon-reload and `is-enabled` reports `generated`, so a disable call is a silent no-op
 - The **ROCm llama.cpp profiles** (`qwen38-fp4`, `deepseek-v4`) need `--ipc=host` instead — measured necessary AND sufficient; `seccomp=unconfined` was tested there and does **not** help. Without it the HSA runtime cannot map its shared-memory segments and model load dies with a misleading "Memory in use" error
 - API key authentication on vLLM endpoints (configurable); llama.cpp auth optional
 - Quadlet unit files deployed with `mode: 0600` (contain API keys/tokens)

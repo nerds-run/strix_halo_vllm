@@ -52,6 +52,10 @@
 # units, so systemd has no Conflicts= relationship to lean on. Two engines
 # claiming the iGPU at once do not fail cleanly — the second one OOMs or
 # silently falls back to host memory at a third of the throughput.
+# Stop them now so GTT drains before Lemonade loads; the Conflicts= lines in
+# the Quadlet template are what keep them down across reboots. `enabled: false`
+# is deliberately NOT set: Quadlet units are generated, so systemctl cannot
+# persistently disable them and the call is a no-op that reads like a fix.
 - name: Stop conflicting inference services
   ansible.builtin.systemd:
     name: "{{ item }}"
@@ -99,14 +103,26 @@
     - lemonade
 
 # ------------------------------------------------------------------
-# 3. Pull container image
+# 3. Resolve paths on the managed host, then pull the image
 # ------------------------------------------------------------------
+# expanduser would run on the CONTROLLER, so a remote host whose user or home
+# differs would get the controller's path baked into its Quadlet — binding a
+# directory that does not exist there, and silently losing every mounted model.
+- name: Resolve the shared model directory on the managed host
+  ansible.builtin.set_fact:
+    lemonade_service_extra_dir: >-
+      {{ lemonade_extra_models_host_dir | regex_replace('^~', ansible_user_dir) }}
+  when: lemonade_extra_models_host_dir | length > 0
+  tags:
+    - lemonade
+
 - name: Pull Lemonade Server container image
   ansible.builtin.command:
     cmd: "podman pull {{ lemonade_image }}"
   become: false
   register: lemonade_service_image_pull
   changed_when: "'Writing' in lemonade_service_image_pull.stdout or 'Storing' in lemonade_service_image_pull.stdout"
+  when: lemonade_enabled | bool
   tags:
     - lemonade
 
@@ -129,6 +145,10 @@
     mode: "0600"
   become: false
   no_log: "{{ lemonade_api_key | length > 0 }}"
+  # Without this guard `lemonade_enabled: false` still writes the Quadlet and
+  # notifies the restart handler, and the flush below then starts the server
+  # that the documented disable switch was supposed to keep down.
+  when: lemonade_enabled | bool
   notify:
     - Reload systemd user daemon
     - Restart lemonade service

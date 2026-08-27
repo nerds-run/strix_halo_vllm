@@ -7,6 +7,14 @@
 Description=Lemonade Server {{ lemonade_version }} (model router / Strix Halo gfx1151)
 After=network-online.target
 Wants=network-online.target
+# Every other unit that can claim the iGPU. All are user-scoped, so Conflicts=
+# is expressible and is the only guard that survives a reboot: Quadlet units
+# cannot be disabled with `systemctl disable` — the generator recreates them
+# from [Install] on every daemon-reload and `is-enabled` reports `generated` —
+# so stopping them at deploy time holds only until the next login.
+{% for svc in lemonade_stop_conflicting_services %}
+Conflicts={{ svc }}.service
+{% endfor %}
 
 [Container]
 Image={{ lemonade_image }}
@@ -22,7 +30,11 @@ PublishPort={{ lemonade_port }}:13305
 Volume={{ vol }}:{{ dest }}
 {% endfor %}
 {% if lemonade_extra_models_host_dir | length > 0 %}
-Volume={{ lemonade_extra_models_host_dir | expanduser }}:{{ lemonade_extra_models_mount }}:ro
+# `z` (shared), not `Z` (private): two containers read this tree. A private
+# relabel would hand the categories to whichever container mounted last and
+# lock the other out. Without any relabel, a host that has only ever run
+# lemonade.yml leaves ~/models as user_home_t and SELinux denies the mount.
+Volume={{ lemonade_service_extra_dir }}:{{ lemonade_extra_models_mount }}:ro,z
 {% endif %}
 {% if lemonade_podman_args | length > 0 %}
 PodmanArgs={{ lemonade_podman_args | join(' ') }}

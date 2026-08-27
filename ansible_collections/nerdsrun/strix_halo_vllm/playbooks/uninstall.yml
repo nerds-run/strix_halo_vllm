@@ -95,6 +95,45 @@
     # ================================================================
     # 2c. Remove amdgpu-performance systemd unit (from gpu_tuning role)
     # ================================================================
+    # Lemonade must be torn down like the other stacks. Leaving it up is
+    # worse than leaving a llama.cpp profile up: its API is unauthenticated by
+    # default and it binds 0.0.0.0, so an operator who believes the box is
+    # clean would still be serving models to the network.
+    - name: Stop and disable Lemonade systemd user service
+      ansible.builtin.systemd:
+        name: lemonade-server
+        state: stopped
+        enabled: false
+        scope: user
+      become: false
+      failed_when: false
+      register: uninstall_lemonade_service
+
+    - name: Remove Lemonade container
+      containers.podman.podman_container:
+        name: lemonade-server
+        state: absent
+      become: false
+      failed_when: false
+      register: uninstall_lemonade_container
+
+    - name: Track Lemonade container removal  # noqa: no-handler
+      ansible.builtin.set_fact:
+        uninstall_removed: "{{ uninstall_removed + ['Lemonade container'] }}"
+      when: uninstall_lemonade_container is changed
+
+    - name: Remove Lemonade Quadlet unit file
+      ansible.builtin.file:
+        path: "{{ ansible_user_dir }}/.config/containers/systemd/lemonade-server.container"
+        state: absent
+      become: false
+      register: uninstall_lemonade_quadlet
+
+    - name: Track Lemonade Quadlet removal  # noqa: no-handler
+      ansible.builtin.set_fact:
+        uninstall_removed: "{{ uninstall_removed + ['Lemonade Quadlet unit'] }}"
+      when: uninstall_lemonade_quadlet is changed
+
     - name: Stop and disable amdgpu-performance unit
       ansible.builtin.systemd:
         name: "{{ gpu_tuning_unit_name }}"
@@ -155,6 +194,26 @@
     - name: Purge cache volumes
       when: strix_halo_uninstall_purge_cache | bool
       block:
+        # ~100 GB of downloaded models lives here. Only removed under the
+        # same purge flag that drops the Open WebUI volume.
+        - name: Remove Lemonade volumes
+          containers.podman.podman_volume:
+            name: "{{ item }}"
+            state: absent
+          become: false
+          failed_when: false
+          loop:
+            - lemonade-cache
+            - lemonade-llama
+            - lemonade-data
+            - lemonade-config
+          register: uninstall_lemonade_volumes
+
+        - name: Track Lemonade volume removal  # noqa: no-handler
+          ansible.builtin.set_fact:
+            uninstall_removed: "{{ uninstall_removed + ['Lemonade volumes'] }}"
+          when: uninstall_lemonade_volumes is changed
+
         - name: Remove Open WebUI data volume
           ansible.builtin.command:
             cmd: "podman volume rm -f {{ openwebui_data_volume }}"

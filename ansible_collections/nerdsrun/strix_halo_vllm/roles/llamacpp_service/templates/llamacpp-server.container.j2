@@ -15,7 +15,7 @@ ContainerName={{ llamacpp_container_name }}
 AddDevice={{ dev }}
 {% endfor %}
 PublishPort={{ llamacpp_port }}:8080
-Volume={{ llamacpp_service_model_dir_expanded }}:/models:Z
+Volume={{ llamacpp_service_model_dir_expanded }}:/models:z
 {% if llamacpp_active.podman_args is defined %}
 PodmanArgs={{ llamacpp_active.podman_args | join(' ') }}
 {% endif %}

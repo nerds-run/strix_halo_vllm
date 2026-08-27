@@ -134,7 +134,7 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 | `Qwen3.8-27B-GGUF` | downloaded (17.2 GB) | **18.5 - 27.0 tok/s** | vision + MTP speculative decoding, both from the catalog entry |
 | `deepseek-v4` | **already on disk** (0 GB added) | **17.1 tok/s** | alias for the `deepseek-v4` profile's own 2.90 bpw quant, served through Lemonade |
 
-Both run on **llama.cpp/ROCm** (b10469 + TheRock 7.14.0). Only one inference stack can hold the GPU: the role stops `llamacpp-server` and waits for GTT to drain. The reverse is not automatic — `systemctl --user stop lemonade-server` before redeploying a llama.cpp profile.
+Both run on **llama.cpp/ROCm** (b10469 + TheRock 7.14.0). Only one inference stack can hold the GPU, and that is now enforced by systemd rather than by convention: the Quadlet carries `Conflicts=llamacpp-server.service` and `Conflicts=vllm-server.service`, so starting either one stops Lemonade and vice versa. The role also stops them at deploy time and waits for GTT to drain, because `Conflicts=` releases the unit but the driver frees GTT only when the process exits.
 
 ### Why this is faster than the equivalent profiles
 

@@ -617,7 +617,13 @@ systemctl --user status llamacpp-server lemonade-server
 cat /sys/class/drm/card*/device/mem_info_gtt_used     # the real diagnostic, not `free`
 ```
 
-Stop whichever one you are not using. `lemonade_service` stops `llamacpp-server` on deploy and waits for GTT to drain; the reverse is **not** true — deploying a llama.cpp profile does not stop Lemonade, so do it yourself:
+This should no longer be reachable: the Lemonade Quadlet declares `Conflicts=` against `llamacpp-server.service` and `vllm-server.service`, so systemd stops one when the other starts, in both directions and across reboots. If you do see both active, the Quadlet is stale — re-run `mise run deploy:lemonade` and check the unit:
+
+```bash
+systemctl --user show lemonade-server -p Conflicts
+```
+
+To switch stacks by hand:
 
 ```bash
 systemctl --user stop lemonade-server

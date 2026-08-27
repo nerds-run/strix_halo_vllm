@@ -646,13 +646,118 @@
         # systemd cannot express Conflicts= between these units, so the
         # guard has to live in the play. Without it both stacks claim the
         # iGPU and the second one runs from host memory at a third speed.
-        - name: "Assert the conflicting llama.cpp unit is stopped first"
+        # vllm-server counts: it owns /dev/dri and /dev/kfd too, and its GTT
+        # is still held during the drain check.
+        - name: "Assert every GPU-owning unit is in the conflict list"
           ansible.builtin.assert:
             that:
               - "'llamacpp-server' in lemonade_stop_conflicting_services"
+              - "'vllm-server' in lemonade_stop_conflicting_services"
             fail_msg: >-
-              lemonade_service must stop llamacpp-server before taking the
-              GPU — nothing in systemd does it for us.
+              Every unit that can claim /dev/kfd must be stopped before
+              Lemonade takes the GPU — nothing in systemd does it for us.
+
+        # Stopping is not enough on its own: a Quadlet unit deployed normally
+        # stays WantedBy=default.target, so the next login or reboot starts
+        # it alongside Lemonade and recreates the contention.
+        - name: "Read the lemonade_service conflict-handling task"
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/lemonade_service/tasks/main.yml"
+          register: _lemon_tasks
+
+        - name: "Read the lemonade_service Quadlet template"
+          ansible.builtin.slurp:
+            src: >-
+              {{ playbook_dir }}/../../roles/lemonade_service/templates/lemonade-server.container.j2
+          register: _lemon_quadlet
+
+        # `systemctl disable` is NOT the mechanism: Quadlet regenerates its
+        # units from [Install] on every daemon-reload and `is-enabled` reports
+        # `generated`, so a disable call is a silent no-op. Conflicts= in the
+        # unit is what actually survives a reboot — and it is expressible
+        # because both stacks are user-scoped.
+        - name: "Assert the conflict guard survives a reboot"
+          ansible.builtin.assert:
+            that:
+              - "'Conflicts=' in (_lemon_quadlet.content | b64decode)"
+              # Match a real YAML directive, not the phrase inside a comment.
+              - >-
+                (_lemon_tasks.content | b64decode)
+                | regex_search('(?m)^\\s+enabled: false\\s*$') is none
+            fail_msg: >-
+              The Quadlet must carry Conflicts= for every unit in
+              lemonade_stop_conflicting_services, and must NOT rely on
+              `enabled: false`, which is a no-op against a generated unit and
+              reads like a fix while changing nothing.
+
+        # `lemonade_enabled: false` must not deploy anything. The template
+        # task notifies the restart handler, and the handler flush that
+        # follows would start the server the switch was meant to keep down.
+        - name: "Assert the Quadlet template honours lemonade_enabled"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (_lemon_tasks.content | b64decode)
+                | regex_search('Deploy Lemonade Quadlet container unit file(.|\n)*?when: lemonade_enabled')
+                is not none
+            fail_msg: >-
+              The Quadlet template task must be guarded by lemonade_enabled.
+              Unguarded, it writes the unit and notifies the restart handler,
+              and the flush starts the service despite the start task being
+              skipped.
+
+        # Two containers read this tree. `Z` is a PRIVATE relabel and would
+        # hand the MCS categories to whichever mounted last, locking the
+        # other out; no relabel at all fails on a host that has only ever run
+        # lemonade.yml, where ~/models is still user_home_t.
+        - name: "Read both Quadlet templates"
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          register: _quadlets
+          loop:
+            - "{{ playbook_dir }}/../../roles/lemonade_service/templates/lemonade-server.container.j2"
+            - "{{ playbook_dir }}/../../roles/llamacpp_service/templates/llamacpp-server.container.j2"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: "Assert the shared model mount uses a shared SELinux relabel"
+          ansible.builtin.assert:
+            that:
+              # No uppercase (private) relabel anywhere in the volume lines...
+              - >-
+                (item.content | b64decode)
+                | regex_search('(?m)^Volume=.*[:,]Z$') is none
+              # ...and the model mount carries a lowercase (shared) one.
+              # Rendered forms differ: `/models:z` here, `/models:ro,z` there.
+              - >-
+                (item.content | b64decode)
+                | regex_search('(?m)^Volume=.*models.*[:,]z$') is not none
+            fail_msg: >-
+              {{ item.item | basename }} must relabel the shared model tree
+              with lowercase `z`. `Z` is private and locks the other stack
+              out; omitting it entirely is denied under SELinux on a host
+              where llamacpp_service has never run.
+          loop: "{{ _quadlets.results }}"
+          loop_control:
+            label: "{{ item.item | basename }}"
+
+        # Leaving Lemonade up after `mise run uninstall` is worse than
+        # leaving a llama.cpp profile up: its API is unauthenticated by
+        # default and binds 0.0.0.0.
+        - name: "Read the uninstall playbook"
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../playbooks/uninstall.yml"
+          register: _uninstall
+
+        - name: "Assert uninstall removes the Lemonade unit, container and volumes"
+          ansible.builtin.assert:
+            that:
+              - "'lemonade-server.container' in (_uninstall.content | b64decode)"
+              - "'lemonade-cache' in (_uninstall.content | b64decode)"
+            fail_msg: >-
+              playbooks/uninstall.yml must tear Lemonade down. Otherwise
+              `mise run uninstall` leaves an unauthenticated API bound to
+              0.0.0.0 and a GPU workload running.
 
     - name: "Test Lemonade is documented everywhere it must be"
       block:
