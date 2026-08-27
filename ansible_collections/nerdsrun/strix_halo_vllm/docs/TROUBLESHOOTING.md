@@ -610,6 +610,19 @@ Stop whichever one you are not using. `lemonade_service` stops `llamacpp-server`
 systemctl --user stop lemonade-server
 ```
 
+### The server looks hung — connections time out and nothing responds
+
+Check whether it is *busy* rather than hung. Lemonade runs `max_loaded_models: 1`, so a single long generation serializes everything behind it, and on `ds4` at ~12 tok/s a genuinely long answer (a page of code, say) takes **tens of minutes**. Meanwhile every other client — including `lemonade load` — sits in the queue and eventually times out.
+
+```bash
+podman logs --tail 5 lemonade-server     # a rising `gen=N ... t/s` means it is generating
+curl -s http://127.0.0.1:13305/api/v1/health | grep -o '"is_busy":[a-z]*'
+```
+
+A rising `gen=` counter means the server is working normally; restarting discards real work. Only restart if `gen=` is static and `is_busy` stays `true`.
+
+This also invalidates client-side timing: never benchmark against a server that is serving someone else, because a queued request inherits the wait of whatever is ahead of it.
+
 ### Streaming responses arrive all at once on `ds4`
 
 Known upstream limitation of the experimental `ds4` backend: deltas are delivered in one burst when generation completes rather than incrementally. Throughput is unaffected — only the streaming UX. There is nothing to configure.

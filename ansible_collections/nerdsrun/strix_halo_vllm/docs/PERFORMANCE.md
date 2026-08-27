@@ -738,3 +738,65 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 - [Getting Started](GETTING_STARTED.md) -- Full setup walkthrough
 - [Troubleshooting](TROUBLESHOOTING.md) -- Fix common issues
 - [Variables Reference](VARIABLES.md) -- All configuration options
+
+---
+
+## Lemonade Server (11.8.0)
+
+A second inference stack, deployed with `mise run deploy:lemonade`. Measured on the same box, build as pinned in `lemonade_service` defaults, ROCm via TheRock 7.14.0, amdgpu pinned to `high`.
+
+### Qwen3.8-27B — Lemonade/ROCm vs the `qwen38` profile on Vulkan
+
+Same GGUF (`unsloth/Qwen3.8-27B-GGUF`, UD-Q4_K_XL), same box, different backend:
+
+| Path | Decode | ttft | Notes |
+|---|---:|---:|---|
+| `qwen38` profile (Vulkan, RADV) | 12.3 | — | bandwidth-saturated, no conventional knob moves it |
+| **Lemonade `llamacpp:rocm`** | **17.4 - 18.5** | 0.35 - 0.47 s | **1.4 - 1.5x** |
+
+The gain is not the ROCm backend on its own — **Lemonade turns on MTP speculative decoding automatically** for this model (the catalog entry carries an `mtp` label). Measured draft acceptance was **0.48 - 0.51**, mean accepted length 2.4 - 2.5 of the drafted tokens.
+
+Two things follow. First, this is the same lever the `qwen38-fp4` profile uses, but reached without the ROCmFPX fork and without giving up vision. Second, acceptance here is markedly lower than the 0.93 that profile sees on code, so the multiple is correspondingly smaller — 1.4x rather than 2.4x. Acceptance is workload-dependent, and these figures came from short prose prompts.
+
+**Prefill is not characterised.** The only prefill numbers observed were on 17 - 21 token prompts (≈61 t/s), and this document's own rule applies: never characterise prefill from a short prompt. Treat prefill as unmeasured on this path.
+
+### DeepSeek-V4-Flash on ds4 (DwarfStar)
+
+`DeepSeek-V4-Flash-IQ2XXS-DS4`, 81 GB at roughly 2.3 bpw, ctx 32768.
+
+| Source | Decode | Measured by |
+|---|---:|---|
+| **Lemonade + ds4, warm** | **12.8 t/s** | **here** |
+| Lemonade + ds4, `--ssd-streaming-cache-experts 96GB` | 11.9 t/s | here |
+| ds4 driven directly, upstream's own figure | 16.45 t/s | [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) — **not measured here** |
+| `deepseek-v4` profile (llama.cpp/ROCm, 2.90 bpw) | 17.1 t/s | here, different quant |
+
+**We are ~25% below upstream's number for the same engine and quant, and below the llama.cpp path this collection already had.** The most likely cause is identified and is not a misconfiguration:
+
+#### Lemonade forces `--ssd-streaming`, and it cannot be turned off
+
+`Ds4Server::build_args` appends `--ssd-streaming` unconditionally, on this reasoning:
+
+> ds4-server defaults to full residency, which maps the entire model into the ROCm arena. [...] the only supported device (gfx1151) tops out around a 64 GB VRAM carveout with a smaller usable arena, so full residency always OOMs mid-load.
+
+**That premise does not hold on this box.** This fleet routinely runs fully resident models well past 64 GB — `minimax` at ~108 GB, `deepseek-v4` at ~97 GB — because the working pool is the 124 GB GTT, not a VRAM carveout. Upstream's own 16.45 t/s was measured with full residency (their notes record a 21.4 s load into 100 GiB of GTT); ours streams experts from disk.
+
+`ds4-server` publishes no flag to disable streaming once it is on, and Lemonade inserts the flag before any `ds4_args`, so **there is no way to reach full residency through Lemonade**. Raising the resident expert budget does not substitute: `--ssd-streaming-cache-experts 96GB` was accepted, lifted GTT from ~7.6 GB at load to 72.7 GB, and made decode marginally *worse* (11.9 vs 12.8).
+
+Observed behaviour is consistent with streaming throughout: load reports success in **1.2 s** rather than upstream's 21.4 s, GTT sits at ~7.6 GB immediately after load, and grows to 88 - 107 GB only as generation touches experts.
+
+#### Operational notes
+
+- **Telemetry reports zero for this backend.** Lemonade logs `ttft=0.00s, tps=0.00` on every ds4 completion, and the UI's rate counters follow. The `usage` block in the API response *is* correct (`prompt_tokens`, `completion_tokens`, `total_tokens`). This is the visible face of the known upstream limitation that ds4 streaming is bursty — deltas arrive in one burst at the end, so Lemonade never observes a first token and cannot compute either figure. Real throughput is only in `ds4-server`'s own stdout (`avg=12.8 t/s`), which reaches `journalctl --user -u lemonade-server`.
+- **The reasoning/content split leaks.** A raw `</think>` was observed inside `content`, with the answer duplicated on either side of it: `'Paris is the capital of France.</think>Paris is the capital of France.'` It is intermittent — repeat runs of the same prompt came back clean. Because DeepSeek frequently reasons in Chinese, a mis-split surfaces as Chinese text in the answer. Passing `chat_template_kwargs: {"enable_thinking": false}` produced clean output in testing, though `reasoning_content` was still populated, so it is a mitigation rather than a confirmed fix.
+- **`max_loaded_models` is 1, so one long generation blocks the whole server.** This is the single most surprising operational property of this stack, and it is not a defect. A realistic UI prompt — "build me a single-page app" — generates tens of thousands of tokens, and at ~12 t/s that is **tens of minutes of wall clock**. One such request was observed running 18,550 tokens over 26 minutes. Throughout, every other client sees connection timeouts and `/api/v1/health` reports `is_busy: true`, which is very easy to misread as a hung server. It is not: `max_tokens` is honoured exactly (`finish_reason: stop`), and unbounded requests terminate normally.
+
+  The practical consequences are worth stating plainly, because the recovery for "hung" and the recovery for "busy" are opposites:
+
+  - **Check before restarting.** `podman logs --tail 5 lemonade-server` shows a live `gen=N ... t/s` counter while ds4 is generating. A rising `gen=` means it is working, and restarting throws away real work — as happened once here.
+  - **Do not benchmark against a shared server.** Queued requests inherit the wait of whatever is ahead of them, which silently corrupts any timing measured from the client side.
+  - Model-switching contends for the same slot, so a `lemonade load` issued during a long generation waits too.
+
+#### What has not been tried
+
+`--power` is already at its default maximum of 100 and the GPU is pinned to `high`, so neither is a candidate. `--prefill-chunk` (default 4096) affects prefill, which is unmeasured here. `--batched-session` and `--threads` are untested. None of these address residency, which remains the leading hypothesis.
