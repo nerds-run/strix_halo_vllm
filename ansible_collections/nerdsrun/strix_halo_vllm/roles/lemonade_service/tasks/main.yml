@@ -18,13 +18,30 @@
   tags:
     - lemonade
 
+# getent returns the fields AFTER the group name — [password, gid, userlist] —
+# so the GID is index 1. Index 0 is the password placeholder 'x', which renders
+# as `GroupAdd=x`: podman cannot resolve it, and the failure surfaces as a unit
+# start error rather than anything pointing at this expression.
 - name: Collect resolved group IDs
   ansible.builtin.set_fact:
     lemonade_service_group_ids: >-
       {{ lemonade_service_group_lookup.results
          | map(attribute='ansible_facts.getent_group')
          | map('dict2items') | map('first') | map(attribute='value')
-         | map('first') | list }}
+         | map(attribute=1) | list }}
+  tags:
+    - lemonade
+
+- name: Assert the GPU group IDs resolved to numbers
+  ansible.builtin.assert:
+    that:
+      - lemonade_service_group_ids | length == lemonade_supplementary_groups | length
+      - lemonade_service_group_ids | select('match', '^[0-9]+$') | list | length
+        == lemonade_supplementary_groups | length
+    fail_msg: >-
+      Resolved GPU group IDs are not numeric: {{ lemonade_service_group_ids }}.
+      A non-numeric value here renders GroupAdd= with a name podman cannot
+      resolve, and ROCm then fails to open /dev/kfd.
   tags:
     - lemonade
 
@@ -266,17 +283,28 @@
 # be filtered out by the memory-pool check (see enable_dgpu_gtt in defaults).
 # Fail loudly here rather than letting `pull` fail with a name error, because
 # the two look identical from the outside.
-- name: Assert every requested model is visible in the catalog
-  ansible.builtin.shell:
-    cmd: |
-      set -o pipefail
-      podman exec {{ lemonade_container_name }} lemonade list '*' | grep -qF '{{ item }}'
-    executable: /bin/bash
+- name: List the full Lemonade catalog
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade list *
   become: false
-  loop: "{{ lemonade_models }}"
+  register: lemonade_service_catalog
   changed_when: false
-  register: lemonade_service_visible
-  failed_when: lemonade_service_visible.rc != 0
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Assert every requested model is visible in the catalog
+  ansible.builtin.assert:
+    that:
+      - item in (lemonade_service_catalog.stdout | default(''))
+    fail_msg: >-
+      '{{ item }}' is not in `lemonade list`. If the name is right, the
+      memory-pool filter has hidden it: on gfx1151 Lemonade reads the pool as
+      vram_gb (0.5 GB) unless enable_dgpu_gtt is set, and then drops every
+      streaming (ds4) model with no error. See docs/TROUBLESHOOTING.md.
+  loop: "{{ lemonade_models }}"
   when: lemonade_enabled | bool
   tags:
     - lemonade

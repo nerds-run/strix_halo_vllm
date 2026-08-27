@@ -22,7 +22,31 @@ lemonade_host: "0.0.0.0"
 lemonade_port: 13305
 
 # Optional bearer token for the OpenAI-compatible API. Empty disables auth.
+#
+# SECURITY: with lemonade_host 0.0.0.0 and no key, everything on the LAN can
+# reach the *control* endpoints (/internal/shutdown, /internal/config), not
+# just inference. Lemonade logs a warning at startup when bound to a
+# non-loopback host without this set. Set it on any network you do not fully
+# trust; LEMONADE_ADMIN_API_KEY alone protects /internal/* but leaves /api,
+# /v0 and /v1 open.
 lemonade_api_key: ""
+
+# Browser origins allowed to call the API. Loopback (localhost, 127.0.0.1,
+# [::1]) and desktop schemes (file://, vscode-webview:// ...) are always
+# permitted; every other origin is rejected with a 403.
+#
+# This bites the moment anyone opens the bundled web UI over the LAN rather
+# than on the box itself: the page loads (GET / is 200) but every
+# POST /api/v1/chat/completions returns 403, because the browser sends
+# `Origin: http://<host>:13305` and that is not loopback. curl is unaffected —
+# non-browser clients send no Origin header at all — so the endpoint looks
+# healthy from the command line while the UI is dead. The default below
+# derives the box's own LAN origin so the shipped UI works as served.
+#
+# `*` allows any origin and is a genuinely bad idea without lemonade_api_key:
+# it lets any website a user visits drive this server from their browser.
+lemonade_allowed_origins:
+  - "http://{{ ansible_host | default(ansible_default_ipv4.address | default('127.0.0.1')) }}:{{ lemonade_port }}"
 
 # ROCm needs the KFD compute device, not just the render node — and the
 # container process must be in the host's render/video groups to open them.

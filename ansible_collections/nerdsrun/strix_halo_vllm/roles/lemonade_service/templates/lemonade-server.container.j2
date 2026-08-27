@@ -27,6 +27,9 @@ PodmanArgs={{ lemonade_podman_args | join(' ') }}
 {% if lemonade_api_key | length > 0 %}
 Environment=LEMONADE_API_KEY={{ lemonade_api_key }}
 {% endif %}
+{% if lemonade_allowed_origins | length > 0 %}
+Environment=LEMONADE_ALLOWED_ORIGINS={{ lemonade_allowed_origins | join(',') }}
+{% endif %}
 Exec=./lemond --host {{ lemonade_host }}
 
 [Service]
