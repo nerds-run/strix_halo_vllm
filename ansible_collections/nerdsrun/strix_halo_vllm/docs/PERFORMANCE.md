@@ -38,6 +38,8 @@ The 30B MoE model at 4-bit gets **3x the speed** of the 14B dense model despite 
 
 Dense models (Llama, Mistral, GPT-OSS, Command-R) read every parameter on every token. A dense 70B model at FP16 would need to read 140 GB per token -- that's 0.7 seconds per token at 200 GB/s. Stick to MoE.
 
+> **One deliberate exception now ships: the `qwen38` profile (Qwen3.8-27B, dense).** The rule above is about *throughput*, and it holds — at 12.3 tok/s it is the slowest profile in the fleet bar none. It is included anyway because it buys things no MoE here offers at its size: a native vision encoder, a 262K context that costs only ~30 GB resident, and the best capability-per-gigabyte on the box. It also turns out to run at a *higher* fraction of memory bandwidth than any MoE profile (~216 GB/s effective vs `big`'s ~157), because dense weight reads are sequential where expert gathers are scattered. So read the rule as "dense costs you tok/s," not "dense wastes the hardware." See [Qwen3.8-27B (qwen38 profile)](#qwen3827b-qwen38-profile).
+
 ---
 
 ## Rule #2: Enable TunableOp
@@ -150,6 +152,9 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
 | Qwen3.5-122B-A10B | MoE | 10B | 77 GB | Q4_K_XL | **23.3** |
 | NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE (Mamba-2 + MoE + Attn) | 12B | ~63 GB | UD-Q3_K_XL | **18.8** |
 | MiniMax-M2.7 (229B) | MoE | 10B | ~108 GB | UD-IQ4_XS | **28.1 fresh / 24.5 at 8K / 17.9 at 32K** |
+| Qwen3.8-27B ‡ | **Dense** + Gated DeltaNet hybrid | 27B (dense — all of them) | ~16 GB | UD-Q4_K_XL | **12.4 fresh / 12.3 at 8K / 11.8 at 32K** |
+
+‡ `Qwen3.8-27B` is the only **dense** model in this table and the only one whose tok/s is bounded by weights rather than by architecture choices — see [Qwen3.8-27B (qwen38 profile)](#qwen3827b-qwen38-profile) before comparing it to anything above it.
 
 † `Ling-3.0-flash` is **not a profile in this collection**. It requires a community fork of llama.cpp (`aetherbird/llama.cpp`, branch `bailingmoe3-support`) because the `bailingmoe3` architecture is unsupported upstream. Listed here for comparison only; see the expedition report for methodology and caveats.
 
@@ -188,8 +193,9 @@ The `llamacpp` deployment mode uses the Vulkan backend instead of ROCm/HIP. This
   > | Qwen3 / Qwen3.5 / Nemotron (`qwen3moe`, `qwen35moe`, `nemotron_h_moe`) | **2048** | +8% to +44% prefill across six profiles |
   > | `bailingmoe3` (Ling-3.0-flash) | **default (512)** | 2048 costs ~18% prefill |
   > | `deepseek4` (DeepSeek-V4-Flash) | **1024** | 2048 costs **22%** prefill (82.1 vs 104.8 t/s at pp4096) |
+  > | `qwen35` **dense** (Qwen3.8-27B) | **default (512)** | prefill falls monotonically: 361.0 / 345.1 / 336.1 at 512 / 1024 / 2048 |
   >
-  > Both *novel* architectures reject the value that every mainstream one prefers. Sweep per profile before assuming it transfers — it takes one `llama-bench` run. `-b` must also be raised alongside `-ub`: llama.cpp clamps the micro-batch to the logical batch, so `-b 512 -ub 2048` silently does nothing.
+  > All three *novel* architectures reject the value that every mainstream one prefers. Sweep per profile before assuming it transfers — it takes one `llama-bench` run. `-b` must also be raised alongside `-ub`: llama.cpp clamps the micro-batch to the logical batch, so `-b 512 -ub 2048` silently does nothing.
 
   Re-verified on hardware at `-ub 2048` (3 cold runs per size, `cache_prompt: false`):
 
@@ -398,6 +404,234 @@ Summary-reset recovers decode by ~3 tok/s — the agent client is responsible fo
 
 **CUDA 13.2 warning:** [Unsloth's model card](https://huggingface.co/unsloth/MiniMax-M2.7-GGUF) warns that running these GGUFs on CUDA 13.2 produces gibberish output. This deployment uses the Vulkan backend so that path is avoided, but be aware if you repoint the container image at a CUDA build.
 
+### Qwen3.8-27B (qwen38 profile)
+
+The fleet's first **dense** model and its first Qwen3.8. Read its throughput with that framing: every other profile here is MoE and reads 2-6 GiB per token, while a dense 27B reads all ~16 GiB. This is the capability/vision/long-context tier.
+
+Measured on build 10400, UD-Q4_K_XL (16.34 GiB), `-b 4096 -ub 512`, `-fa 1`, KV `q8_0`, full 262,144 ctx:
+
+| Depth | `prompt_n` | Prefill t/s | Decode tok/s |
+|---|---|---|---|
+| fresh | 24 | 87.6 | **12.39** |
+| 8K | 5,758 | 360.0 | **12.28** |
+| 32K | 23,000 | 314.9 | **11.78** |
+
+`llama-bench` agrees independently: **tg128 12.32**, **pp4096 361.0**.
+
+#### Decode is memory-bandwidth saturated — no *conventional* knob will move it
+
+12.32 tok/s x 16.34 GiB read per token is roughly **216 GB/s of effective weight reads**. Dense inference touches every parameter every token, so that number *is* the memory subsystem running flat out. For contrast, `big` (122B MoE, 10B active) achieves only about 157 GB/s effective — scattered expert gathers have worse locality, so MoE leaves bandwidth unused that a dense model does not.
+
+Two consequences worth internalising before tuning this profile:
+
+1. **No decode-side knob will help.** Batch, ubatch, thread count and cache quant cannot change how many bytes must cross the bus per token. The sweep shows it directly: decode is 12.32 / 12.31 / 12.31 at `-ub` 512 / 1024 / 2048 — flat to three significant figures.
+2. **The only real lever is reading fewer bytes per accepted token** — speculative decoding, or a smaller quant. That lever is real and large, but it is not reachable from the upstream-Vulkan configuration this profile ships (below). Read "saturated" as *saturated at one token per weight read* — speculation breaks that assumption, and third-party measurement on this exact hardware clears the ceiling by ~2.4x.
+
+> The hardware table at the top of this document quotes ~200 GB/s for Strix Halo, and the figure above exceeds it. Note that 216 GB/s is an *effective weight-read rate inferred from* `tok/s x model size`, not a bandwidth benchmark. It does suggest the documented ~200 GB/s is conservative — the 256-bit LPDDR5X-8000 config has a 256 GB/s theoretical ceiling — but it should not be quoted as a measured bandwidth number.
+
+#### Long context is nearly free (16 of 65 layers carry KV)
+
+The layout is 16 x (3 x Gated DeltaNet -> 1 x Gated Attention), so only 16 of 65 blocks hold a KV cache. Decode barely degrades with depth, and the **full 262,144-token context measures ~30 GB resident in total** — weights, KV, compute buffers and all:
+
+| Profile | fresh -> 32K | Falloff |
+|---|---|---|
+| `qwen38` | 12.39 -> 11.78 | **-5%** |
+| `coder-next` | 42.7 -> 38.1 | -11% |
+| `minimax` | 28.1 -> 17.9 | -36% |
+
+This is the same property that makes `super` affordable at 1M ctx, and it is the strongest practical argument for this profile: it is the cheapest way in the fleet to hold a very large working set.
+
+Sizing note specific to recurrent/hybrid archs: the server also keeps `--ctx-checkpoints` (default **32**) recurrent-state checkpoints **per slot**, serialized fp32 into host RAM. For this model's geometry one checkpoint is ~149.6 MiB ([#27211](https://github.com/ggml-org/llama.cpp/issues/27211)), so the default is ~4.7 GB per slot *on top of* weights, KV and the `--cache-ram` pool. The profile pins `--ctx-checkpoints 8`. The [`--cache-ram` sizing table](#sizing---cache-ram-prompt-cache-pool) does not account for this term.
+
+#### `-ub 512`: the third novel architecture to reject 2048
+
+Swept on build 10400 (`-b 4096`, `llama-bench`, r=2):
+
+| `-ub` | pp4096 | tg128 |
+|---|---|---|
+| **512** | **361.0** | 12.32 |
+| 1024 | 345.1 (-4%) | 12.31 |
+| 2048 | 336.1 (-7%) | 12.31 |
+
+Prefill falls monotonically as `-ub` rises. The fleet default of 2048 is actively wrong here, and the llama.cpp default wins.
+
+**A correctness caveat sits next to this value, and it was tested rather than assumed.** [#27237](https://github.com/ggml-org/llama.cpp/issues/27237) reports that this exact architecture emits garbage or early-EOS output on Vulkan at batch 512, and is correct at 1024/4096. That was checked here across three arms — greedy decoding, five known-answer cases plus three 4.3K-token summarisation runs each:
+
+| Arm | Config | Result |
+|---|---|---|
+| A | `-b 4096 -ub 512` (this pin) | clean |
+| B | `-b 512 -ub 512` (the reporter's own config) | **clean — did not reproduce** |
+| C | `-b 4096 -ub 2048` (control) | clean |
+
+No garbage, no degenerate repetition, no early EOS in any arm. The reporter ran Windows 11 with an RX 7900 XTX on AMD's proprietary driver; this box is Fedora with gfx1151 on RADV/Mesa. **This is a negative result on our hardware, not evidence the upstream issue is invalid.**
+
+One case did differ: `137 * 4` was answered `548` in arm A and `554` in arms B and C, at temperature 0. That is fluent-and-wrong rather than corrupt — different batch widths change float reduction order, so greedy output is deterministic only within a fixed config. It is a single sample and should not be read as one config being more accurate than another.
+
+#### MTP speculative decoding: blocked upstream on Vulkan, but not blocked in general
+
+The model ships an MTP head, build 10400 has the machinery (`--spec-type draft-mtp`, `-md`, `-ngld`, `--spec-draft-n-max`), and the profile already stages the draft GGUF on disk. It is still deliberately off.
+
+[#27306](https://github.com/ggml-org/llama.cpp/issues/27306) is open against precisely this combination — gfx1151 / Radeon 8060S / 128 GB / Vulkan-RADV, Qwen3.8-27B plus mmproj from Unsloth. With `--spec-type draft-mtp`, long prefill dies in `vk::Queue::submit` with `ErrorDeviceLost` and a compute-ring reset, leaving the process alive as a zombie (`/v1/models` returns 200, `/completion` returns 500). The same argv with MTP off runs past 125k tokens. Qwen3.8's MTP is `!is_mem_shared`, so the draft context is a **second same-width** `llama_decode` after every target ubatch — that extra decode is the trigger, and `GGML_VK_MAX_NODES_PER_SUBMIT=1` does not prevent it.
+
+**That is a statement about upstream llama.cpp on Vulkan/RADV, not about the hardware.** An earlier revision of this document said "blocked on this hardware", which was too broad — the correction matters because this is the profile's one large unexploited lever.
+
+Note also that #27306's failure is specifically *long unique-prefix prefill* ("tens of thousands of tokens"; MTP-off survives past 125k). It is not a blanket failure at every context length, so MTP on Vulkan may work at short-to-moderate context and fall over only on long prefills — the risk profile that matters for a 262K-context profile, but not for every workload.
+
+##### MEASURED HERE: the `qwen38-fp4` profile clears the ceiling
+
+The [`ROCmFPX`](https://github.com/charlie12345/ROCmFPX) fork of llama.cpp adds a `ROCmFP4` runtime tensor format (ggml types 100-106) that stock llama.cpp rejects. [`kingjones777/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF`](https://huggingface.co/kingjones777/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF) publishes measured numbers for this model on a Ryzen AI Max+ 395 / Radeon 8060S / gfx1151 / 128 GB box under ROCm 7.2.4 — the same machine class as ours:
+
+| `--spec-draft-n-max` | decode @8K | acceptance |
+|---:|---:|---:|
+| off | 13.46 | — |
+| 2 | 27.79 | 0.917 |
+| **4** | **30.30** | **0.926** |
+| 12 | 19.17 | 0.845 |
+
+with perplexity parity against Q4_K_M (5.8877 vs 5.8926 on wikitext-2) at 13.75 GiB, and prefill improving slightly versus their Q4_K_M reference.
+
+**These are third-party figures. Nothing in that table was measured on our box** — the same standard applied to the `Ling-3.0-flash` row above. Read them alongside these caveats:
+
+- Their Q4_K_M reference decodes **10.70** tok/s at 8K; our Vulkan `qwen38` measures **12.28** at the same depth, so our baseline is already ~15% ahead of theirs. The ~2.8x they quote is against *their* baseline, not ours — against ours the honest multiple is closer to **2.4x**.
+- Their prefill at 8K is **317.6** (293 with MTP, which costs ~6%); ours is **360.0**. We would give up prefill to gain decode.
+- Their context is validated to **65536**; this profile ships **262144**. If long context is the reason to run this model, that is a real regression, not a footnote.
+- It requires a **fork** and a different backend. This collection pins an upstream image by digest precisely so throughput is not a function of when you last deployed. The mitigating detail is that the fork is packaged in the toolbox repo we already pin — `rocm-7.14-rocmfpx` / `rocm-7.2.4-rocmfpx` tags — so it is a tag change rather than a build-it-yourself project.
+- Their card warns llama.cpp's `--spec-draft-n-max` default is **16**, far down the wrong side of the curve. **Build 10400 reports `default: 3`**, already near their optimum of 3-4 — so verify the default on whatever build you run rather than trusting either card.
+
+**This has now been done, and it works.** The `qwen38-fp4` profile runs that stack on our box. Measured here, greedy, `cache_prompt: false`, medians:
+
+| Workload | `qwen38` (Vulkan) | `qwen38-fp4` (ROCmFP4+MTP) | Speedup |
+|---|---:|---:|---:|
+| **Code generation** (400 tok) | 12.3 | **29.11** | **2.4x** |
+| Prose, fresh | 12.39 | ~22 | 1.8x |
+| Prose, 8K | 12.28 | ~21 | 1.7x |
+| Prose, 32K | 11.78 | 18.79 | 1.6x |
+| Prefill @8K | **360.0** | 341-346 | 0.95x |
+| Prefill @32K | **314.9** | 296.1 | 0.94x |
+
+Decode without speculation is content-independent (it is a bytes-per-token bound), so 12.3 is the fair Vulkan baseline for every row.
+
+**Speculative throughput is workload-dependent, and that is the headline caveat.** The gain tracks draft *acceptance*, not the flags. Measured acceptance on this box was **0.59-0.94** on prose (mean accepted length ~3 of 4 drafted) against the quant author's 0.926 measured with `ignore_eos` on a predictable continuation. Code is where it pays: 29.11 tok/s, and the three runs came in at 29.14 / 29.11 / 29.11 — a 0.1% spread. Agentic coding is exactly the predictable-continuation workload speculation is good at, so **the published ~2.8x is reachable on code and roughly 1.6-1.8x is what prose gives you**. Do not quote one number for both.
+
+Quality did not regress: all eight cases in the output-quality probe pass, including `137 * 4 = 548`, which two of the three Vulkan ubatch arms got wrong. Tool calling returns native `tool_calls` with correct JSON.
+
+Three things this profile costs you, all real:
+
+1. **Vision is off.** Multimodal + MTP aborts the server (`server-context.cpp:3192: fatal error`, `ggml_abort`) after the image decodes successfully. Isolated here by rerunning the same quant and projector with the speculative flags removed, which answers image questions correctly — so the trigger is the *combination*. The quant author's published vision test also omits the spec flags. Use `qwen38` for images.
+2. **Context drops 262144 -> 65536.**
+3. **A fork, off the upstream release train**, and a second image to keep pinned.
+
+###### Context: the full native 262144, validated past the author's 65536
+
+The quant author validates 65536 and lists higher as *not measured* rather than broken. It was measured here and it holds. Memory was never the constraint — the layout is 16 x (3 x Gated DeltaNet -> 1 x Gated Attention), so only **16 of 65 layers carry KV**:
+
+| Depth | `prompt_n` | Prefill t/s | Decode tok/s |
+|---:|---:|---:|---:|
+| fresh | 24 | 36.1 | 21.12 |
+| 8K | 5,758 | 338.6 | 22.29 |
+| 32K | 23,000 | 294.6 | 18.04 |
+| 100K | 71,840 | 209.9 | 15.02 |
+
+At 71,840 tokens the profile sat at 48 GB of 125 with 76 GB free, and the service stayed healthy — no device-lost, abort, or ring-timeout lines.
+
+**The risk being tested was not memory, it was MTP.** [#27306](https://github.com/ggml-org/llama.cpp/issues/27306) kills the GPU on long unique-prefix prefill precisely because speculative decoding runs a second same-width draft decode after every target ubatch. That report is Vulkan/RADV; this profile is ROCm, so it does not transfer automatically — hence testing at depth rather than assuming. **It does not reproduce here.** If a device-lost ever does appear on a very long prompt, `ctx_size` and the speculative block are the first two suspects, in that order.
+
+Note the decode figures above are *prose* summarisation and so run below the ~30 tok/s this profile reaches on code — draft acceptance is workload-dependent, as always with speculation.
+
+###### `reasoning_effort` defaults to `xhigh`, which returns empty content
+
+Thinking is on by default at `reasoning_effort: "xhigh"`. With a modest `max_tokens` the whole budget goes to reasoning and `content` comes back **empty** — the model looks broken and is not. The chat template accepts **only** `xhigh`, `medium`, `low`; `"none"` raises.
+
+The profile therefore pins a server-side default via `chat_template_kwargs`, and per-request values still override it:
+
+| Setting | reasoning | content |
+|---|---:|---|
+| server default (`medium`) | 74 chars | `Paris` |
+| per-request `{"reasoning_effort": "low"}` | 53 chars | `Paris` |
+| per-request `{"enable_thinking": false}` | 0 | `Paris` |
+
+###### `--ipc=host` is mandatory, and the error will send you the wrong way
+
+Without it the model load dies in the HSA runtime:
+
+```
+Memory critical error by agent node-0 ... Reason: Memory in use.
+(libhsa-runtime64.so / libggml-hip.so)
+```
+
+That reads like an OOM or a locked-memory problem. It is neither. ROCm's HSA runtime allocates through shared-memory segments, and rootless podman's private IPC namespace breaks it. Isolated on this box, minimal load, one variable at a time:
+
+| Container flags | Result |
+|---|---|
+| none | HSA critical error |
+| `--security-opt seccomp=unconfined` | HSA critical error |
+| **`--ipc=host`** | **loads cleanly** |
+
+Necessary and sufficient. Note this box's `RLIMIT_MEMLOCK` is 8 MB soft *and* hard (`DefaultLimitMEMLOCK`), so neither rootless podman nor a systemd user unit can raise it — and it is **not** the cause, so no root change is needed. The error message strongly invites that detour; do not take it.
+
+**The `ngram-*` `--spec-type` variants** allocate no draft context at all, so they should sidestep #27306's code path while staying on upstream Vulkan. Unmeasured here, and the cheapest of the three experiments.
+
+#### Vision
+
+Native VLM. Vision is silently **off** unless the projector is passed: the server starts normally and simply rejects image parts. The profile sets `mmproj_file: mmproj-F16.gguf`, which the role renders as `--mmproj`. Verified end-to-end on a synthetic 224x224 image (yellow disc on blue), answered correctly at 90 prompt tokens.
+
+### DeepSeek-V4-Flash-0731 (deepseek-v4 profile)
+
+A 284B MoE / 13B active running on a 128 GB APU, at 2.90 bpw in 97 GiB. The capability flagship of the fleet — it reports Terminal Bench 2.1 **82.7** against Qwen3.8-27B's 73.0, on a model that fits.
+
+Measured here on mainline llama.cpp build 10217 for ROCm/HIP, ctx 32768, code generation, median of 3:
+
+| Config | Image | GTT | Decode | Prefill |
+|---|---|---:|---:|---:|
+| **No drafter, all on GPU** | **mainline 10217** | 97 GiB | **17.07** | ~37-40 |
+| No drafter, all on GPU | ROCmFPX fork (211) | 97 GiB | 12.22 | ~34 |
+| No drafter, `--n-cpu-moe 16` | ROCmFPX fork | 65 GiB | 10.74 | 26.3 |
+| DSpark drafter + `--n-cpu-moe 16` | ROCmFPX fork | 77 GiB | 4.22 | 7.5 |
+
+Prefill scales steeply with prompt length, so a short-prompt number badly understates it:
+
+| Prompt | Prefill t/s | Decode tok/s |
+|---:|---:|---:|
+| 24 tok | ~37 | 17.16 |
+| 5,594 | **161.8** | 15.97 |
+| 22,370 | **141.6** | 14.89 |
+
+That **matches or beats the author's ~130 t/s**, and their ~14-16 t/s at 16k. An earlier revision of this document claimed our prefill was "~3.5x short and unexplained"; that was measured on a 24-token prompt where fixed per-request overhead dominates, and it was wrong. The same shape appears on `qwen38` (87.6 t/s at 24 tokens, 360 at 5,758) — never characterise prefill from a short prompt.
+
+#### Context is almost free — the full 1M window fits
+
+MLA makes this the cheapest long context in the fleet, and the naive arithmetic is badly misleading. From the GGUF geometry — `head_count_kv = 1`, key/value length 512, 43 blocks — you would derive ~45.7 KiB/token at q8_0. **Measured, it is ~5.3 KiB/token**: GTT grew 115 MiB across a 22,370-token prompt. llama.cpp stores MLA's *compressed latent*, not the nominal 512+512, so the derivation is off by ~9x.
+
+| ctx | KV | GTT total | Decode @8K | Prefill @5.6K |
+|---|---:|---:|---:|---:|
+| 65536 | ~0.3 GiB | 97 GiB | — | — |
+| 262144 | ~1.3 GiB | 97 GiB | 15.95 | 161.5 |
+| **1048576** (shipped) | ~5.3 GiB | **101 GiB** | **15.97** | **161.8** |
+
+Sixteen times the window for ~4 GiB of GTT and no measurable throughput cost. Note also that llama.cpp allocates KV **lazily** — GTT at load is identical for 65536 and 262144, so `ctx_size` alone tells you nothing about what a profile will actually consume. Watch `mem_info_gtt_used` under real traffic.
+
+Two caveats, neither about memory:
+
+- **65536 is the trained window; 1M is extrapolation.** rope scaling is `yarn`, factor 16.0, `original_context_length` 65536 — and 65536 x 16 = 1048576 exactly. Reaching past 65536 trades quality for reach by design.
+- **Prefill is the real ceiling.** At ~140-160 t/s, filling 1M tokens takes roughly two hours. The window is there when a task needs it; it is not one you fill casually.
+
+#### Four findings that contradict or extend the artifact's card
+
+1. **The ROCmFPX fork costs 40% of decode on this model.** 12.22 vs 17.07 for the identical quant and flags. The fork is mainline plus extra ROCmFP4 tensor types and loads this model correctly, so substituting it looks free — it is not. `qwen38-fp4` genuinely needs the fork (its quant uses those tensor types); this profile must not use it.
+2. **The DSpark drafter is a net loss, then unloadable.** On the fork it costs 2.5x (4.22 vs 10.74 at equal `--n-cpu-moe`), because the drafter is 10.15 GiB while the target reads only ~4.7 GB per token at 13B active — every drafted token costs more than generating one. Acceptance was healthy at 0.82-0.84, so the speculation works; it just cannot pay for its own weight. On mainline it will not load at all: `key not found in model: dflash.attention.sliding_window_pattern`. Compare `qwen38-fp4`, where a small MTP head pays 2.4x — **drafter size relative to per-token target bytes is what decides it**, not the flags.
+3. **`--n-cpu-moe 16` costs 12%, not 0.1%.** 10.74 vs 12.22 on the fork. The full 97 GiB fits in the 124 GiB GTT, so the offload buys nothing here. GTT by setting: 16 -> 65 GiB, 8 -> 81 GiB, none -> 97 GiB.
+4. **Two silent misconfigurations cost 3-4x each, with no error in the log.** Both are worth knowing because the only symptom is throughput:
+   - `GGML_HIP_ENABLE_UNIFIED_MEMORY=1` (correct for `qwen38-fp4`, wrong here) makes HIP allocate managed memory that never enters GTT. `mem_info_gtt_used` sat at **0 of 124 GiB** while a 97 GiB model ran from host memory: 3.4-3.9 tok/s.
+   - `n_parallel` left on auto picked **4 slots** at 262144 ctx, pinning 120 of 125 GB and collapsing buff/cache to ~1 GB: 3.88 tok/s decode, 9.4 t/s prefill.
+
+   **`mem_info_gtt_used` is the diagnostic**, not `free`. Check it after every change to this profile.
+
+#### Operational notes
+
+- **Thinking is on by default at `reasoning_effort: xhigh`.** With a small `max_tokens` the entire budget goes to reasoning and `content` returns empty — the model looks broken and is not. The template accepts only `xhigh`, `medium`, `low`; `"none"` throws. Use `chat_template_kwargs: {"enable_thinking": false}` to disable.
+- **Wait for GTT release between profile switches.** The driver frees buffers after the process exits, so poll `mem_info_gtt_used` rather than sleeping — starting a 97 GiB load against stale GTT is what triggers the autofit failure above.
+- Integrity was verified before first launch (`sha256 538ec693...`), which the card recommends and which is cheap next to a 97 GiB download.
+
 ### Observability
 
 With `llamacpp_log_disable: false` in inventory + `--metrics` in the profile's extra_args:
@@ -486,7 +720,7 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 | Qwen3.5-35B-A3B | MoE, 3B active | 21 GB | Q4_K_XL | **59.4** |
 | Qwen3.5-122B-A10B | MoE, 10B active | 77 GB | Q4_K_XL | **22.8** |
 | NVIDIA-Nemotron-3-Super-120B-A12B | Hybrid LatentMoE, 12B active | ~63 GB | UD-Q3_K_XL | **15.6** |
-| MiniMax-M2.7 (229B) | MoE, 10B active | ~108 GB | UD-IQ4_XS | **TBD** |
+| MiniMax-M2.7 (229B) | MoE, 10B active | ~108 GB | UD-IQ4_XS | **28.1 fresh / 17.9 at 32K** |
 
 ### vLLM (ROCm/TheROCk, --enforce-eager + TunableOp)
 

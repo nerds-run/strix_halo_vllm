@@ -78,8 +78,17 @@ Pin the amdgpu (gfx1151) iGPU to a high-performance state so Vulkan compute work
 | `llamacpp_enabled` | bool | `true` | Enable the llama.cpp server |
 | `llamacpp_host` | string | `"0.0.0.0"` | llama.cpp bind address |
 | `llamacpp_port` | int | `8080` | llama.cpp listen port |
-| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `nemotron`, `super`, or `minimax` |
-| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions. Per-profile keys: `repo`, `file`, `include`, `ctx_size`, `temp`, `top_p`, `top_k`, `min_p`, `jinja`, `repeat_penalty`, `batch_size`, `ubatch_size`, `cache_type_k`, `cache_type_v`, `extra_args`. A `repeat_penalty` of `0` omits the flag entirely rather than passing `--repeat-penalty 0` |
+| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `qwen38`, `qwen38-fp4`, `nemotron`, `lightning`, `super`, `coder-next`, `minimax`, `deepseek-v4`, or `deepseek` (gated -- see `unsupported_reason`) |
+| `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions. Per-profile keys: `repo`, `file`, `include`, `ctx_size`, `temp`, `top_p`, `top_k`, `min_p`, `jinja`, `repeat_penalty`, `presence_penalty`, `batch_size`, `ubatch_size`, `cache_type_k`, `cache_type_v`, `parallel_slots`, `mmproj_file`, `draft_file`, `draft_ngl`, `extra_args`, `unsupported_reason`. `repeat_penalty` / `presence_penalty` of `0` omit the flag entirely rather than passing `0`. `include` accepts a string (one glob) **or a list** — each pattern becomes its own repeated `--include` flag, which is required: `hf download --include "a" "b"` silently reparses the trailing patterns as positional filenames and discards `--include` altogether. `mmproj_file` renders `--mmproj` (vision projector; vision is silently off without it). `draft_file` renders `--model-draft` plus `--spec-type` (`spec_type`, default `draft-mtp`), `--spec-draft-ngl` (`draft_ngl`, default 99) and `--spec-draft-n-max` (`spec_n_max`, default 4); `draft_repo` points the drafter at a different HF repo from the target and triggers a second download; `draft_device` / `main_device` render `--spec-draft-device` / `-dev`. `chat_template_kwargs` (dict) renders `--chat-template-kwargs` as JSON — used to pin a default `reasoning_effort`.
+
+**Backend is a per-profile property.** Most profiles use the global Vulkan `llamacpp_image`; two override it:
+
+| Profile | Image | Build | Why |
+|---|---|---|---|
+| `qwen38-fp4` | `rocm-7.2.4-rocmfpx` | 211 | its quant uses ROCmFP4 tensor types that stock llama.cpp rejects |
+| `deepseek-v4` | `rocm-7.2.4` (mainline) | 10217 | `deepseek4` has no Vulkan implementation; the fork costs 40% decode on this model |
+
+Both set `devices: ['/dev/dri', '/dev/kfd']` and `podman_args: ['--ipc=host']`, which ROCm requires. Flag availability differs per build — see [TROUBLESHOOTING](TROUBLESHOOTING.md#llama-server-refuses-to-start-invalid-argument). A profile may also override host-level settings: `image` (per-profile container image — used by `qwen38-fp4` to select the ROCm/ROCmFPX image instead of the default Vulkan one), `devices` (list, default `['/dev/dri']`; ROCm needs `/dev/kfd` too), `env` (dict, merged over the global `llamacpp_env`), `podman_args` (list, rendered as a Quadlet `PodmanArgs=` line — `--ipc=host` is mandatory for ROCm), `no_mmap` (overrides the global `llamacpp_no_mmap`), and `backend` (label shown in the deploy summary) |
 | `llamacpp_model_dir` | string | `"~/models"` | Directory for GGUF model storage |
 | `llamacpp_ngl` | int | `999` | GPU layers to offload (999 = all) |
 | `llamacpp_flash_attn` | bool | `true` | Enable flash attention |

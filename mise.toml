@@ -122,6 +122,18 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY 
 description = "Deploy llama.cpp — fast profile (Qwen3.5-35B-A3B, general+vision)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=fast"
 
+[tasks."deploy:llamacpp:qwen38"]
+description = "Deploy llama.cpp — qwen38 profile (Qwen3.8-27B dense, VLM, 262K ctx)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=qwen38"
+
+[tasks."deploy:llamacpp:qwen38-fp4"]
+description = "Deploy llama.cpp — qwen38-fp4 (Qwen3.8-27B ROCmFP4 + MTP, ROCmFPX fork, ~2.4x decode)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=qwen38-fp4"
+
+[tasks."deploy:llamacpp:deepseek-v4"]
+description = "Deploy llama.cpp — deepseek-v4 (DeepSeek-V4-Flash-0731 284B MoE, ROCm/HIP + DSpark)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=deepseek-v4"
+
 [tasks."deploy:llamacpp:nemotron"]
 description = "Deploy llama.cpp — nemotron profile (Nemotron-3-Nano-30B-A3B, coding/agentic)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=nemotron"

@@ -9,21 +9,41 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image={{ llamacpp_image }}
+Image={{ llamacpp_active.image | default(llamacpp_image) }}
 ContainerName={{ llamacpp_container_name }}
-AddDevice=/dev/dri
+{% for dev in llamacpp_active.devices | default(['/dev/dri']) %}
+AddDevice={{ dev }}
+{% endfor %}
 PublishPort={{ llamacpp_port }}:8080
 Volume={{ llamacpp_service_model_dir_expanded }}:/models:Z
-{% for key, value in (llamacpp_env | default({})).items() %}
+{% if llamacpp_active.podman_args is defined %}
+PodmanArgs={{ llamacpp_active.podman_args | join(' ') }}
+{% endif %}
+{% for key, value in ((llamacpp_env | default({})) | combine(llamacpp_active.env | default({}))).items() %}
 Environment={{ key }}={{ value }}
 {% endfor -%}
 Exec=llama-server \
   -m /models/{{ llamacpp_service_repo_dir }}/{{ llamacpp_active.file }} \
   -ngl {{ llamacpp_ngl }} \
+{% if llamacpp_active.mmproj_file is defined %}
+  --mmproj /models/{{ llamacpp_service_repo_dir }}/{{ llamacpp_active.mmproj_file }} \
+{% endif -%}
+{% if llamacpp_active.draft_file is defined %}
+  --spec-type {{ llamacpp_active.spec_type | default('draft-mtp') }} \
+  --model-draft /models/{{ (llamacpp_active.draft_repo | default(llamacpp_active.repo)) | regex_replace('/', '_') }}/{{ llamacpp_active.draft_file }} \
+  --spec-draft-ngl {{ llamacpp_active.draft_ngl | default(99) }} \
+  --spec-draft-n-max {{ llamacpp_active.spec_n_max | default(4) }} \
+{% if llamacpp_active.draft_device is defined %}
+  --spec-draft-device {{ llamacpp_active.draft_device }} \
+{% endif -%}
+{% endif -%}
+{% if llamacpp_active.main_device is defined %}
+  -dev {{ llamacpp_active.main_device }} \
+{% endif -%}
 {% if llamacpp_flash_attn %}
   -fa 1 \
 {% endif -%}
-{% if llamacpp_no_mmap %}
+{% if llamacpp_active.no_mmap | default(llamacpp_no_mmap) %}
   --no-mmap \
 {% endif -%}
 {% if llamacpp_active.jinja | default(false) %}
@@ -40,6 +60,9 @@ Exec=llama-server \
 {% if llamacpp_active.repeat_penalty | default(0) | float > 0 %}
   --repeat-penalty {{ llamacpp_active.repeat_penalty }} \
 {% endif -%}
+{% if llamacpp_active.presence_penalty | default(0) | float > 0 %}
+  --presence-penalty {{ llamacpp_active.presence_penalty }} \
+{% endif -%}
 {% set _cache_k = llamacpp_active.cache_type_k | default(llamacpp_cache_type_k) | default('') %}
 {% set _cache_v = llamacpp_active.cache_type_v | default(llamacpp_cache_type_v) | default('') %}
 {% if _cache_k | length > 0 %}
@@ -53,6 +76,8 @@ Exec=llama-server \
 {% endif -%}
 {% if not llamacpp_thinking_enabled %}
   --chat-template-kwargs '{"enable_thinking":false}' \
+{% elif llamacpp_active.chat_template_kwargs is defined %}
+  --chat-template-kwargs '{{ llamacpp_active.chat_template_kwargs | to_json }}' \
 {% endif -%}
 {% if llamacpp_api_key_enabled %}
   --api-key {{ llamacpp_api_key_value }} \

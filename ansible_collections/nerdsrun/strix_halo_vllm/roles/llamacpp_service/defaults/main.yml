@@ -33,6 +33,14 @@ llamacpp_port: 8080
 # big:      Qwen3.5-122B-A10B — most powerful, reasoning/vision/coding (~77GB, ~22 tok/s)
 # coder:    Qwen3-Coder-30B-A3B — coding specialist, tool-use, agentic (~20GB, ~55-65 tok/s)
 # fast:     Qwen3.5-35B-A3B — fast reasoning/vision/coding (~20GB, ~50-55 tok/s)
+# qwen38:   Qwen3.8-27B — DENSE 27B, native VLM, 262K ctx (~16GB at UD-Q4_K_XL)
+#           Capability/vision tier, NOT a speed tier — dense weights on a
+#           bandwidth-bound APU. Arch is dense `qwen35`, runs on build 10400.
+# deepseek-v4: DeepSeek-V4-Flash-0731 — 284B MoE / 13B active, ~103GB at 2.90bpw.
+#           Capability flagship. ROCm/HIP + DSpark speculative decoding.
+# qwen38-fp4: Qwen3.8-27B on ROCmFP4 + tuned MTP — the SPEED variant of qwen38.
+#           Trades the 262K window and the upstream image for ~2.4x decode via
+#           speculative decoding. Requires the ROCmFPX llama.cpp fork.
 # nemotron: Nemotron-3-Nano-30B-A3B — hybrid Mamba-Transformer MoE, coding/agentic/reasoning (~20GB)
 # lightning: NVIDIA-Nemotron-3.5-Lightning-30B-A3B — successor to nemotron (~35GB at Q8_0)
 #           Fast agentic executor: tool use, code review, high-volume delegation
@@ -93,6 +101,559 @@ llamacpp_model_profiles:
     min_p: 0.0
     jinja: true
     repeat_penalty: 1.05
+  qwen38:
+    # Qwen3.8-27B — DENSE 27B, native vision-language, hybrid attention.
+    # The first Qwen3.8 model in the fleet and the first DENSE one.
+    #
+    # Arch: the GGUF reports `general.architecture = qwen35` — the *dense*
+    #   qwen35 path, NOT the `qwen35moe` path that `big` and `fast` exercise.
+    #   Same llama.cpp model file (qwen35.cpp, in-tree since 2026-05), a
+    #   different code path through it. Verified to load on the pinned build
+    #   10400, so this profile costs no image bump.
+    # Layout: 65 blocks, 16 x (3 x Gated DeltaNet -> 1 x Gated Attention).
+    #   Only 16 of 65 layers carry a KV cache, which is why the full 262144
+    #   native context is affordable here — the same property that makes
+    #   `super` viable at 1M.
+    # SPEED: this is a DENSE model on a bandwidth-bound APU. Every token reads
+    #   the whole ~16 GiB of weights, where the MoE fleet reads 2-6 GiB. It is
+    #   a capability/vision/long-context tier, NOT a speed tier — do not file
+    #   its throughput as a regression against `coder`. See docs/PERFORMANCE.md.
+    # Sampling: Qwen publishes two distinct sets, and they are not
+    #   interchangeable. Thinking mode — the model default, and what
+    #   `llamacpp_thinking_enabled: true` selects — wants temp=1.0, top_p=0.95,
+    #   top_k=20, min_p=0.0, presence_penalty=0.0, repetition_penalty=1.0
+    #   (1.0 is the no-op, so repeat_penalty is left at 0 = flag omitted).
+    #   Non-thinking wants temp=0.7, top_p=0.80, presence_penalty=1.5. If you
+    #   flip llamacpp_thinking_enabled to false you MUST change these too:
+    #   presence_penalty is the knob that stops endless repetition, and Qwen
+    #   calls for it explicitly in instruct mode.
+    # Thinking control is per-request via chat_template_kwargs —
+    #   `enable_thinking`, `reasoning_effort`, `preserve_thinking`.
+    repo: "unsloth/Qwen3.8-27B-GGUF"
+    file: "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+    # Native VLM — the projector is a separate GGUF and vision is silently
+    # OFF without it (the server starts fine and simply rejects image parts).
+    mmproj_file: "mmproj-F16.gguf"
+    # A list, not a single glob: the main quant plus two sidecars from the same
+    # repo. mmproj-F16 is the vision projector; MTP/ is the Multi-Token
+    # Prediction draft model for speculative decoding. Both are staged on disk
+    # so they can be wired in (mmproj_file / draft_file) without re-downloading.
+    include:
+      - "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+      - "mmproj-F16.gguf"
+      - "MTP/mtp-Qwen3.8-27B-Q4_0.gguf"
+    ctx_size: 262144
+    temp: 1.0
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 0
+    presence_penalty: 0
+    # Pinned, NOT inherited: this profile wants the llama.cpp DEFAULT ubatch,
+    # not the fleet's 2048. Swept on build 10400 (b=4096, llama-bench, r=2):
+    #   -ub  512 -> pp4096 361.0 t/s   tg128 12.32   <- peak
+    #   -ub 1024 -> pp4096 345.1 t/s   tg128 12.31   (-4%)
+    #   -ub 2048 -> pp4096 336.1 t/s   tg128 12.31   (-7%)
+    # Prefill falls monotonically as -ub rises, and decode does not move at
+    # all. This is the THIRD novel architecture to reject 2048 (bailingmoe3
+    # -18%, deepseek4 -22%, now dense qwen35 -7%), against every mainstream
+    # Qwen/Nemotron MoE preferring it. Do not "fix" this back to the global.
+    batch_size: 4096
+    ubatch_size: 512
+    #
+    # A correctness caveat sits right next to this value, and it was checked
+    # rather than assumed. ggml-org/llama.cpp#27237 reports that this exact
+    # arch (qwen35 hybrid Gated DeltaNet) emits garbage / early-EOS output on
+    # Vulkan at batch 512, and is fine at 1024/4096 — reproduced there at both
+    # 32K and 262K ctx, with FA on/off, KV f16 and q8_0, MTP on/off.
+    #
+    # NOT REPRODUCED HERE. Three arms, greedy decoding, five known-answer
+    # cases plus three 4.3K-token summarisation runs each:
+    #   -b 4096 -ub 512 (this pin) -> clean
+    #   -b  512 -ub  512 (the reporter's own config) -> clean
+    #   -b 4096 -ub 2048 (control) -> clean
+    # No garbage, no degenerate repetition, no early EOS in any arm. The
+    # reporter ran Windows 11 + RX 7900 XTX on AMD's proprietary driver; this
+    # box is Fedora + gfx1151 on RADV/Mesa, so the driver stack differs and
+    # the bug appears not to reach us. This is a negative result on our
+    # hardware, NOT evidence the upstream issue is invalid.
+    #
+    # One case did differ across arms: 137*4 answered 548 at -b 4096 -ub 512
+    # and 554 at the other two, at temperature 0. That is fluent-and-wrong,
+    # not corrupt — different batch widths change float reduction order, so
+    # greedy output is only deterministic within a fixed config. Do not read
+    # it as one config being "more accurate"; it is a single sample.
+    extra_args:
+      - "--reasoning-format auto"
+      # Qwen documents `preserve_thinking` — reasoning context from earlier
+      # turns is retained rather than stripped. build 10400 prints
+      # "chat template supports preserving reasoning" for this GGUF and
+      # exposes it as --reasoning-preserve. Matters for multi-turn agentic
+      # loops, where dropping prior reasoning makes the model re-derive.
+      - "--reasoning-preserve"
+      - "--metrics"
+      - "--threads-http 8"
+      - "--cache-reuse 256"
+      # ~16 GiB of weights on a 128 GB box leaves ~90 GB free, so the wide
+      # prefix-reuse pool is affordable here (cf. the sizing table in
+      # docs/PERFORMANCE.md — the 2048 cap exists for the ~108 GB models).
+      #
+      # But --cache-ram is NOT the only additive term on a recurrent/hybrid
+      # arch, and the sizing table alone will mislead you here. The server
+      # also keeps --ctx-checkpoints (default 32) recurrent-state checkpoints
+      # PER SLOT, each serialized as fp32 into host RAM. For this model's
+      # geometry (65 blocks, SSM state 128 x 16 groups, inner size 6144) one
+      # checkpoint is ~149.6 MiB, so the default 32 is ~4.7 GB per slot on
+      # top of weights + KV + the cache-ram pool (ggml-org/llama.cpp#27211).
+      # Pinned to 8 (~1.2 GB) — measured resident is ~30 GB at full 262K ctx,
+      # so this is headroom management, not a fix for an observed OOM. This is
+      # the one flag here chosen from arithmetic rather than a before/after
+      # measurement, and it is not free: fewer checkpoints means more
+      # recomputation when a slot rolls back. On agentic loops with long
+      # shared prefixes that can cost more than the ~3.5 GB it saves on a box
+      # with ~90 GB spare. If rollback recompute shows up in the timings,
+      # putting this back to the default 32 is the right call.
+      - "--ctx-checkpoints 8"
+      - "--cache-ram 8192"
+      # SPECULATIVE DECODING IS DELIBERATELY OFF — do not enable it here.
+      # This model ships an MTP head and build 10400 has the machinery for it
+      # (--spec-type draft-mtp, -md, -ngld, --spec-draft-n-max), and the draft
+      # GGUF is already staged on disk by the `include` list above, so turning
+      # it on looks like a one-line change. It is not.
+      #
+      # ggml-org/llama.cpp#27306 is open against THIS EXACT combination —
+      # gfx1151 / Radeon 8060S / 128 GB / Vulkan-RADV, Qwen3.8-27B + mmproj
+      # from Unsloth. With --spec-type draft-mtp, long prefill dies in
+      # vk::Queue::submit with ErrorDeviceLost and a compute-ring reset; the
+      # process survives as a zombie (/v1/models answers 200, /completion
+      # 500s). The same argv with MTP off runs past 125k tokens. Qwen3.8 MTP
+      # is `!is_mem_shared`, so the draft context is a SECOND same-width
+      # llama_decode after every target ubatch — that extra decode is the
+      # trigger. GGML_VK_MAX_NODES_PER_SUBMIT=1 does not save it.
+      #
+      # This matters because decode here is already memory-bandwidth
+      # saturated (see docs/PERFORMANCE.md), so speculation is the only lever
+      # that could move tok/s at all. Re-test when #27306 closes.
+      #
+      # SCOPE, because it is easy to over-read the above: #27306 is a bug in
+      # UPSTREAM llama.cpp on VULKAN/RADV, and its failure is specifically
+      # long unique-prefix prefill (MTP-off survives past 125k). It is not a
+      # property of the hardware, and it is not a blanket failure at every
+      # context length. MTP demonstrably works on this silicon on other
+      # stacks: the ROCmFPX fork (packaged as the rocm-7.14-rocmfpx /
+      # rocm-7.2.4-rocmfpx tags of the SAME toolbox repo we pin) reports
+      # 30.30 tok/s at 8K on a Max+ 395 with --spec-draft-n-max 4, against
+      # 13.46 unspeculated — third-party, not measured here. See the
+      # "Reported elsewhere on this exact hardware" subsection in
+      # docs/PERFORMANCE.md for the numbers and the caveats, of which the
+      # sharpest are a fork dependency and context validated only to 64K
+      # against the 262K this profile ships.
+      #
+      # If you do enable it: --spec-draft-n-max wants 3-4, NOT the default
+      # you may have read is 16. Build 10400 reports default: 3 already.
+      # Use the Q4_0 draft head over Q8_0 (its cost is dominated by the
+      # output projection over a 248K vocab, so the cheaper head wins end to
+      # end), and set -ngld/--spec-draft-ngl or the head lands on CPU and the
+      # entire speculative gain disappears.
+      #
+      # The ngram-* --spec-type variants (ngram-cache, ngram-simple, ...) do
+      # NOT allocate a draft context, so they should sidestep #27306's code
+      # path while staying on upstream Vulkan. Unmeasured here — cheapest of
+      # the three experiments and the next thing to try.
+  qwen38-fp4:
+    # Qwen3.8-27B on ROCmFP4 + tuned MTP speculative decoding.
+    #
+    # This is the SPEED variant of `qwen38`, and the two are deliberately kept
+    # as separate profiles rather than one profile with a switch. They differ
+    # in backend (ROCm vs Vulkan), container image, quant format, and context
+    # ceiling; `qwen38` stays as the known-good upstream fallback.
+    #
+    # WHY IT EXISTS: `qwen38` decodes 12.3 tok/s and that is the memory
+    # bandwidth ceiling for a dense 27B at 16.3 GiB — no conventional flag
+    # moves it (see docs/PERFORMANCE.md). Speculative decoding is the only
+    # lever, because it produces several tokens per weight read. Upstream
+    # llama.cpp cannot take that lever on Vulkan/RADV here: MTP dies with
+    # ErrorDeviceLost on long prefill (ggml-org/llama.cpp#27306). ROCmFPX can.
+    #
+    # DEPENDENCY, stated plainly: ROCmFP4 is a runtime tensor format (ggml
+    # types 100-106) that exists ONLY in the ROCmFPX fork of llama.cpp
+    # (https://github.com/charlie12345/ROCmFPX). Stock llama.cpp REJECTS these
+    # tensors — this GGUF will not load on the vulkan-radv image. The fork is
+    # packaged as the rocm-*-rocmfpx tags of the same toolbox repo we already
+    # pin, so it is a tag change rather than a build project, but it is still
+    # a fork and it is still off the upstream release train.
+    #
+    # ROCm RISK: this collection uses Vulkan specifically to dodge a ROCm/HIP
+    # hang with Qwen 3.5 models (ROCm/ROCm#6027), and this model's GGUF arch
+    # is `qwen35` — the same family. The quant author reports it healthy on
+    # ROCm 7.2.4, which is far newer than that issue. Watch for a hang here
+    # before trusting this profile with anything long-running.
+    # Pinned by digest, same discipline as llamacpp_image above: the
+    # rocm-*-rocmfpx tags move (the repo carries many timestamped
+    # variants), and a silent move already cost this fleet 33% of a
+    # profile's decode once. This digest is ROCmFPX build 211 (a7ddbe7).
+    image: "docker.io/kyuz0/amd-strix-halo-toolboxes@sha256:d9462a185fc410889a9501890e7f3379e080b6d3cf9a7d0831b0808bbb611ab9"
+    # ROCm needs the KFD compute device, not just the render node.
+    devices:
+      - "/dev/dri"
+      - "/dev/kfd"
+    # --ipc=host is REQUIRED, and the failure without it is deeply misleading.
+    # ROCm's HSA runtime allocates through shared-memory segments; rootless
+    # podman's private IPC namespace breaks that, and the model load dies with
+    #   Memory critical error by agent node-0 ... Reason: Memory in use.
+    #   (libhsa-runtime64.so / libggml-hip.so)
+    # which reads like an out-of-memory or a locked-memory fault and is
+    # neither. Isolated on this box (minimal load, 4096 ctx, one variable):
+    #   no extra flags             -> HSA critical error
+    #   --security-opt seccomp=unconfined -> HSA critical error
+    #   --ipc=host                 -> loads cleanly
+    # So --ipc=host is necessary AND sufficient; seccomp is irrelevant here,
+    # do NOT add it (it is a real security relaxation that buys nothing).
+    # Also note this box's RLIMIT_MEMLOCK is 8 MB, soft and hard, so neither
+    # rootless podman nor a systemd user unit can raise it. That limit is NOT
+    # the cause of the fault above and no root change is needed — do not go
+    # chasing it, as the error message strongly invites you to.
+    podman_args:
+      - "--ipc=host"
+    env:
+      # gfx1151 is not in ROCm's shipped arch list; 11.5.1 is the override the
+      # Strix Halo toolboxes use. Unified memory is required on an APU where
+      # "VRAM" is system RAM.
+      HSA_OVERRIDE_GFX_VERSION: "11.5.1"
+      GGML_HIP_ENABLE_UNIFIED_MEMORY: "1"
+    # Explicit, because the image is pinned by DIGEST and a digest reference
+    # carries no "rocm" substring to sniff for.
+    backend: "ROCm/HIP via the ROCmFPX fork — overrides the default Vulkan image"
+    repo: "kingjones777/Qwen3.8-27B-ROCmFP4-STRIX-MTP-GGUF"
+    file: "Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf"
+    # VISION IS DELIBERATELY OFF ON THIS PROFILE — mmproj_file is NOT set,
+    # even though the projector is downloaded by the `include` list below.
+    # Multimodal + MTP speculative decoding ABORTS the server on this build:
+    #   srv process_chun: image processed in 26 ms
+    #   server-context.cpp:3192: fatal error - please provide logs and repro
+    #     in https://github.com/ggml-org/llama.cpp/pull/20277
+    #   ggml_abort -> container dies, systemd restarts it
+    # The image itself decodes fine; it is the combination that dies. Isolated
+    # on this box by running the same quant and projector with the --spec-type
+    # flags removed — vision then answers correctly ("a yellow circle centred
+    # on a blue background"). The quant author's published vision test also
+    # omits the speculative flags, so the pairing was never exercised upstream.
+    # If you need images from Qwen3.8, use the `qwen38` profile: Vulkan, no
+    # speculation, vision verified, and the full 262K window.
+    include:
+      - "Qwen3.8-27B-Q4_0_ROCMFP4_STRIX.gguf"
+      - "mmproj-Qwen3.8-27B-BF16.gguf"
+      - "mtp-Qwen3.8-27B-Q4_0.gguf"
+      - "SHA256SUMS"
+    # --- speculative decoding: the entire point of this profile ---
+    # Use the Q4_0 head, NOT the Q8_0 one that ships alongside it. The head's
+    # per-step cost is dominated by its output projection over a 248K-token
+    # vocabulary, so the cheaper head is faster end-to-end at equal or better
+    # acceptance, and the gap widens with draft depth.
+    draft_file: "mtp-Qwen3.8-27B-Q4_0.gguf"
+    draft_ngl: 99
+    draft_device: "ROCm0"
+    main_device: "ROCm0"
+    spec_type: "draft-mtp"
+    # Published depth curve (author's box, same silicon; decode @8K):
+    #   off 13.46 | n1 21.74 | n2 27.79 | n3 30.13 | n4 30.30 | n6 27.55 | n12 19.17
+    # Classic rise/knee/decline — past 4 the draft cost grows linearly while
+    # acceptance compounds down. Re-swept on OUR box; see docs/PERFORMANCE.md.
+    spec_n_max: 4
+    # Author validated 65536 and lists higher as "not yet measured" — NOT as
+    # broken. `qwen38` runs the full 262144 on Vulkan, so if you need the long
+    # window and can accept 12.3 tok/s, that profile is the one.
+    # 262144 — the model's full native window, not the 65536 the quant author
+    # validated to. Memory is not the constraint on this profile: the layout is
+    # 16 x (3 x Gated DeltaNet -> 1 x Gated Attention), so only 16 of 65 layers
+    # carry a KV cache, and at 65536 the whole profile sat at 28 GB of 125 with
+    # ~96 GB free. Verified at depth after raising — see docs/PERFORMANCE.md.
+    #
+    # The risk here was never RAM, it was MTP + long prefill: that is precisely
+    # the mechanism in ggml-org/llama.cpp#27306, where a second same-width
+    # draft decode after every target ubatch kills the GPU on long unique
+    # prefixes. That report is Vulkan/RADV and this profile is ROCm, so it does
+    # not transfer automatically — which is why this was tested at depth rather
+    # than assumed. If you see a device-lost or a hang on very long prompts,
+    # this flag and the speculative block are the first suspects, in that order.
+    ctx_size: 262144
+    # One slot, deliberately, so a single request gets the FULL 262144 window.
+    # Slots SUBDIVIDE ctx_size rather than each getting their own, and 262144
+    # is this model's native maximum, so the per-request window cannot be
+    # restored by raising ctx_size — fewer slots is the only lever:
+    #   parallel_slots: 1 -> 1 x 262144  <- here
+    #   parallel_slots: 2 -> 2 x 131072
+    #   parallel_slots: 4 -> 4 x  65536
+    # Verified live via /props total_slots and /slots[0].n_ctx, not from the
+    # rendered flag — the two disagreed once already (see extra_args note).
+    parallel_slots: 1
+    # Server-side default. Thinking is ON in this model at reasoning_effort
+    # "xhigh" unless told otherwise, and xhigh is not a sane default for
+    # interactive use.
+    #
+    # What reasoning actually costs, measured on one ordinary refactoring
+    # prompt at max_tokens 700 (reason_ch = characters of reasoning_content):
+    #   effort   wall_s  tokens  tok/s  reason_ch  finish
+    #   low        27.3     700   26.1       1800  length
+    #   medium     29.4     700   24.1       2564  length
+    #   thinking off 4.1     116    ~30          0  stop
+    #
+    # Two things follow, and the second is the one that bites:
+    # 1. Reasoning IS counted against max_tokens. Both thinking arms stop at
+    #    exactly the cap with finish_reason "length" — so a too-small budget
+    #    truncates the answer, or spends the lot reasoning and returns
+    #    content: "", which reads as a broken model and is not one.
+    # 2. low vs medium is a modest difference (~40% more reasoning), NOT the
+    #    difference between usable and unusable. If a request feels like it is
+    #    "thinking forever", the fix is usually a bigger max_tokens or
+    #    enable_thinking:false, not a lower effort.
+    #
+    # Thinking is therefore OFF by default on this profile. It is the speed
+    # tier: the whole reason it exists is 2.4x decode via speculation, and
+    # spending that budget on reasoning tokens that then truncate the answer
+    # defeats the point. Note the "thinking off" row is the ONLY one that
+    # finishes with "stop" rather than "length" — the others run out of budget
+    # mid-answer, which is what "thinking forever" actually looks like.
+    #
+    # This is a DEFAULT, not a restriction — but turning it back on has a
+    # gotcha worth knowing, because the obvious incantation does nothing.
+    # Per-request kwargs MERGE over the server-side ones rather than replacing
+    # them, so enable_thinking:false keeps winning unless you override it by
+    # name. Measured on a reasoning prompt (chars of reasoning_content):
+    #   {}                                              ->   0   (default)
+    #   {"reasoning_effort": "low"}                     ->   0   <- NO EFFECT
+    #   {"enable_thinking": true}                       -> 210
+    #   {"enable_thinking": true, "reasoning_effort": "low"} -> 441
+    # So always pass enable_thinking:true to re-enable; reasoning_effort alone
+    # is silently inert here. The template accepts ONLY xhigh, medium and low
+    # for reasoning_effort; "none" raises.
+    #
+    # The sibling `qwen38` profile (Vulkan, vision, 262K) leaves thinking on,
+    # so the capability tier and the speed tier differ here deliberately.
+    chat_template_kwargs:
+      enable_thinking: false
+    # OVERRIDES the global llamacpp_no_mmap: true. That global exists for the
+    # Vulkan backend ("required on Strix Halo unified memory — prevents
+    # crashes"), but on this ROCm/HIP stack --no-mmap combined with -dio
+    # (direct I/O) crashes the HSA runtime during model load:
+    #   Memory critical error by agent node-0 ... Reason: Memory in use
+    #   (libhsa-runtime64.so.1.18.70204 / libggml-hip.so)
+    # The quant author's known-good command line uses -dio and does NOT pass
+    # --no-mmap. Match it. Do not "restore consistency" with the other
+    # profiles here — they are on a different backend.
+    no_mmap: false
+    temp: 1.0
+    top_p: 0.95
+    top_k: 20
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 0
+    presence_penalty: 0
+    extra_args:
+      - "--reasoning-format auto"
+      # NOTE: no --reasoning-preserve here, unlike the `qwen38` profile. The
+      # ROCmFPX fork is cut from an older upstream (build 211 / a7ddbe7) and
+      # rejects that flag outright — llama-server exits 1 with "invalid
+      # argument" and systemd restart-loops. Flag sets are per-build, which is
+      # a large part of why this is a separate profile rather than a switch.
+      - "--metrics"
+      - "--threads-http 8"
+      # Cold-loads the 13.7 GiB file in ~6 s instead of ~9.
+      - "-dio"
+      # llama.cpp's autofit reads MemAvailable, which on an integrated GPU is
+      # at its lowest right after a model unload. Left on, it can silently
+      # shrink context or spill tensors to CPU.
+      - "-fit off"
+      # NOTE: --parallel/-np is NOT set here. It belongs in parallel_slots,
+      # which the template renders as -np earlier in the command line.
+      # extra_args renders LAST, so a --parallel here silently overrides
+      # parallel_slots (llama.cpp takes the last occurrence) and the server
+      # comes up with a different slot count than the profile declares, with
+      # no warning. Check /props total_slots after changing slot config.
+      # NOTE the absence of --cache-reuse / --cache-ram. Prompt caching does
+      # NOT work on this architecture: llama.cpp emits "forcing full prompt
+      # re-processing due to lack of cache data (SWA or hybrid/recurrent
+      # memory)" and reprefills every turn. That is an upstream hybrid-memory
+      # limitation, not a quant property, so a prefix-reuse pool here would
+      # reserve RAM that can never be used. Budget for a full prefill on every
+      # turn in multi-turn use.
+  deepseek-v4:
+    # DeepSeek-V4-Flash-0731 — 284B MoE / 13B active, on mainline llama.cpp
+    # with the ROCm/HIP backend. This is the capability flagship of the fleet.
+    #
+    # WHY THIS EXISTS ALONGSIDE THE GATED `deepseek` PROFILE BELOW: that one
+    # targets Unsloth's UD-IQ3_XXS on the default VULKAN image and is gated
+    # because the `deepseek4` arch has no Vulkan implementation. That gate is
+    # still correct. It was never a statement about the hardware — the arch
+    # runs fine on ROCm/HIP, which is what this profile uses.
+    #
+    # ARTIFACT CHOICE — there are three Strix Halo DeepSeek-V4 builds in
+    # circulation and they need THREE DIFFERENT RUNTIMES. Only this one runs
+    # on llama.cpp, so benchmark numbers do not transfer between them:
+    #   * otheru/...Strix-Halo-GGUF (2.58bpw + DSpark drafter) needs `Ember`,
+    #     a separate DeepSeek-V4 runtime, and uses custom tensor types that
+    #     mainline llama.cpp does not implement. It is also *abliterated*.
+    #     The widely-quoted "25.3 tok/s / 32.0 with DSpark / ~250 t/s sparse
+    #     prefill" figures are ITS numbers, on ITS runtime. Not ours.
+    #   * Lucebox/...ROCmFP3 (98.29 GB, 2.766bpw) needs `dflash_server` off a
+    #     feature branch, measures 18.1 tok/s, and its own card says the
+    #     current DSpark helper makes it slower overall.
+    #   * THIS ONE: Kevletesteur's requantization of the Unsloth UD-IQ3_XXS,
+    #     103 GB at 2.90 bpw, explicitly "mainline llama.cpp — no fork".
+    #     It lifts the three attention tensor families that are 51.9% of
+    #     per-token bytes from Q8_0 to Q6_K, which raises draft acceptance
+    #     from 44% to 63% and long-form generation by ~23.8%.
+    #
+    # SPEED — author's figures vs ours. The author reports ~20-27 t/s short
+    # ctx, ~14-16 at 16k, ~11 at 150k, prefill ~130. MEASURED HERE on mainline
+    # 10217 at ctx 32768, code generation, median of 3: 17.07 tok/s decode,
+    # ~37-40 t/s prefill. Decode is in the right neighbourhood; prefill is
+    # roughly 3.5x short of their number and unexplained — a newer mainline
+    # build is the most likely difference, since ours (10217) predates the
+    # Vulkan image this collection pins (10400).
+    # MAINLINE llama.cpp for ROCm/HIP (build 10217 / ddd4ec142), pinned by
+    # digest — the configuration the quant author actually measured.
+    # An earlier revision of this profile used the ROCmFPX fork image
+    # (build 211 / a7ddbe7) on the reasoning that it is mainline plus extra
+    # ROCmFP4 tensor types, hence a superset. It loads and runs correctly, so
+    # the substitution is viable, but the fork is cut from a much older base
+    # and this profile is the one place in the fleet where that shows up.
+    # Note build 10217 is also OLDER than the Vulkan image this collection
+    # pins (10400) — these are different points on the tree, not a version
+    # ladder. Do not assume a higher number is newer across images.
+    image: "docker.io/kyuz0/amd-strix-halo-toolboxes@sha256:1e666bff85b85e1fc877531c51ea7459a40429c8e48daee1b99eaece1c90c247"
+    backend: "ROCm/HIP (mainline llama.cpp) — deepseek4 has no Vulkan impl"
+    devices:
+      - "/dev/dri"
+      - "/dev/kfd"
+    # Same HSA shared-memory requirement as qwen38-fp4 — without it the load
+    # dies with a misleading "Memory in use" error. See that profile.
+    podman_args:
+      - "--ipc=host"
+    env:
+      HSA_OVERRIDE_GFX_VERSION: "11.5.1"
+      # NOTE the deliberate ABSENCE of GGML_HIP_ENABLE_UNIFIED_MEMORY here,
+      # which the qwen38-fp4 profile does set. Copying it over to this profile
+      # was measured to be actively harmful: with managed/unified allocations
+      # the tensors never land in GTT (mem_info_gtt_used stayed at 0 of 124
+      # GiB) and migrate on demand instead, so a 97 GiB model effectively runs
+      # from host memory. Decode sat at 3.4-3.9 tok/s against the ~20-27 this
+      # artifact is capable of, with no error anywhere in the log.
+      # The quant author's environment is only the two GGML_* vars below.
+      # +3.0%: a 256-expert MoE re-routes on every token, so HIP graph
+      # re-instantiation costs more than launch amortisation saves.
+      GGML_CUDA_DISABLE_GRAPHS: "1"
+      # +1.5%: this specific micro-fusion loses on gfx1151.
+      LLAMA_NO_FUSE_HC_POST: "1"
+    repo: "Kevletesteur/DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF"
+    file: "DeepSeek-V4-Flash-0731-UD-IQ3_XXS-q6kattn.gguf"
+    include: "*q6kattn*"
+    # The DSpark drafter is published in a DIFFERENT repo from the target, so
+    # draft_repo is set and the role fetches it separately.
+    # Q8_0 (10.15 GiB) is used as-is. Do NOT substitute a 2-bit drafter:
+    # hit-rate collapses to 9-15% and speculation then LOSES ~40% against no
+    # drafter at all. Q3_K_S (3.44 bpw) is the documented floor.
+    # SPECULATIVE DECODING IS OFF — measured a 2.5x LOSS on this box, which is
+    # the opposite of what the card reports, and the arithmetic says why.
+    # The DSpark drafter is 10.15 GiB (Q8_0) while the target only reads
+    # ~4.7 GB per token (13B active at 2.90 bpw), so every drafted token costs
+    # more than simply generating one. Acceptance was healthy (0.82-0.84) —
+    # speculation works, it just is not worth its own weight here. Measured,
+    # ctx 32768, code generation, medians:
+    #   drafter + --n-cpu-moe 16 ->  4.22 tok/s   (ROCmFPX fork)
+    #   no drafter, --n-cpu-moe 16 -> 10.74 tok/s   (ROCmFPX fork)
+    #   no drafter, all on GPU     -> 12.22 tok/s   (ROCmFPX fork)
+    #   no drafter, all on GPU     -> 17.07 tok/s   (MAINLINE 10217) <- shipped
+    #
+    # And on MAINLINE the drafter is not merely a loss, it will not load:
+    #   error loading model hyperparameters:
+    #     key not found in model: dflash.attention.sliding_window_pattern
+    # The Unsloth DSpark drafter's `dflash` arch wants a hyperparameter this
+    # build requires and the GGUF does not carry. So across both ROCm images
+    # available here, DSpark is either a 2.5x loss (fork) or unloadable
+    # (mainline). Either way this profile ships without it.
+    # Contrast qwen38-fp4, where the MTP head is small and speculation pays
+    # 2.4x. Drafter size relative to per-token target bytes is the thing that
+    # decides it. Re-enable by restoring these four keys if a much smaller
+    # DSpark drafter appears (the card suggests requantizing to Q3_K_S):
+    #   draft_repo: "unsloth/DeepSeek-V4-Flash-0731-GGUF"
+    #   draft_file: "dspark-DeepSeek-V4-Flash-0731-Q8_0.gguf"
+    #   draft_ngl: 99
+    #   spec_type: "draft-dspark"
+    # n-max 2, not the default. The optimum moves with context depth: 3 wins
+    # at short context, 2 wins from ~16k on (+3-4%), and there is a HARD CLIFF
+    # at n>=4 (RDNA3 MMVQ max_batch=4 for these expert types). Long-context
+    # agent work is the target here, so 2.
+    spec_n_max: 2
+    # Full native 1,048,576 window. KV is far cheaper than the geometry
+    # suggests, because llama.cpp stores MLA's COMPRESSED LATENT rather than
+    # the nominal 512+512 per layer. Derived from head_count_kv=1 x
+    # (512+512) x 43 blocks you get ~45.7 KiB/token, which is wrong by ~9x.
+    # MEASURED on this box: GTT grew 115 MiB across a 22,370-token prompt,
+    # i.e. ~5.3 KiB/token:
+    #    262144 -> ~1.3 GiB KV
+    #   1048576 -> ~5.3 GiB KV   <- here, against 26 GiB of GTT headroom
+    # Weights dominate completely; context is nearly free. Same property that
+    # makes `super` affordable at 1M.
+    #
+    # TWO CAVEATS, neither a memory one:
+    # 1. rope scaling is yarn, factor 16.0, original_context_length 65536 --
+    #    and 65536 x 16 = 1048576. So 65536 is the TRAINED window and 1M is
+    #    extrapolation. Reach past 65536 costs quality, by design.
+    # 2. Prefill is the real limit. At the measured ~140-160 t/s on long
+    #    prompts, filling 1M tokens is roughly two hours. The window is there
+    #    when you need it; it is not a window you fill casually.
+    ctx_size: 1048576
+    # MANDATORY here, not a tuning preference. llama.cpp sets n_parallel to
+    # "auto" and picked 4 on this box, reserving KV for four 262144-token
+    # slots. Measured result: 120 of 125 GB resident, buff/cache collapsed to
+    # ~1 GB, and throughput fell off a cliff — 3.88 tok/s decode and 9.4 t/s
+    # prefill against the ~20-27 / ~130 this artifact is capable of. That is
+    # thrashing, not the model being slow. One serving slot is also the right
+    # shape for a 97 GiB model: there is no memory left to serve two.
+    parallel_slots: 1
+    temp: 1.0
+    top_p: 0.95
+    top_k: 0
+    min_p: 0.0
+    jinja: true
+    repeat_penalty: 0
+    # Card measured f16 KV at -20.6% ON THIS QUANT (and +21% on the previous
+    # one). Settings do not transpose between quants — re-measure if you swap.
+    cache_type_k: "q8_0"
+    cache_type_v: "q8_0"
+    batch_size: 2048
+    ubatch_size: 512
+    extra_args:
+      # Frees ~33 GB of GTT for a 0.1% decode cost, and prefill IMPROVES 2.4x
+      # because the binding constraint here is memory pressure, not compute.
+      # This is what makes a 96 GiB model comfortable on a 128 GB box.
+      # -fit off is NOT optional, and omitting it is a silent catastrophe
+      # rather than an error. llama.cpp's autofit reads MemAvailable, which on
+      # an integrated GPU is at its lowest immediately after unloading the
+      # previous model — exactly when a profile switch runs. Measured here
+      # with autofit left on: GTT used settled at 0.95 GiB of 124 GiB, i.e.
+      # the entire 97 GiB model silently ran on CPU, giving 3.67 tok/s decode
+      # and 6.7 t/s prefill with no warning in the log beyond a one-line
+      # "fitting params to device memory". Nothing reports that the offload
+      # did not happen; you only notice via tok/s or mem_info_gtt_used.
+      - "-fit off"
+      # Explicit device selection, same reason.
+      - "-dev ROCm0"
+      # --n-cpu-moe is NOT used. The card reports it frees ~33 GB of GTT for a
+      # 0.1% cost; measured here it costs 12% (10.74 vs 12.22 tok/s) and the
+      # full 97 GiB fits in the 124 GiB GTT anyway. GTT by setting:
+      #   --n-cpu-moe 16 -> 65 GiB   --n-cpu-moe 8 -> 81 GiB   none -> 97 GiB
+      - "-t 12"
+      - "--spec-draft-type-k q8_0"
+      - "--spec-draft-type-v q8_0"
+      - "--reasoning-format auto"
+      - "--metrics"
+      - "--threads-http 8"
+      # NEVER add an ngram-* --spec-type alongside draft-dspark. It is
+      # syntactically accepted and destroys DSpark (+101% -> +13% on tool
+      # calls); ngram modes alone lose up to -46%.
   nemotron:
     # Hybrid Mamba-Transformer MoE (128 experts, 6 active per token)
     # Requires llama.cpp build ≥8351 — earlier builds crash with an assertion
@@ -178,6 +739,10 @@ llamacpp_model_profiles:
     file: "UD-Q3_K_XL/NVIDIA-Nemotron-3-Super-120B-A12B-UD-Q3_K_XL-00001-of-00003.gguf"
     include: "*UD-Q3_K_XL*"
     ctx_size: 1048576
+    # Was "-np 1" in extra_args. Moved to the dedicated key: extra_args
+    # renders LAST, so a slot flag there silently overrides parallel_slots
+    # and the server serves a different count than the profile declares.
+    parallel_slots: 1
     temp: 1.0
     top_p: 0.95
     top_k: 0
@@ -220,7 +785,6 @@ llamacpp_model_profiles:
       # 16 cores / 32 threads, so 8 HTTP workers is well within budget.
       - "--threads-http 8"
       - "--metrics"
-      - "-np 1"
   coder-next:
     # Qwen3-Coder-Next-80B-A3B — 80B total / 3B active, MoE with hybrid
     # linear attention. GGUF arch is `qwen3next`.
@@ -297,6 +861,10 @@ llamacpp_model_profiles:
     file: "UD-IQ4_XS/MiniMax-M2.7-UD-IQ4_XS-00001-of-00004.gguf"
     include: "*UD-IQ4_XS*"
     ctx_size: 81920
+    # Was "-np 1" in extra_args. Moved to the dedicated key: extra_args
+    # renders LAST, so a slot flag there silently overrides parallel_slots
+    # and the server serves a different count than the profile declares.
+    parallel_slots: 1
     temp: 1.0
     top_p: 0.95
     top_k: 40
@@ -319,9 +887,16 @@ llamacpp_model_profiles:
       - "--cache-ram 2048"
       - "--slot-save-path /models/slot-cache"
       - "--metrics"
-      - "-np 1"
 
   deepseek:
+    # SCOPE NOTE (added when the deepseek-v4 profile landed): this gate is
+    # about VULKAN, not about the hardware and not about the arch itself.
+    # `deepseek4` loads fine on ROCm/HIP — verified on this box, the loader
+    # parses the arch and proceeds to tensor placement with no "unknown model
+    # architecture". For DeepSeek-V4-Flash on this machine use the
+    # `deepseek-v4` profile above, which selects the ROCm image. Keep THIS one
+    # gated: it targets the default Vulkan image, where the arch really is
+    # absent.
     # DeepSeek-V4-Flash-0731 — 284B total / 13B active, MoE with hybrid
     # CSA/HCA sparse attention. GGUF arch is `deepseek4`, native ctx 1M.
     #
@@ -382,6 +957,10 @@ llamacpp_model_profiles:
     include: "*UD-IQ3_XXS*"
     ubatch_size: 1024
     ctx_size: 131072
+    # Was "-np 1" in extra_args. Moved to the dedicated key: extra_args
+    # renders LAST, so a slot flag there silently overrides parallel_slots
+    # and the server serves a different count than the profile declares.
+    parallel_slots: 1
     temp: 0.6
     top_p: 0.95
     top_k: 20
@@ -393,7 +972,6 @@ llamacpp_model_profiles:
     extra_args:
       - "--reasoning-format auto"
       - "--metrics"
-      - "-np 1"
 
 llamacpp_model_dir: "~/models"
 
