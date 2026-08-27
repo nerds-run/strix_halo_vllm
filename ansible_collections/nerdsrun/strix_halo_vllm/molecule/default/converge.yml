@@ -523,3 +523,264 @@
               # An explicit base URL must win over mode-based resolution.
               - "_resolved['llamacpp/25'] == 'http://example.invalid/v1'"
             fail_msg: "openwebui_ui URL resolution is wrong: {{ _resolved }}"
+
+    - name: "Test lemonade_service defaults"
+      vars:
+        lemonade_enabled: false
+      block:
+        - name: "Load lemonade_service defaults"
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../../roles/lemonade_service/defaults/main.yml"
+
+        # --- Lemonade regression guards ---------------------------------
+        # Every assertion below encodes something that was measured or
+        # debugged on hardware and that fails SILENTLY: the server starts,
+        # answers requests, and the only symptom is a missing model or a
+        # third of the expected throughput.
+
+        # The single most surprising finding of this deployment. Lemonade
+        # sizes a device's memory pool from the JSON key it enumerated the
+        # GPU under, and only `amd_igpu` gets the max(vram, GTT) behaviour.
+        # Strix Halo enumerates as `amd_gpu`, so the pool is read as
+        # vram_gb alone = 0.5 GB (the BIOS carveout), and every streaming
+        # model is hidden as "too large for this device" with no error
+        # anywhere. Turning this off makes DeepSeek-V4-Flash vanish from
+        # `lemonade list` and the failure looks like a bad model name.
+        - name: "Assert GTT-aware model filtering is enabled"
+          ansible.builtin.assert:
+            that:
+              - lemonade_config['enable_dgpu_gtt'] | bool
+            fail_msg: >-
+              enable_dgpu_gtt is off. On gfx1151 Lemonade then sizes the GPU
+              pool from vram_gb (0.5 GB) and silently hides every ds4 model
+              from the catalog. See roles/lemonade_service/defaults/main.yml.
+
+        # Same finding as the llamacpp ROCm profiles: measured necessary AND
+        # sufficient, and seccomp=unconfined does not substitute. Without it
+        # the HSA runtime cannot map its shared-memory segments and model
+        # load dies with a misleading "Memory in use".
+        - name: "Assert the ROCm container declares KFD and --ipc=host"
+          ansible.builtin.assert:
+            that:
+              - "'/dev/kfd' in lemonade_devices"
+              - "'/dev/dri' in lemonade_devices"
+              - "'--ipc=host' in lemonade_podman_args"
+            fail_msg: >-
+              Lemonade drives ROCm and needs the KFD compute device plus
+              --ipc=host, not just the render node.
+
+        # The ds4 recipe is what makes this deployment different from
+        # llamacpp_service; losing it silently downgrades DeepSeek-V4 to
+        # "model not found" because no other engine reads its quant.
+        - name: "Assert llamacpp:rocm is the serving backend"
+          ansible.builtin.assert:
+            that:
+              - "'llamacpp:rocm' in lemonade_backends"
+            fail_msg: >-
+              llamacpp:rocm serves every model in this deployment. Its build
+              carries the deepseek4 arch, which is why DeepSeek-V4-Flash does
+              not need a second engine.
+
+        # ds4 was deployed, measured head-to-head, and removed. Re-adding it
+        # is a real decision with a measured cost, not a default to drift
+        # back into: 12.8 tok/s against llamacpp:rocm's 17.08 on the same
+        # model, a coarser quant, forced SSD streaming that cannot be
+        # disabled, and telemetry that reports ttft=0/tps=0.
+        - name: "Assert the ds4 backend has not been reintroduced silently"
+          ansible.builtin.assert:
+            that:
+              - "'ds4:rocm' not in lemonade_backends"
+              - "lemonade_models | select('search', 'DS4') | list | length == 0"
+            fail_msg: >-
+              ds4 is back in the defaults. It was removed on measurement, not
+              on taste — see docs/PERFORMANCE.md. If upstream has gated
+              --ssd-streaming on available GTT, re-measure before restoring
+              it, and update this assertion with the new numbers.
+
+        # Downloading a model that extra_models_dir already exposes wastes
+        # tens of GB. The one deliberate exception is Qwen3.8-27B, whose
+        # catalog entry adds the mmproj sidecar and the mtp label that a bare
+        # auto-discovered GGUF does not carry.
+        - name: "Assert only the catalog-enriched model is downloaded"
+          ansible.builtin.assert:
+            that:
+              - lemonade_models == ['Qwen3.8-27B-GGUF']
+            fail_msg: >-
+              lemonade_models should hold only models whose catalog entry adds
+              something the raw GGUF lacks (vision projector, mtp label).
+              Anything already under llamacpp_model_dir belongs in
+              lemonade_required_models, which costs no disk.
+
+        - name: "Assert DeepSeek is served from disk, not re-downloaded"
+          ansible.builtin.assert:
+            that:
+              - lemonade_required_models | select('search', 'DeepSeek-V4-Flash')
+                | list | length > 0
+              - lemonade_extra_models_host_dir | length > 0
+              - lemonade_config['extra_models_dir'] | length > 0
+            fail_msg: >-
+              DeepSeek-V4-Flash must come from the mounted GGUF tree. Without
+              extra_models_dir the same 97 GB quant would be downloaded a
+              second time into the Podman volume.
+
+        - name: "Assert every alias points at a required model"
+          ansible.builtin.assert:
+            that:
+              - item.value in lemonade_required_models
+            fail_msg: >-
+              Alias '{{ item.key }}' targets '{{ item.value }}', which is not
+              in lemonade_required_models — `lemonade alias add` would bind it
+              to a name the catalog cannot resolve.
+          loop: "{{ lemonade_aliases | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
+
+        # A silent image move already cost this fleet 33% of a profile's
+        # decode once; both the `latest` and `vX.Y.Z` tags move.
+        - name: "Assert the Lemonade image is pinned by digest"
+          ansible.builtin.assert:
+            that:
+              - "'@sha256:' in lemonade_image"
+            fail_msg: "lemonade_image must be pinned by digest, not by tag."
+
+        # systemd cannot express Conflicts= between these units, so the
+        # guard has to live in the play. Without it both stacks claim the
+        # iGPU and the second one runs from host memory at a third speed.
+        # vllm-server counts: it owns /dev/dri and /dev/kfd too, and its GTT
+        # is still held during the drain check.
+        - name: "Assert every GPU-owning unit is in the conflict list"
+          ansible.builtin.assert:
+            that:
+              - "'llamacpp-server' in lemonade_stop_conflicting_services"
+              - "'vllm-server' in lemonade_stop_conflicting_services"
+            fail_msg: >-
+              Every unit that can claim /dev/kfd must be stopped before
+              Lemonade takes the GPU — nothing in systemd does it for us.
+
+        # Stopping is not enough on its own: a Quadlet unit deployed normally
+        # stays WantedBy=default.target, so the next login or reboot starts
+        # it alongside Lemonade and recreates the contention.
+        - name: "Read the lemonade_service conflict-handling task"
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/lemonade_service/tasks/main.yml"
+          register: _lemon_tasks
+
+        - name: "Read the lemonade_service Quadlet template"
+          ansible.builtin.slurp:
+            src: >-
+              {{ playbook_dir }}/../../roles/lemonade_service/templates/lemonade-server.container.j2
+          register: _lemon_quadlet
+
+        # `systemctl disable` is NOT the mechanism: Quadlet regenerates its
+        # units from [Install] on every daemon-reload and `is-enabled` reports
+        # `generated`, so a disable call is a silent no-op. Conflicts= in the
+        # unit is what actually survives a reboot — and it is expressible
+        # because both stacks are user-scoped.
+        - name: "Assert the conflict guard survives a reboot"
+          ansible.builtin.assert:
+            that:
+              - "'Conflicts=' in (_lemon_quadlet.content | b64decode)"
+              # Match a real YAML directive, not the phrase inside a comment.
+              - >-
+                (_lemon_tasks.content | b64decode)
+                | regex_search('(?m)^\\s+enabled: false\\s*$') is none
+            fail_msg: >-
+              The Quadlet must carry Conflicts= for every unit in
+              lemonade_stop_conflicting_services, and must NOT rely on
+              `enabled: false`, which is a no-op against a generated unit and
+              reads like a fix while changing nothing.
+
+        # `lemonade_enabled: false` must not deploy anything. The template
+        # task notifies the restart handler, and the handler flush that
+        # follows would start the server the switch was meant to keep down.
+        - name: "Assert the Quadlet template honours lemonade_enabled"
+          ansible.builtin.assert:
+            that:
+              - >-
+                (_lemon_tasks.content | b64decode)
+                | regex_search('Deploy Lemonade Quadlet container unit file(.|\n)*?when: lemonade_enabled')
+                is not none
+            fail_msg: >-
+              The Quadlet template task must be guarded by lemonade_enabled.
+              Unguarded, it writes the unit and notifies the restart handler,
+              and the flush starts the service despite the start task being
+              skipped.
+
+        # Two containers read this tree. `Z` is a PRIVATE relabel and would
+        # hand the MCS categories to whichever mounted last, locking the
+        # other out; no relabel at all fails on a host that has only ever run
+        # lemonade.yml, where ~/models is still user_home_t.
+        - name: "Read both Quadlet templates"
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          register: _quadlets
+          loop:
+            - "{{ playbook_dir }}/../../roles/lemonade_service/templates/lemonade-server.container.j2"
+            - "{{ playbook_dir }}/../../roles/llamacpp_service/templates/llamacpp-server.container.j2"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: "Assert the shared model mount uses a shared SELinux relabel"
+          ansible.builtin.assert:
+            that:
+              # No uppercase (private) relabel anywhere in the volume lines...
+              - >-
+                (item.content | b64decode)
+                | regex_search('(?m)^Volume=.*[:,]Z$') is none
+              # ...and the model mount carries a lowercase (shared) one.
+              # Rendered forms differ: `/models:z` here, `/models:ro,z` there.
+              - >-
+                (item.content | b64decode)
+                | regex_search('(?m)^Volume=.*models.*[:,]z$') is not none
+            fail_msg: >-
+              {{ item.item | basename }} must relabel the shared model tree
+              with lowercase `z`. `Z` is private and locks the other stack
+              out; omitting it entirely is denied under SELinux on a host
+              where llamacpp_service has never run.
+          loop: "{{ _quadlets.results }}"
+          loop_control:
+            label: "{{ item.item | basename }}"
+
+        # Leaving Lemonade up after `mise run uninstall` is worse than
+        # leaving a llama.cpp profile up: its API is unauthenticated by
+        # default and binds 0.0.0.0.
+        - name: "Read the uninstall playbook"
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../playbooks/uninstall.yml"
+          register: _uninstall
+
+        - name: "Assert uninstall removes the Lemonade unit, container and volumes"
+          ansible.builtin.assert:
+            that:
+              - "'lemonade-server.container' in (_uninstall.content | b64decode)"
+              - "'lemonade-cache' in (_uninstall.content | b64decode)"
+            fail_msg: >-
+              playbooks/uninstall.yml must tear Lemonade down. Otherwise
+              `mise run uninstall` leaves an unauthenticated API bound to
+              0.0.0.0 and a GPU workload running.
+
+    - name: "Test Lemonade is documented everywhere it must be"
+      block:
+        - name: "Read the docs that must mention Lemonade"
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          register: _lemon_docs
+          loop:
+            - "{{ playbook_dir }}/../../../../../README.md"
+            - "{{ playbook_dir }}/../../../../../mise.toml"
+            - "{{ playbook_dir }}/../../docs/GETTING_STARTED.md"
+            - "{{ playbook_dir }}/../../docs/VARIABLES.md"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: "Assert Lemonade appears in README, mise.toml, GETTING_STARTED and VARIABLES"
+          ansible.builtin.assert:
+            that:
+              - "'lemonade' in (item.content | b64decode | lower)"
+            fail_msg: >-
+              Lemonade is missing from {{ item.item | basename }}. A second
+              inference stack that is not documented is how operators end up
+              running two engines against one GPU.
+          loop: "{{ _lemon_docs.results }}"
+          loop_control:
+            label: "{{ item.item | basename }}"

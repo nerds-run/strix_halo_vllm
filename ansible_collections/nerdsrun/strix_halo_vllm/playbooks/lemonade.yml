@@ -1,0 +1,18 @@
+---
+- name: Deploy Lemonade Server on AMD Strix Halo
+  hosts: all
+  gather_facts: true
+
+  roles:
+    # Lemonade drives the iGPU through ROCm, so the same hardware gates and
+    # the same amdgpu perf-level pinning that llamacpp.yml applies are needed
+    # here — DVFS throttling under compute is backend-agnostic.
+    - role: nerdsrun.strix_halo_vllm.host_prereqs
+      tags:
+        - prereqs
+    - role: nerdsrun.strix_halo_vllm.gpu_tuning
+      tags:
+        - gpu
+    - role: nerdsrun.strix_halo_vllm.lemonade_service
+      tags:
+        - lemonade

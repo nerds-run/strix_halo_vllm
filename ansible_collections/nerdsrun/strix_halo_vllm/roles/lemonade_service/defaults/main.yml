@@ -1,0 +1,172 @@
+---
+# ==========================================================================
+# lemonade_service - Lemonade Server (AMD) as a rootless Podman Quadlet
+# ==========================================================================
+# Lemonade is a model *router*, not a single-model server: one service loads
+# and evicts models on demand across several inference engines. That is the
+# opposite of llamacpp_service, where one systemd unit serves exactly one
+# GGUF. Both can be installed; only one can hold the GPU at a time, which is
+# why this role stops the conflicting unit rather than assuming it is down.
+
+lemonade_enabled: true
+lemonade_container_name: lemonade-server
+
+# Pinned by digest, same discipline as llamacpp_image. The `latest` and
+# `vX.Y.Z` tags both move; a silent image move already cost this fleet 33% of
+# a profile's decode once. This digest is the linux/amd64 manifest of v11.8.0.
+lemonade_version: "11.8.0"
+lemonade_image: >-
+  ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc210afc282aea5c23bc3af5674d991239d9620d46cdd4ccafd16f7375f
+
+lemonade_host: "0.0.0.0"
+lemonade_port: 13305
+
+# Optional bearer token for the OpenAI-compatible API. Empty disables auth.
+#
+# SECURITY: with lemonade_host 0.0.0.0 and no key, everything on the LAN can
+# reach the *control* endpoints (/internal/shutdown, /internal/config), not
+# just inference. Lemonade logs a warning at startup when bound to a
+# non-loopback host without this set. Set it on any network you do not fully
+# trust; LEMONADE_ADMIN_API_KEY alone protects /internal/* but leaves /api,
+# /v0 and /v1 open.
+lemonade_api_key: ""
+
+# Browser origins allowed to call the API. Loopback (localhost, 127.0.0.1,
+# [::1]) and desktop schemes (file://, vscode-webview:// ...) are always
+# permitted; every other origin is rejected with a 403.
+#
+# This bites the moment anyone opens the bundled web UI over the LAN rather
+# than on the box itself: the page loads (GET / is 200) but every
+# POST /api/v1/chat/completions returns 403, because the browser sends
+# `Origin: http://<host>:13305` and that is not loopback. curl is unaffected —
+# non-browser clients send no Origin header at all — so the endpoint looks
+# healthy from the command line while the UI is dead. The default below
+# derives the box's own LAN origin so the shipped UI works as served.
+#
+# `*` allows any origin and is a genuinely bad idea without lemonade_api_key:
+# it lets any website a user visits drive this server from their browser.
+lemonade_allowed_origins:
+  - "http://{{ ansible_host | default(ansible_default_ipv4.address | default('127.0.0.1')) }}:{{ lemonade_port }}"
+
+# ROCm needs the KFD compute device, not just the render node — and the
+# container process must be in the host's render/video groups to open them.
+# The GIDs are resolved at run time (getent); Fedora's are 105/39 but that is
+# not guaranteed across hosts.
+lemonade_devices:
+  - /dev/kfd
+  - /dev/dri
+lemonade_supplementary_groups:
+  - render
+  - video
+
+# --ipc=host is REQUIRED for ROCm under rootless Podman and the failure
+# without it is deeply misleading: the HSA runtime cannot map its
+# shared-memory segments and model load dies with "Memory in use". Measured
+# necessary AND sufficient here; seccomp=unconfined does not substitute.
+# See docs/TROUBLESHOOTING.md.
+lemonade_podman_args:
+  - --ipc=host
+
+# Named volumes, matching the layout upstream documents. Models land in the
+# Podman volume store, NOT in llamacpp_model_dir — Lemonade uses the HF cache
+# layout and cannot share the flat --local-dir tree llamacpp_service builds,
+# so a model used by both stacks is stored twice.
+lemonade_volumes:
+  lemonade-cache: /opt/lemonade/.cache/huggingface
+  lemonade-llama: /opt/lemonade/llama
+  lemonade-data: /opt/lemonade/.cache/lemonade
+  lemonade-config: /opt/lemonade/.config/lemonade
+
+# Expose the llamacpp_service GGUF tree to Lemonade, read-only. Lemonade
+# stores its own downloads in HF cache layout and cannot read the flat
+# --local-dir tree llamacpp_service builds, so without this a model served by
+# both stacks is on disk twice. Mounted models appear as `extra.NAME` and cost
+# nothing to add. Empty string disables the mount.
+# A leading ~ is resolved against the MANAGED host's home in tasks/main.yml,
+# not with expanduser — that runs on the controller and would bake the
+# controller's home into the remote unit whenever the two users differ.
+lemonade_extra_models_host_dir: "{{ llamacpp_model_dir | default('~/models') }}"
+lemonade_extra_models_mount: "/models"
+
+# Backend binaries are fetched at run time, so the image itself is
+# GPU-agnostic and there is no rocm/vulkan image variant to choose. Installing
+# a backend downloads it plus its runtime: llamacpp:rocm pulls llama.cpp
+# b10470 and the TheRock ROCm 7.14.0 gfx1151 runtime (~1.8 GB).
+# ds4 (DwarfStar) is deliberately NOT installed. It is the only engine that
+# reads antirez's asymmetric IQ2XXS quant, but measured head-to-head on this
+# box it loses to llama.cpp/ROCm on every axis: 12.8 tok/s against 17.08, a
+# coarser quant (~2.3 bpw vs 2.90 bpw verified 90.8% token-identical against
+# the full-precision API), forced SSD streaming that cannot be turned off, and
+# broken telemetry (ttft=0, tps=0). See docs/PERFORMANCE.md for the numbers.
+# Re-add 'ds4:rocm' here and the IQ2XXS model below if upstream gates
+# --ssd-streaming on available GTT.
+lemonade_backends:
+  - llamacpp:rocm
+
+# Applied with `lemonade config set k=v`, then the service is restarted —
+# model filtering is evaluated at startup, so a config change is invisible
+# until it is.
+#
+# enable_dgpu_gtt is MANDATORY on Strix Halo and the reason is non-obvious.
+# Lemonade sizes a device's memory pool from the JSON key it enumerated the
+# GPU under: only `amd_igpu` gets MemoryAllocBehavior::Largest (max of vram
+# and GTT). This APU enumerates as `amd_gpu`, so it falls to ::Hardware,
+# which returns vram_gb alone — 0.5 GB, the BIOS carveout, ignoring the
+# 124 GB GTT the whole fleet actually runs on. Any model with a resident
+# working set above 0.5 GB is then hidden as "too large for this device".
+# The visible symptom is a model silently absent from `lemonade list` with no
+# error anywhere; enable_dgpu_gtt switches the calculation to ::Unified
+# (vram + GTT) and it appears. Only streaming backends (ds4) are affected —
+# llamacpp models stay visible either way, which makes this look like a ds4
+# bug rather than a device-detection one.
+lemonade_config:
+  enable_dgpu_gtt: true
+  llamacpp.backend: rocm
+  extra_models_dir: "{{ lemonade_extra_models_mount if lemonade_extra_models_host_dir | length > 0 else '' }}"
+
+# Models Lemonade downloads itself. Names must match `lemonade list` exactly.
+#
+# Qwen3.8-27B is deliberately downloaded even though ~/models already holds
+# the same GGUF and it is visible via extra_models_dir. The catalog entry is
+# not equivalent to the bare file: it declares the `mmproj` sidecar (vision)
+# and carries the `mtp` label that switches on speculative decoding. That is
+# where 26.95 tok/s at a 7.7K prompt comes from, against 12.3 for the same
+# weights on the Vulkan `qwen38` profile. An auto-discovered extra.* entry is
+# a bare GGUF with neither. ~17 GB is the price of vision plus ~2x decode.
+lemonade_models:
+  - Qwen3.8-27B-GGUF
+
+# Models that must resolve in the catalog but are NOT downloaded here —
+# they come from extra_models_dir, already on disk for llamacpp_service.
+# Deploy fails if one is missing, which is the signal that the mount or the
+# memory-pool filter is wrong rather than the name.
+lemonade_required_models:
+  - Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF
+
+# Friendly aliases for the auto-generated extra.* names, which are derived
+# from the directory and are unusable in a chat UI.
+lemonade_aliases:
+  deepseek-v4: Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF
+
+# Every other GPU consumer in this collection. All are user-scoped Quadlet
+# units with no Conflicts= between them, so nothing stops two from claiming
+# the iGPU at once — the guard has to live in the play. vllm-server belongs
+# here as much as llamacpp-server: it owns /dev/dri and /dev/kfd too, and its
+# GTT would still be held during the drain check below.
+#
+# Each name here becomes a `Conflicts=<name>.service` line in the Lemonade
+# Quadlet AND is stopped at deploy time. Both are needed: stopping releases
+# GTT now, Conflicts= is what survives a reboot. Note that `systemctl disable`
+# is NOT the answer for these — Quadlet regenerates its units from [Install]
+# on every daemon-reload, `is-enabled` reports `generated`, and a disable call
+# is a silent no-op.
+lemonade_stop_conflicting_services:
+  - llamacpp-server
+  - vllm-server
+
+# Seconds to wait for the driver to release GTT after stopping a conflicting
+# unit. Starting a large load against stale GTT is what triggers the autofit
+# failure documented in docs/TROUBLESHOOTING.md.
+lemonade_gtt_drain_timeout: 120
+
+firewall_open_lemonade_port: false

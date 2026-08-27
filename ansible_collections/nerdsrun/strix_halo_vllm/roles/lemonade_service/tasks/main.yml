@@ -1,0 +1,412 @@
+---
+# ==========================================================================
+# lemonade_service - Lemonade Server as a systemd-managed Podman Quadlet
+# ==========================================================================
+
+# ------------------------------------------------------------------
+# 1. Resolve host group IDs for GPU device access
+# ------------------------------------------------------------------
+# ROCm opens /dev/kfd through the render group. Rootless Podman maps the
+# container process into the host's supplementary groups only when they are
+# named explicitly, and the GIDs are not stable across hosts.
+- name: Resolve GIDs of the GPU device groups
+  ansible.builtin.getent:
+    database: group
+    key: "{{ item }}"
+  loop: "{{ lemonade_supplementary_groups }}"
+  register: lemonade_service_group_lookup
+  tags:
+    - lemonade
+
+# getent returns the fields AFTER the group name — [password, gid, userlist] —
+# so the GID is index 1. Index 0 is the password placeholder 'x', which renders
+# as `GroupAdd=x`: podman cannot resolve it, and the failure surfaces as a unit
+# start error rather than anything pointing at this expression.
+- name: Collect resolved group IDs
+  ansible.builtin.set_fact:
+    lemonade_service_group_ids: >-
+      {{ lemonade_service_group_lookup.results
+         | map(attribute='ansible_facts.getent_group')
+         | map('dict2items') | map('first') | map(attribute='value')
+         | map(attribute=1) | list }}
+  tags:
+    - lemonade
+
+- name: Assert the GPU group IDs resolved to numbers
+  ansible.builtin.assert:
+    that:
+      - lemonade_service_group_ids | length == lemonade_supplementary_groups | length
+      - lemonade_service_group_ids | select('match', '^[0-9]+$') | list | length
+        == lemonade_supplementary_groups | length
+    fail_msg: >-
+      Resolved GPU group IDs are not numeric: {{ lemonade_service_group_ids }}.
+      A non-numeric value here renders GroupAdd= with a name podman cannot
+      resolve, and ROCm then fails to open /dev/kfd.
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 2. Release the GPU from any conflicting stack
+# ------------------------------------------------------------------
+# llamacpp_service and lemonade_service are both user-scoped but independent
+# units, so systemd has no Conflicts= relationship to lean on. Two engines
+# claiming the iGPU at once do not fail cleanly — the second one OOMs or
+# silently falls back to host memory at a third of the throughput.
+# Stop them now so GTT drains before Lemonade loads; the Conflicts= lines in
+# the Quadlet template are what keep them down across reboots. `enabled: false`
+# is deliberately NOT set: Quadlet units are generated, so systemctl cannot
+# persistently disable them and the call is a no-op that reads like a fix.
+- name: Stop conflicting inference services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    scope: user
+  become: false
+  loop: "{{ lemonade_stop_conflicting_services }}"
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# A Quadlet unit that has been stopped mid-restart lands in `failed`, and
+# systemd then refuses to start it again until the state is cleared. Doing it
+# here means a later `mise run deploy:llamacpp:*` is not mysteriously blocked.
+- name: Clear failed state on conflicting services  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: "systemctl --user reset-failed {{ item }}"
+  become: false
+  loop: "{{ lemonade_stop_conflicting_services }}"
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# The driver frees GTT after the process exits, not when systemd returns, so
+# poll rather than sleep. `mem_info_gtt_used` is the diagnostic — `free` shows
+# nothing useful here because GTT is not accounted as process memory.
+- name: Wait for the driver to release GTT
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1
+    executable: /bin/bash
+  become: false
+  register: lemonade_service_gtt
+  until: (lemonade_service_gtt.stdout | default('0') | int) < 2147483648
+  retries: "{{ (lemonade_gtt_drain_timeout | int / 5) | int }}"
+  delay: 5
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 3. Resolve paths on the managed host, then pull the image
+# ------------------------------------------------------------------
+# expanduser would run on the CONTROLLER, so a remote host whose user or home
+# differs would get the controller's path baked into its Quadlet — binding a
+# directory that does not exist there, and silently losing every mounted model.
+- name: Resolve the shared model directory on the managed host
+  ansible.builtin.set_fact:
+    lemonade_service_extra_dir: >-
+      {{ lemonade_extra_models_host_dir | regex_replace('^~', ansible_user_dir) }}
+  when: lemonade_extra_models_host_dir | length > 0
+  tags:
+    - lemonade
+
+- name: Pull Lemonade Server container image
+  ansible.builtin.command:
+    cmd: "podman pull {{ lemonade_image }}"
+  become: false
+  register: lemonade_service_image_pull
+  changed_when: "'Writing' in lemonade_service_image_pull.stdout or 'Storing' in lemonade_service_image_pull.stdout"
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 4. Deploy Quadlet unit
+# ------------------------------------------------------------------
+- name: Ensure systemd user Quadlet directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_user_dir }}/.config/containers/systemd"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - lemonade
+
+- name: Deploy Lemonade Quadlet container unit file
+  ansible.builtin.template:
+    src: lemonade-server.container.j2
+    dest: "{{ ansible_user_dir }}/.config/containers/systemd/{{ lemonade_container_name }}.container"
+    mode: "0600"
+  become: false
+  no_log: "{{ lemonade_api_key | length > 0 }}"
+  # Without this guard `lemonade_enabled: false` still writes the Quadlet and
+  # notifies the restart handler, and the flush below then starts the server
+  # that the documented disable switch was supposed to keep down.
+  when: lemonade_enabled | bool
+  notify:
+    - Reload systemd user daemon
+    - Restart lemonade service
+  tags:
+    - lemonade
+
+- name: Flush handlers to apply Quadlet changes
+  ansible.builtin.meta: flush_handlers
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 5. Start and wait for the API
+# ------------------------------------------------------------------
+- name: Enable and start Lemonade service
+  ansible.builtin.systemd:
+    name: "{{ lemonade_container_name }}"
+    state: started
+    enabled: true
+    scope: user
+  become: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# localhost resolves to IPv6 ::1 on Fedora; use 127.0.0.1 explicitly.
+- name: Wait for the Lemonade API to become available
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
+    method: GET
+    status_code: 200
+  become: false
+  register: lemonade_service_health
+  until: lemonade_service_health.status == 200
+  retries: 40
+  delay: 5
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 6. Apply server configuration
+# ------------------------------------------------------------------
+# config.json holds only the overrides, so diffing the file before and after
+# is an exact change signal — cheaper and more honest than parsing the
+# human-readable `lemonade config` table, whose nested sections do not map
+# back to the dotted keys `config set` accepts.
+- name: Read current Lemonade configuration
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      cat /opt/lemonade/.config/lemonade/config.json
+  become: false
+  register: lemonade_service_cfg_before
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Apply Lemonade configuration keys
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade config set {{ item.key }}={{ item.value | lower if item.value is boolean else item.value }}
+  become: false
+  loop: "{{ lemonade_config | dict2items }}"
+  changed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Re-read Lemonade configuration
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      cat /opt/lemonade/.config/lemonade/config.json
+  become: false
+  register: lemonade_service_cfg_after
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# Model filtering is evaluated once at startup, so a config change is
+# invisible until the server restarts. This is the step that makes
+# enable_dgpu_gtt actually take effect.
+- name: Restart Lemonade to apply configuration changes
+  ansible.builtin.systemd:
+    name: "{{ lemonade_container_name }}"
+    state: restarted
+    scope: user
+  become: false
+  when:
+    - lemonade_enabled | bool
+    - lemonade_service_cfg_before.stdout | default('') != lemonade_service_cfg_after.stdout | default('')
+  tags:
+    - lemonade
+
+- name: Wait for the Lemonade API after configuration restart
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
+    method: GET
+    status_code: 200
+  become: false
+  register: lemonade_service_health_post
+  until: lemonade_service_health_post.status == 200
+  retries: 40
+  delay: 5
+  when:
+    - lemonade_enabled | bool
+    - lemonade_service_cfg_before.stdout | default('') != lemonade_service_cfg_after.stdout | default('')
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 7. Install inference backends
+# ------------------------------------------------------------------
+# Re-installing an already-present backend is a safe no-op, but it is not
+# silent: the command reports success either way. The reliable change signal
+# is whether it printed a `[n/m] <asset>` download line.
+- name: Install Lemonade inference backends
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade backends install {{ item }}
+  become: false
+  loop: "{{ lemonade_backends }}"
+  register: lemonade_service_backends
+  changed_when: "'[1/' in lemonade_service_backends.stdout"
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 8. Download models
+# ------------------------------------------------------------------
+- name: List already-downloaded models
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade list --downloaded
+  become: false
+  register: lemonade_service_downloaded
+  changed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# A model absent from `lemonade list` is not necessarily unavailable — it may
+# be filtered out by the memory-pool check (see enable_dgpu_gtt in defaults).
+# Fail loudly here rather than letting `pull` fail with a name error, because
+# the two look identical from the outside.
+- name: List the full Lemonade catalog
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade list *
+  become: false
+  register: lemonade_service_catalog
+  changed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Assert every requested model is visible in the catalog
+  ansible.builtin.assert:
+    that:
+      - item in (lemonade_service_catalog.stdout | default(''))
+    fail_msg: >-
+      '{{ item }}' is not in `lemonade list`. Two causes look identical from
+      outside. If it is a lemonade_required_models entry, the
+      extra_models_dir mount is wrong — check that
+      {{ lemonade_extra_models_mount }} is populated inside the container.
+      Otherwise the memory-pool filter has hidden it: on gfx1151 Lemonade
+      reads the pool as vram_gb (0.5 GB) unless enable_dgpu_gtt is set. See
+      docs/TROUBLESHOOTING.md.
+  loop: "{{ lemonade_models + lemonade_required_models }}"
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# The extra.* names are derived from the directory that holds the GGUF, so
+# they are long and carry the uploader's handle. Alias them to the profile
+# name the rest of this collection uses.
+- name: Bind friendly aliases for auto-discovered models
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade alias add {{ item.key }} {{ item.value }}
+  become: false
+  loop: "{{ lemonade_aliases | dict2items }}"
+  register: lemonade_service_alias
+  changed_when: "'already' not in (lemonade_service_alias.stdout | default('') | lower)"
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Download Lemonade models
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade pull {{ item }}
+  become: false
+  loop: "{{ lemonade_models }}"
+  register: lemonade_service_pull
+  changed_when: "'already' not in (lemonade_service_pull.stdout | default(''))"
+  when:
+    - lemonade_enabled | bool
+    - item not in (lemonade_service_downloaded.stdout | default(''))
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 9. Firewall
+# ------------------------------------------------------------------
+- name: Open Lemonade port in firewall
+  ansible.posix.firewalld:
+    port: "{{ lemonade_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  become: true
+  when:
+    - firewall_open_lemonade_port | bool
+    - lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 10. Display info
+# ------------------------------------------------------------------
+- name: Display Lemonade service information
+  ansible.builtin.debug:
+    msg: |
+      Lemonade Server {{ lemonade_version }} is running as a systemd user service.
+
+      Service    : {{ lemonade_container_name }}
+      Image      : {{ lemonade_image }}
+      API        : http://{{ lemonade_host }}:{{ lemonade_port }}/api/v1
+      Web UI     : http://127.0.0.1:{{ lemonade_port }}
+      Backends   : {{ lemonade_backends | join(', ') }}
+      Downloaded : {{ lemonade_models | join(', ') }}
+      From disk  : {{ lemonade_required_models | join(', ') }}
+      Aliases    : {{ lemonade_aliases | dict2items | map(attribute='key') | join(', ') }}
+
+      Lemonade routes between models on demand — there is no per-model unit.
+      Only one inference stack can hold the GPU: this role stopped
+      {{ lemonade_stop_conflicting_services | join(', ') }} to take it.
+
+      Manage with:
+        systemctl --user status {{ lemonade_container_name }}
+        journalctl --user -u {{ lemonade_container_name }} -f
+        podman exec {{ lemonade_container_name }} lemonade list
+
+      Test:
+        curl http://127.0.0.1:{{ lemonade_port }}/api/v1/models
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade

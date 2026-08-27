@@ -549,3 +549,105 @@ mise run uninstall
 ansible-playbook ansible_collections/nerdsrun/strix_halo_vllm/playbooks/uninstall.yml \
   -i inventory -e strix_halo_uninstall_purge_cache=true
 ```
+
+---
+
+## Lemonade Server
+
+### A model is missing from `lemonade list` and there is no error anywhere
+
+**Symptom.** `lemonade list` shows the llama.cpp models but not `DeepSeek-V4-Flash-IQ2XXS-DS4`. `GET /api/v1/models` does not list it either. `lemonade pull DeepSeek-V4-Flash-IQ2XXS-DS4` fails as if the name were wrong. Nothing appears in `journalctl --user -u lemonade-server`. The `ds4:rocm` backend reports `installed`, and the entry is present in `/opt/lemonade/resources/server_models.json`.
+
+**Cause.** Lemonade sizes a device's memory pool from the JSON key it enumerated the GPU under. Only `amd_igpu` gets `MemoryAllocBehavior::Largest` (`max(vram_gb, virtual_mem_gb)`); this APU enumerates as `amd_gpu`, so it falls to `::Hardware`, which returns `vram_gb` — **0.5 GB**, the BIOS carveout. The 124 GB of GTT the fleet actually uses is reported as `virtual_mem_gb` and never consulted. Streaming backends (`ds4`) are then checked with `min_resident_gb` (16 GB for this model) against a 0.5 GB pool and filtered out.
+
+Confirm what the server detected:
+
+```bash
+curl -s http://127.0.0.1:13305/api/v1/system-info | grep -E "vram_gb|virtual_mem_gb"
+#   "virtual_mem_gb": 124.0,
+#   "vram_gb": 0.5          <-- this is what the filter uses
+```
+
+**Fix.**
+
+```bash
+podman exec lemonade-server lemonade config set enable_dgpu_gtt=true
+systemctl --user restart lemonade-server     # filtering is evaluated at startup only
+```
+
+The restart is not optional — the model list is built once when the server comes up, so the config change is invisible until it restarts. `lemonade_service` does this automatically and only when `config.json` actually changed.
+
+Do **not** reach for `disable_model_filtering: true`. It also makes the model appear, but by disabling every size check rather than fixing the arithmetic.
+
+### `lemonade-server-11.8.0-fc43.x86_64.rpm` returns 404
+
+The v11.8.0 release notes link to Fedora, Debian and macOS packages that **are not attached to the release**. v11.7.0 published 13 assets; v11.8.0 published 6 — only the Windows MSIs and the embeddable tarballs. The Linux packages were evidently withdrawn after the configuration-data-loss report that opens those release notes.
+
+Use the container image instead, which is published and is what `lemonade_service` deploys:
+
+```bash
+podman pull ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc210afc282aea5c23bc3af5674d991239d9620d46cdd4ccafd16f7375f
+```
+
+The data-loss warning concerns migrating pre-existing state from `.cache` to `.config` on Ubuntu and Arch; a fresh container install has nothing to migrate. Note also that 11.8.0 is the first release with `ds4`, so downgrading to 11.7.0 to get an RPM would cost you DeepSeek-V4-Flash entirely.
+
+### A model under `~/models` does not show up in `lemonade list`
+
+Models on disk reach Lemonade through `extra_models_dir`, which requires the bind mount to be present and populated *inside* the container:
+
+```bash
+podman exec lemonade-server ls /models | head
+podman exec lemonade-server sh -c 'cat /opt/lemonade/.config/lemonade/config.json'   # extra_models_dir must be "/models"
+```
+
+If `/models` is empty the Quadlet lost its `Volume=` line; re-run `mise run deploy:lemonade`. If it is populated but the model is still absent, the memory-pool filter is the other cause — see the `enable_dgpu_gtt` entry above.
+
+Discovered names are derived from the **directory**, not the file, so `~/models/Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF/` registers under that whole string. Use `lemonade_aliases` to bind something usable. Precedence is registered > imported > built-in, so a downloaded model with the same bare name shadows a mounted one; `extra.NAME` addresses the mounted copy explicitly.
+
+### `lemonade pull DeepSeek-V4-Flash-DS4` fails with an unknown model
+
+Two separate problems. The name in [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) is not the name that shipped — the 11.8.0 catalog registers `DeepSeek-V4-Flash-IQ2XXS-DS4`. But **this deployment no longer installs `ds4` at all**: measured head-to-head it lost to `llamacpp:rocm` on the same model (12.8 vs 17.08 tok/s, on a coarser quant, with broken telemetry), so the backend was uninstalled and the 81 GB download deleted. Use `deepseek-v4`, which serves the better quant already on disk. See [PERFORMANCE](PERFORMANCE.md#lemonade-server-1180).
+
+### Throughput collapses after deploying Lemonade, or a model OOMs on load
+
+Two inference stacks are holding the iGPU. `llamacpp-server` and `lemonade-server` are separate user units with no `Conflicts=` between them — systemd will happily run both, and the second one to allocate either OOMs or silently falls back to host memory at roughly a third of the expected rate.
+
+```bash
+systemctl --user status llamacpp-server lemonade-server
+cat /sys/class/drm/card*/device/mem_info_gtt_used     # the real diagnostic, not `free`
+```
+
+This should no longer be reachable: the Lemonade Quadlet declares `Conflicts=` against `llamacpp-server.service` and `vllm-server.service`, so systemd stops one when the other starts, in both directions and across reboots. If you do see both active, the Quadlet is stale — re-run `mise run deploy:lemonade` and check the unit:
+
+```bash
+systemctl --user show lemonade-server -p Conflicts
+```
+
+To switch stacks by hand:
+
+```bash
+systemctl --user stop lemonade-server
+```
+
+### The server looks hung — connections time out and nothing responds
+
+Check whether it is *busy* rather than hung. Lemonade runs `max_loaded_models: 1`, so a single long generation serializes everything behind it, and on `ds4` at ~12 tok/s a genuinely long answer (a page of code, say) takes **tens of minutes**. Meanwhile every other client — including `lemonade load` — sits in the queue and eventually times out.
+
+```bash
+podman logs --tail 5 lemonade-server     # a rising `gen=N ... t/s` means it is generating
+curl -s http://127.0.0.1:13305/api/v1/health | grep -o '"is_busy":[a-z]*'
+```
+
+A rising `gen=` counter means the server is working normally; restarting discards real work. Only restart if `gen=` is static and `is_busy` stays `true`.
+
+This also invalidates client-side timing: never benchmark against a server that is serving someone else, because a queued request inherits the wait of whatever is ahead of it.
+
+### Streaming responses arrive all at once, and the token counters read zero
+
+Both are symptoms of the experimental `ds4` backend, which this deployment no longer installs. Its deltas arrive in one burst when generation completes rather than incrementally, so Lemonade never observes a first token and logs `ttft=0.00s, tps=0.00` — the UI's rate counters follow. The API `usage` block stays correct throughout.
+
+On `llamacpp:rocm` both work normally (`ttft=0.32-0.50s` measured). If you see this, check whether something reinstalled `ds4:rocm`:
+
+```bash
+podman exec lemonade-server lemonade backends --all | grep ds4
+```

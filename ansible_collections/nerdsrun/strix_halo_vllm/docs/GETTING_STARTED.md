@@ -187,6 +187,11 @@ mise run deploy:llamacpp:qwen38   # Qwen3.8-27B dense VLM (12.3 tok/s, vision + 
 mise run deploy:llamacpp:qwen38-fp4  # Qwen3.8-27B ROCmFP4 + MTP (29.1 tok/s on code, no vision)
 mise run deploy:llamacpp:deepseek-v4 # DeepSeek-V4-Flash-0731 284B (17.1 tok/s, full 1M ctx)
 
+# --- Lemonade Server (multi-model router, ROCm, port 13305) ---
+mise run deploy:lemonade          # Qwen3.8-27B (18.5-27 tok/s, vision + MTP) and deepseek-v4 (17.1),
+                                  # both on llama.cpp/ROCm. Mounts ~/models, so only Qwen is downloaded.
+                                  # Stops llamacpp-server first: only one stack can hold the GPU
+
 # --- vLLM (ROCm) ---
 mise run deploy:toolbox           # Interactive toolbox
 mise run deploy:service           # Persistent systemd service
