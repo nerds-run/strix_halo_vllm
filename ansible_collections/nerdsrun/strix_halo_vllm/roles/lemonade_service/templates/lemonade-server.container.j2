@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+# Podman Quadlet container unit for Lemonade Server on AMD Strix Halo (gfx1151)
+# Lemonade routes across engines; llamacpp:rocm and ds4:rocm are installed into
+# the lemonade-data volume at deploy time, not baked into the image.
+
+[Unit]
+Description=Lemonade Server {{ lemonade_version }} (model router / Strix Halo gfx1151)
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image={{ lemonade_image }}
+ContainerName={{ lemonade_container_name }}
+{% for dev in lemonade_devices %}
+AddDevice={{ dev }}
+{% endfor %}
+{% for gid in lemonade_service_group_ids %}
+GroupAdd={{ gid }}
+{% endfor %}
+PublishPort={{ lemonade_port }}:13305
+{% for vol, dest in lemonade_volumes.items() %}
+Volume={{ vol }}:{{ dest }}
+{% endfor %}
+{% if lemonade_podman_args | length > 0 %}
+PodmanArgs={{ lemonade_podman_args | join(' ') }}
+{% endif %}
+{% if lemonade_api_key | length > 0 %}
+Environment=LEMONADE_API_KEY={{ lemonade_api_key }}
+{% endif %}
+Exec=./lemond --host {{ lemonade_host }}
+
+[Service]
+Restart=on-failure
+# Backend install and a cold 81 GB model load both happen after the socket is
+# up, but a first start still has to unpack the image and bind four volumes.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

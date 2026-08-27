@@ -105,6 +105,43 @@ Both set `devices: ['/dev/dri', '/dev/kfd']` and `podman_args: ['--ipc=host']`, 
 | `llamacpp_api_key_value` | string | `"local-dev-key"` | API key value |
 | `llamacpp_container_name` | string | `"llamacpp-server"` | Container/service name |
 
+## Lemonade Server Variables
+
+Lemonade is a multi-model **router**, not a single-model server: one Quadlet unit loads and evicts models on demand across several engines. Deployed with `mise run deploy:lemonade` (playbook `lemonade.yml`), independent of `strix_halo_mode`.
+
+| Variable | Type | Default | Description |
+|---|---|---|---|
+| `lemonade_enabled` | bool | `true` | Deploy and start the service |
+| `lemonade_version` | string | `"11.8.0"` | Upstream version, used only in unit descriptions and output — the image digest is what actually pins it |
+| `lemonade_image` | string | `ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc2...` | Container image, **pinned by digest**. Both `latest` and `vX.Y.Z` move. There is no rocm/vulkan image variant: backend binaries are fetched at run time, so the image is GPU-agnostic |
+| `lemonade_container_name` | string | `"lemonade-server"` | Quadlet unit and container name |
+| `lemonade_host` | string | `"0.0.0.0"` | Bind address passed to `lemond`. Must be `0.0.0.0` for `PublishPort` to reach it. Note that in 11.8.0 `--host` became an *ephemeral* override that no longer persists to `config.json` |
+| `lemonade_port` | int | `13305` | Host port published to the container's 13305 |
+| `lemonade_api_key` | string | `""` | Bearer token for the OpenAI-compatible API, rendered as `LEMONADE_API_KEY`. Empty disables auth |
+| `lemonade_devices` | list | `['/dev/kfd', '/dev/dri']` | ROCm needs the KFD compute device, not just the render node |
+| `lemonade_supplementary_groups` | list | `['render', 'video']` | Host groups whose GIDs are resolved at run time and rendered as `GroupAdd=`. Rootless Podman only maps supplementary groups named explicitly, and the GIDs are not stable across hosts |
+| `lemonade_podman_args` | list | `['--ipc=host']` | `--ipc=host` is **mandatory** for ROCm under rootless Podman — measured necessary *and* sufficient; `seccomp=unconfined` does not substitute. Without it the HSA runtime cannot map its shared-memory segments and model load dies with a misleading "Memory in use" |
+| `lemonade_volumes` | dict | 4 named volumes | Volume name → container path. Models land in the Podman volume store in HuggingFace cache layout, **not** in `llamacpp_model_dir` — the two stacks cannot share a model file |
+| `lemonade_backends` | list | `['llamacpp:rocm', 'ds4:rocm']` | Installed with `lemonade backends install`. `llamacpp:rocm` pulls llama.cpp b10470 plus the TheRock ROCm 7.14.0 gfx1151 runtime (~1.8 GB); `ds4:rocm` pulls the pinned DwarfStar build b0001 |
+| `lemonade_config` | dict | `{enable_dgpu_gtt: true, llamacpp.backend: rocm}` | Applied with `lemonade config set k=v`. Dotted keys map to nested JSON. **`enable_dgpu_gtt` is mandatory here** — see below |
+| `lemonade_models` | list | `['Qwen3.8-27B-GGUF', 'DeepSeek-V4-Flash-IQ2XXS-DS4']` | Pulled after backends are installed. Names must match `lemonade list` exactly; the ds4 model is registered under its quant, and the bare `DeepSeek-V4-Flash-DS4` from the upstream PR was never shipped |
+| `lemonade_stop_conflicting_services` | list | `['llamacpp-server']` | User units stopped (and `reset-failed`) before Lemonade takes the GPU. systemd cannot express `Conflicts=` here, so the guard lives in the play |
+| `lemonade_gtt_drain_timeout` | int | `120` | Seconds to poll `mem_info_gtt_used` after stopping a conflicting unit. The driver frees GTT when the process exits, not when systemd returns |
+| `firewall_open_lemonade_port` | bool | `false` | Open `lemonade_port/tcp` in firewalld |
+
+### `enable_dgpu_gtt` — why a model silently disappears without it
+
+Lemonade decides whether a model fits by reading the device's memory pool, and it picks the sizing rule from the JSON key it enumerated the GPU under: only `amd_igpu` gets `MemoryAllocBehavior::Largest` (`max(vram_gb, virtual_mem_gb)`). Strix Halo enumerates as **`amd_gpu`**, so it falls through to `::Hardware`, which returns `vram_gb` alone — **0.5 GB**, the BIOS carveout — while the 124 GB of GTT this fleet actually runs on is `virtual_mem_gb` and is ignored.
+
+Any model whose resident working set exceeds 0.5 GB is then filtered out. `enable_dgpu_gtt: true` switches the calculation to `::Unified` (`vram + GTT`) and the model reappears.
+
+Two things make this hard to diagnose:
+
+- **There is no error.** The model is simply absent from `lemonade list` and from `GET /api/v1/models`. `lemonade pull` against the name then fails, which reads as a typo.
+- **Only *streaming* backends are affected.** The check applies to backends that read the model from disk on demand — `ds4` — using `min_resident_gb` as the working set. Every llama.cpp model stays visible either way, so the symptom presents as a ds4-specific problem rather than a device-detection one.
+
+`disable_model_filtering: true` also makes it appear, but by turning off every size check; `enable_dgpu_gtt` fixes the arithmetic instead and is the right key.
+
 ## Firewall Variables
 
 | Variable | Type | Default | Description |

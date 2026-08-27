@@ -78,6 +78,7 @@ mise run ui:up            # Open WebUI at http://localhost:3000
 | `service` | `strix_halo_mode: "service"` | vLLM/ROCm | Persistent vLLM server via systemd Quadlet (port 8000) |
 | `both` | `strix_halo_mode: "both"` | vLLM/ROCm | Deploy both simultaneously |
 | `llamacpp` | `strix_halo_mode: "llamacpp"` | llama.cpp/Vulkan | GGUF model server via systemd Quadlet (port 8080) |
+| `lemonade` | `mise run deploy:lemonade` | Lemonade (ROCm) | Multi-model **router** via systemd Quadlet (port 13305) — see [Lemonade](#lemonade-server-multi-model-router) |
 
 ### llama.cpp Model Profiles
 
@@ -121,6 +122,31 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 > **`deepseek` (still gated, and correctly so).** Same model family, but targeting the default **Vulkan** image, where `deepseek4` has no implementation. The gate was never a statement about the hardware — an earlier revision of this note said settling it "requires actually attempting a ~104 GB load", and that has now been done: the arch parses and places tensors fine on ROCm. So the answer is *use a different backend*, not *ungate this profile*. It stays gated to stop anyone downloading ~104 GB for a server that cannot load.
 >
 > Two findings from bringing `deepseek-v4` up are worth carrying: the **DSpark drafter is a net loss** here (the 10.15 GB drafter exceeds the ~4.7 GB the target reads per token — speculation works, at 0.82-0.84 acceptance, but cannot pay for its own weight), and **`--n-cpu-moe` costs 12%, not the 0.1% its card reports**. See [PERFORMANCE.md](ansible_collections/nerdsrun/strix_halo_vllm/docs/PERFORMANCE.md#deepseek-v4-flash-0731-deepseek-v4-profile).
+
+---
+
+## Lemonade Server (multi-model router)
+
+`mise run deploy:lemonade` deploys [Lemonade Server](https://lemonade-server.ai) **11.8.0** as a second, independent inference stack. It is not another llama.cpp profile — it is a *router*: one systemd unit that loads and evicts several models on demand across several engines, behind one OpenAI-compatible endpoint on port **13305**.
+
+| Model | Engine | Size | Why it is here |
+|---|---|---:|---|
+| `Qwen3.8-27B-GGUF` | llama.cpp / **ROCm** | 17.2 GB | Same UD-Q4_K_XL GGUF the `qwen38` profile serves, but on ROCm instead of Vulkan, with the vision projector attached |
+| `DeepSeek-V4-Flash-IQ2XXS-DS4` | **ds4 (DwarfStar)** | 81 GB | The capability flagship on [antirez/ds4](https://github.com/antirez/ds4), a small self-contained C engine written for this model. It is the **only** engine that reads this asymmetric quant — llama.cpp cannot |
+
+**Only one stack can hold the GPU.** systemd cannot express `Conflicts=` between these units, so the role stops `llamacpp-server` and waits for the driver to release GTT before starting. Going back is `mise run deploy:llamacpp:<profile>`, which does not stop Lemonade — do that yourself with `systemctl --user stop lemonade-server`.
+
+### Three things that will cost you a day if you do not know them
+
+> **1. `enable_dgpu_gtt` is mandatory on Strix Halo, and the failure is silent.** Lemonade sizes a device's memory pool from the JSON key it enumerated the GPU under, and only `amd_igpu` gets the `max(vram, GTT)` behaviour. This APU enumerates as `amd_gpu`, so the pool is read as `vram_gb` alone — **0.5 GB**, the BIOS carveout — ignoring the 124 GB of GTT the entire fleet actually runs on. Every model whose resident working set exceeds 0.5 GB is then filtered out of the catalog. The only symptom is that `DeepSeek-V4-Flash-IQ2XXS-DS4` is **absent from `lemonade list`**, with no error in any log, which looks exactly like a wrong model name. Only streaming backends (`ds4`) are affected, so the llama.cpp models stay visible and the bug reads as a ds4 problem rather than a device-detection one. The role sets this by default.
+>
+> **2. There is no Fedora RPM for 11.8.0.** The release notes link to `lemonade-server-11.8.0-fc43.x86_64.rpm`, but that asset — along with every `.deb` and the macOS `.pkg` — **is not attached to the release** and the URL 404s. v11.7.0 has all 13 assets; v11.8.0 has 6. The Linux packages were evidently pulled after the [configuration-data-loss report](https://github.com/lemonade-sdk/lemonade/releases/tag/v11.8.0) that opens the release notes. This deployment therefore uses the container image, which is published and which fits this collection's rootless-Podman idiom anyway. The data-loss warning names Ubuntu and Arch and concerns migrating pre-existing state from `.cache` to `.config`; a fresh container install has nothing to migrate.
+>
+> **3. The shipped model name is not the name in the upstream PR.** [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) registers the model as `DeepSeek-V4-Flash-DS4`; the catalog that actually shipped in 11.8.0 names it **`DeepSeek-V4-Flash-IQ2XXS-DS4`**. `lemonade pull` against the PR's name fails.
+
+### Storage
+
+Lemonade stores models in the HuggingFace cache layout inside a Podman named volume, and **cannot share** the flat `--local-dir` tree under `~/models` that `llamacpp_service` builds. A model served by both stacks is on disk twice — Qwen3.8-27B costs ~17 GB in each. Budget ~100 GB for the two models above on top of whatever `~/models` already holds.
 
 ---
 

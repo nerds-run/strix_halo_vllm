@@ -523,3 +523,121 @@
               # An explicit base URL must win over mode-based resolution.
               - "_resolved['llamacpp/25'] == 'http://example.invalid/v1'"
             fail_msg: "openwebui_ui URL resolution is wrong: {{ _resolved }}"
+
+    - name: "Test lemonade_service defaults"
+      vars:
+        lemonade_enabled: false
+      block:
+        - name: "Load lemonade_service defaults"
+          ansible.builtin.include_vars:
+            file: "{{ playbook_dir }}/../../roles/lemonade_service/defaults/main.yml"
+
+        # --- Lemonade regression guards ---------------------------------
+        # Every assertion below encodes something that was measured or
+        # debugged on hardware and that fails SILENTLY: the server starts,
+        # answers requests, and the only symptom is a missing model or a
+        # third of the expected throughput.
+
+        # The single most surprising finding of this deployment. Lemonade
+        # sizes a device's memory pool from the JSON key it enumerated the
+        # GPU under, and only `amd_igpu` gets the max(vram, GTT) behaviour.
+        # Strix Halo enumerates as `amd_gpu`, so the pool is read as
+        # vram_gb alone = 0.5 GB (the BIOS carveout), and every streaming
+        # model is hidden as "too large for this device" with no error
+        # anywhere. Turning this off makes DeepSeek-V4-Flash vanish from
+        # `lemonade list` and the failure looks like a bad model name.
+        - name: "Assert GTT-aware model filtering is enabled"
+          ansible.builtin.assert:
+            that:
+              - lemonade_config['enable_dgpu_gtt'] | bool
+            fail_msg: >-
+              enable_dgpu_gtt is off. On gfx1151 Lemonade then sizes the GPU
+              pool from vram_gb (0.5 GB) and silently hides every ds4 model
+              from the catalog. See roles/lemonade_service/defaults/main.yml.
+
+        # Same finding as the llamacpp ROCm profiles: measured necessary AND
+        # sufficient, and seccomp=unconfined does not substitute. Without it
+        # the HSA runtime cannot map its shared-memory segments and model
+        # load dies with a misleading "Memory in use".
+        - name: "Assert the ROCm container declares KFD and --ipc=host"
+          ansible.builtin.assert:
+            that:
+              - "'/dev/kfd' in lemonade_devices"
+              - "'/dev/dri' in lemonade_devices"
+              - "'--ipc=host' in lemonade_podman_args"
+            fail_msg: >-
+              Lemonade drives ROCm and needs the KFD compute device plus
+              --ipc=host, not just the render node.
+
+        # The ds4 recipe is what makes this deployment different from
+        # llamacpp_service; losing it silently downgrades DeepSeek-V4 to
+        # "model not found" because no other engine reads its quant.
+        - name: "Assert both inference backends are installed"
+          ansible.builtin.assert:
+            that:
+              - "'llamacpp:rocm' in lemonade_backends"
+              - "'ds4:rocm' in lemonade_backends"
+            fail_msg: >-
+              Both backends are required: llamacpp:rocm serves Qwen3.8-27B,
+              ds4:rocm is the only engine that reads DeepSeek-V4-Flash's
+              asymmetric quant.
+
+        # The upstream PR that added ds4 registers the model as
+        # `DeepSeek-V4-Flash-DS4`; the catalog that actually shipped in
+        # v11.8.0 names it `DeepSeek-V4-Flash-IQ2XXS-DS4`. `lemonade pull`
+        # against the PR's name fails, so pin the shipped name.
+        - name: "Assert model names match the shipped v11.8.0 catalog"
+          ansible.builtin.assert:
+            that:
+              - "'Qwen3.8-27B-GGUF' in lemonade_models"
+              - "'DeepSeek-V4-Flash-IQ2XXS-DS4' in lemonade_models"
+              - "'DeepSeek-V4-Flash-DS4' not in lemonade_models"
+            fail_msg: >-
+              Model names must match `lemonade list` exactly. The ds4 model
+              is registered under its quant (IQ2XXS); the bare name from the
+              upstream PR was never shipped.
+
+        # A silent image move already cost this fleet 33% of a profile's
+        # decode once; both the `latest` and `vX.Y.Z` tags move.
+        - name: "Assert the Lemonade image is pinned by digest"
+          ansible.builtin.assert:
+            that:
+              - "'@sha256:' in lemonade_image"
+            fail_msg: "lemonade_image must be pinned by digest, not by tag."
+
+        # systemd cannot express Conflicts= between these units, so the
+        # guard has to live in the play. Without it both stacks claim the
+        # iGPU and the second one runs from host memory at a third speed.
+        - name: "Assert the conflicting llama.cpp unit is stopped first"
+          ansible.builtin.assert:
+            that:
+              - "'llamacpp-server' in lemonade_stop_conflicting_services"
+            fail_msg: >-
+              lemonade_service must stop llamacpp-server before taking the
+              GPU — nothing in systemd does it for us.
+
+    - name: "Test Lemonade is documented everywhere it must be"
+      block:
+        - name: "Read the docs that must mention Lemonade"
+          ansible.builtin.slurp:
+            src: "{{ item }}"
+          register: _lemon_docs
+          loop:
+            - "{{ playbook_dir }}/../../../../../README.md"
+            - "{{ playbook_dir }}/../../../../../mise.toml"
+            - "{{ playbook_dir }}/../../docs/GETTING_STARTED.md"
+            - "{{ playbook_dir }}/../../docs/VARIABLES.md"
+          loop_control:
+            label: "{{ item | basename }}"
+
+        - name: "Assert Lemonade appears in README, mise.toml, GETTING_STARTED and VARIABLES"
+          ansible.builtin.assert:
+            that:
+              - "'lemonade' in (item.content | b64decode | lower)"
+            fail_msg: >-
+              Lemonade is missing from {{ item.item | basename }}. A second
+              inference stack that is not documented is how operators end up
+              running two engines against one GPU.
+          loop: "{{ _lemon_docs.results }}"
+          loop_control:
+            label: "{{ item.item | basename }}"

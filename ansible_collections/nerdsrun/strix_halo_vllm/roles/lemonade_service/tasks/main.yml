@@ -1,0 +1,343 @@
+---
+# ==========================================================================
+# lemonade_service - Lemonade Server as a systemd-managed Podman Quadlet
+# ==========================================================================
+
+# ------------------------------------------------------------------
+# 1. Resolve host group IDs for GPU device access
+# ------------------------------------------------------------------
+# ROCm opens /dev/kfd through the render group. Rootless Podman maps the
+# container process into the host's supplementary groups only when they are
+# named explicitly, and the GIDs are not stable across hosts.
+- name: Resolve GIDs of the GPU device groups
+  ansible.builtin.getent:
+    database: group
+    key: "{{ item }}"
+  loop: "{{ lemonade_supplementary_groups }}"
+  register: lemonade_service_group_lookup
+  tags:
+    - lemonade
+
+- name: Collect resolved group IDs
+  ansible.builtin.set_fact:
+    lemonade_service_group_ids: >-
+      {{ lemonade_service_group_lookup.results
+         | map(attribute='ansible_facts.getent_group')
+         | map('dict2items') | map('first') | map(attribute='value')
+         | map('first') | list }}
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 2. Release the GPU from any conflicting stack
+# ------------------------------------------------------------------
+# llamacpp_service and lemonade_service are both user-scoped but independent
+# units, so systemd has no Conflicts= relationship to lean on. Two engines
+# claiming the iGPU at once do not fail cleanly — the second one OOMs or
+# silently falls back to host memory at a third of the throughput.
+- name: Stop conflicting inference services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    scope: user
+  become: false
+  loop: "{{ lemonade_stop_conflicting_services }}"
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# A Quadlet unit that has been stopped mid-restart lands in `failed`, and
+# systemd then refuses to start it again until the state is cleared. Doing it
+# here means a later `mise run deploy:llamacpp:*` is not mysteriously blocked.
+- name: Clear failed state on conflicting services  # noqa: command-instead-of-module
+  ansible.builtin.command:
+    cmd: "systemctl --user reset-failed {{ item }}"
+  become: false
+  loop: "{{ lemonade_stop_conflicting_services }}"
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# The driver frees GTT after the process exits, not when systemd returns, so
+# poll rather than sleep. `mem_info_gtt_used` is the diagnostic — `free` shows
+# nothing useful here because GTT is not accounted as process memory.
+- name: Wait for the driver to release GTT
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1
+    executable: /bin/bash
+  become: false
+  register: lemonade_service_gtt
+  until: (lemonade_service_gtt.stdout | default('0') | int) < 2147483648
+  retries: "{{ (lemonade_gtt_drain_timeout | int / 5) | int }}"
+  delay: 5
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 3. Pull container image
+# ------------------------------------------------------------------
+- name: Pull Lemonade Server container image
+  ansible.builtin.command:
+    cmd: "podman pull {{ lemonade_image }}"
+  become: false
+  register: lemonade_service_image_pull
+  changed_when: "'Writing' in lemonade_service_image_pull.stdout or 'Storing' in lemonade_service_image_pull.stdout"
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 4. Deploy Quadlet unit
+# ------------------------------------------------------------------
+- name: Ensure systemd user Quadlet directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_user_dir }}/.config/containers/systemd"
+    state: directory
+    mode: "0755"
+  become: false
+  tags:
+    - lemonade
+
+- name: Deploy Lemonade Quadlet container unit file
+  ansible.builtin.template:
+    src: lemonade-server.container.j2
+    dest: "{{ ansible_user_dir }}/.config/containers/systemd/{{ lemonade_container_name }}.container"
+    mode: "0600"
+  become: false
+  no_log: "{{ lemonade_api_key | length > 0 }}"
+  notify:
+    - Reload systemd user daemon
+    - Restart lemonade service
+  tags:
+    - lemonade
+
+- name: Flush handlers to apply Quadlet changes
+  ansible.builtin.meta: flush_handlers
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 5. Start and wait for the API
+# ------------------------------------------------------------------
+- name: Enable and start Lemonade service
+  ansible.builtin.systemd:
+    name: "{{ lemonade_container_name }}"
+    state: started
+    enabled: true
+    scope: user
+  become: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# localhost resolves to IPv6 ::1 on Fedora; use 127.0.0.1 explicitly.
+- name: Wait for the Lemonade API to become available
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
+    method: GET
+    status_code: 200
+  become: false
+  register: lemonade_service_health
+  until: lemonade_service_health.status == 200
+  retries: 40
+  delay: 5
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 6. Apply server configuration
+# ------------------------------------------------------------------
+# config.json holds only the overrides, so diffing the file before and after
+# is an exact change signal — cheaper and more honest than parsing the
+# human-readable `lemonade config` table, whose nested sections do not map
+# back to the dotted keys `config set` accepts.
+- name: Read current Lemonade configuration
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      cat /opt/lemonade/.config/lemonade/config.json
+  become: false
+  register: lemonade_service_cfg_before
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Apply Lemonade configuration keys
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade config set {{ item.key }}={{ item.value | lower if item.value is boolean else item.value }}
+  become: false
+  loop: "{{ lemonade_config | dict2items }}"
+  changed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Re-read Lemonade configuration
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      cat /opt/lemonade/.config/lemonade/config.json
+  become: false
+  register: lemonade_service_cfg_after
+  changed_when: false
+  failed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# Model filtering is evaluated once at startup, so a config change is
+# invisible until the server restarts. This is the step that makes
+# enable_dgpu_gtt actually take effect.
+- name: Restart Lemonade to apply configuration changes
+  ansible.builtin.systemd:
+    name: "{{ lemonade_container_name }}"
+    state: restarted
+    scope: user
+  become: false
+  when:
+    - lemonade_enabled | bool
+    - lemonade_service_cfg_before.stdout | default('') != lemonade_service_cfg_after.stdout | default('')
+  tags:
+    - lemonade
+
+- name: Wait for the Lemonade API after configuration restart
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
+    method: GET
+    status_code: 200
+  become: false
+  register: lemonade_service_health_post
+  until: lemonade_service_health_post.status == 200
+  retries: 40
+  delay: 5
+  when:
+    - lemonade_enabled | bool
+    - lemonade_service_cfg_before.stdout | default('') != lemonade_service_cfg_after.stdout | default('')
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 7. Install inference backends
+# ------------------------------------------------------------------
+# Re-installing an already-present backend is a safe no-op, but it is not
+# silent: the command reports success either way. The reliable change signal
+# is whether it printed a `[n/m] <asset>` download line.
+- name: Install Lemonade inference backends
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade backends install {{ item }}
+  become: false
+  loop: "{{ lemonade_backends }}"
+  register: lemonade_service_backends
+  changed_when: "'[1/' in lemonade_service_backends.stdout"
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 8. Download models
+# ------------------------------------------------------------------
+- name: List already-downloaded models
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade list --downloaded
+  become: false
+  register: lemonade_service_downloaded
+  changed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# A model absent from `lemonade list` is not necessarily unavailable — it may
+# be filtered out by the memory-pool check (see enable_dgpu_gtt in defaults).
+# Fail loudly here rather than letting `pull` fail with a name error, because
+# the two look identical from the outside.
+- name: Assert every requested model is visible in the catalog
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      podman exec {{ lemonade_container_name }} lemonade list '*' | grep -qF '{{ item }}'
+    executable: /bin/bash
+  become: false
+  loop: "{{ lemonade_models }}"
+  changed_when: false
+  register: lemonade_service_visible
+  failed_when: lemonade_service_visible.rc != 0
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+- name: Download Lemonade models
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade pull {{ item }}
+  become: false
+  loop: "{{ lemonade_models }}"
+  register: lemonade_service_pull
+  changed_when: "'already' not in (lemonade_service_pull.stdout | default(''))"
+  when:
+    - lemonade_enabled | bool
+    - item not in (lemonade_service_downloaded.stdout | default(''))
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 9. Firewall
+# ------------------------------------------------------------------
+- name: Open Lemonade port in firewall
+  ansible.posix.firewalld:
+    port: "{{ lemonade_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+  become: true
+  when:
+    - firewall_open_lemonade_port | bool
+    - lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# ------------------------------------------------------------------
+# 10. Display info
+# ------------------------------------------------------------------
+- name: Display Lemonade service information
+  ansible.builtin.debug:
+    msg: |
+      Lemonade Server {{ lemonade_version }} is running as a systemd user service.
+
+      Service    : {{ lemonade_container_name }}
+      Image      : {{ lemonade_image }}
+      API        : http://{{ lemonade_host }}:{{ lemonade_port }}/api/v1
+      Web UI     : http://127.0.0.1:{{ lemonade_port }}
+      Backends   : {{ lemonade_backends | join(', ') }}
+      Models     : {{ lemonade_models | join(', ') }}
+
+      Lemonade routes between models on demand — there is no per-model unit.
+      Only one inference stack can hold the GPU: this role stopped
+      {{ lemonade_stop_conflicting_services | join(', ') }} to take it.
+
+      Manage with:
+        systemctl --user status {{ lemonade_container_name }}
+        journalctl --user -u {{ lemonade_container_name }} -f
+        podman exec {{ lemonade_container_name }} lemonade list
+
+      Test:
+        curl http://127.0.0.1:{{ lemonade_port }}/api/v1/models
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade

@@ -254,3 +254,7 @@ else
   exit 1
 fi
 """
+
+[tasks."deploy:lemonade"]
+description = "Deploy Lemonade Server 11.8.0 (model router — Qwen3.8-27B on llama.cpp/ROCm + DeepSeek-V4-Flash on DwarfStar)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade.yml -i $INVENTORY"

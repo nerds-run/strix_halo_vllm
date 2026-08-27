@@ -1,0 +1,102 @@
+---
+# ==========================================================================
+# lemonade_service - Lemonade Server (AMD) as a rootless Podman Quadlet
+# ==========================================================================
+# Lemonade is a model *router*, not a single-model server: one service loads
+# and evicts models on demand across several inference engines. That is the
+# opposite of llamacpp_service, where one systemd unit serves exactly one
+# GGUF. Both can be installed; only one can hold the GPU at a time, which is
+# why this role stops the conflicting unit rather than assuming it is down.
+
+lemonade_enabled: true
+lemonade_container_name: lemonade-server
+
+# Pinned by digest, same discipline as llamacpp_image. The `latest` and
+# `vX.Y.Z` tags both move; a silent image move already cost this fleet 33% of
+# a profile's decode once. This digest is the linux/amd64 manifest of v11.8.0.
+lemonade_version: "11.8.0"
+lemonade_image: >-
+  ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc210afc282aea5c23bc3af5674d991239d9620d46cdd4ccafd16f7375f
+
+lemonade_host: "0.0.0.0"
+lemonade_port: 13305
+
+# Optional bearer token for the OpenAI-compatible API. Empty disables auth.
+lemonade_api_key: ""
+
+# ROCm needs the KFD compute device, not just the render node — and the
+# container process must be in the host's render/video groups to open them.
+# The GIDs are resolved at run time (getent); Fedora's are 105/39 but that is
+# not guaranteed across hosts.
+lemonade_devices:
+  - /dev/kfd
+  - /dev/dri
+lemonade_supplementary_groups:
+  - render
+  - video
+
+# --ipc=host is REQUIRED for ROCm under rootless Podman and the failure
+# without it is deeply misleading: the HSA runtime cannot map its
+# shared-memory segments and model load dies with "Memory in use". Measured
+# necessary AND sufficient here; seccomp=unconfined does not substitute.
+# See docs/TROUBLESHOOTING.md.
+lemonade_podman_args:
+  - --ipc=host
+
+# Named volumes, matching the layout upstream documents. Models land in the
+# Podman volume store, NOT in llamacpp_model_dir — Lemonade uses the HF cache
+# layout and cannot share the flat --local-dir tree llamacpp_service builds,
+# so a model used by both stacks is stored twice.
+lemonade_volumes:
+  lemonade-cache: /opt/lemonade/.cache/huggingface
+  lemonade-llama: /opt/lemonade/llama
+  lemonade-data: /opt/lemonade/.cache/lemonade
+  lemonade-config: /opt/lemonade/.config/lemonade
+
+# Backend binaries are fetched at run time, so the image itself is
+# GPU-agnostic and there is no rocm/vulkan image variant to choose. Installing
+# a backend downloads it plus its runtime: llamacpp:rocm pulls llama.cpp
+# b10470 and the TheRock ROCm 7.14.0 gfx1151 runtime (~1.8 GB).
+lemonade_backends:
+  - llamacpp:rocm
+  - ds4:rocm
+
+# Applied with `lemonade config set k=v`, then the service is restarted —
+# model filtering is evaluated at startup, so a config change is invisible
+# until it is.
+#
+# enable_dgpu_gtt is MANDATORY on Strix Halo and the reason is non-obvious.
+# Lemonade sizes a device's memory pool from the JSON key it enumerated the
+# GPU under: only `amd_igpu` gets MemoryAllocBehavior::Largest (max of vram
+# and GTT). This APU enumerates as `amd_gpu`, so it falls to ::Hardware,
+# which returns vram_gb alone — 0.5 GB, the BIOS carveout, ignoring the
+# 124 GB GTT the whole fleet actually runs on. Any model with a resident
+# working set above 0.5 GB is then hidden as "too large for this device".
+# The visible symptom is a model silently absent from `lemonade list` with no
+# error anywhere; enable_dgpu_gtt switches the calculation to ::Unified
+# (vram + GTT) and it appears. Only streaming backends (ds4) are affected —
+# llamacpp models stay visible either way, which makes this look like a ds4
+# bug rather than a device-detection one.
+lemonade_config:
+  enable_dgpu_gtt: true
+  llamacpp.backend: rocm
+
+# Pulled after the backends are installed. Names must match the catalog
+# exactly (`lemonade list`); the DS4 entry is registered under its quant, not
+# the bare model name.
+lemonade_models:
+  - Qwen3.8-27B-GGUF
+  - DeepSeek-V4-Flash-IQ2XXS-DS4
+
+# systemd cannot express Conflicts= across the user/system boundary, and both
+# stacks are user-scoped but independent, so nothing stops them from claiming
+# the GPU at once. The guard has to live in the play.
+lemonade_stop_conflicting_services:
+  - llamacpp-server
+
+# Seconds to wait for the driver to release GTT after stopping a conflicting
+# unit. Starting a large load against stale GTT is what triggers the autofit
+# failure documented in docs/TROUBLESHOOTING.md.
+lemonade_gtt_drain_timeout: 120
+
+firewall_open_lemonade_port: false

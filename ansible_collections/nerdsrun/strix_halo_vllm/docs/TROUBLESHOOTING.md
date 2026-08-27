@@ -549,3 +549,67 @@ mise run uninstall
 ansible-playbook ansible_collections/nerdsrun/strix_halo_vllm/playbooks/uninstall.yml \
   -i inventory -e strix_halo_uninstall_purge_cache=true
 ```
+
+---
+
+## Lemonade Server
+
+### A model is missing from `lemonade list` and there is no error anywhere
+
+**Symptom.** `lemonade list` shows the llama.cpp models but not `DeepSeek-V4-Flash-IQ2XXS-DS4`. `GET /api/v1/models` does not list it either. `lemonade pull DeepSeek-V4-Flash-IQ2XXS-DS4` fails as if the name were wrong. Nothing appears in `journalctl --user -u lemonade-server`. The `ds4:rocm` backend reports `installed`, and the entry is present in `/opt/lemonade/resources/server_models.json`.
+
+**Cause.** Lemonade sizes a device's memory pool from the JSON key it enumerated the GPU under. Only `amd_igpu` gets `MemoryAllocBehavior::Largest` (`max(vram_gb, virtual_mem_gb)`); this APU enumerates as `amd_gpu`, so it falls to `::Hardware`, which returns `vram_gb` — **0.5 GB**, the BIOS carveout. The 124 GB of GTT the fleet actually uses is reported as `virtual_mem_gb` and never consulted. Streaming backends (`ds4`) are then checked with `min_resident_gb` (16 GB for this model) against a 0.5 GB pool and filtered out.
+
+Confirm what the server detected:
+
+```bash
+curl -s http://127.0.0.1:13305/api/v1/system-info | grep -E "vram_gb|virtual_mem_gb"
+#   "virtual_mem_gb": 124.0,
+#   "vram_gb": 0.5          <-- this is what the filter uses
+```
+
+**Fix.**
+
+```bash
+podman exec lemonade-server lemonade config set enable_dgpu_gtt=true
+systemctl --user restart lemonade-server     # filtering is evaluated at startup only
+```
+
+The restart is not optional — the model list is built once when the server comes up, so the config change is invisible until it restarts. `lemonade_service` does this automatically and only when `config.json` actually changed.
+
+Do **not** reach for `disable_model_filtering: true`. It also makes the model appear, but by disabling every size check rather than fixing the arithmetic.
+
+### `lemonade-server-11.8.0-fc43.x86_64.rpm` returns 404
+
+The v11.8.0 release notes link to Fedora, Debian and macOS packages that **are not attached to the release**. v11.7.0 published 13 assets; v11.8.0 published 6 — only the Windows MSIs and the embeddable tarballs. The Linux packages were evidently withdrawn after the configuration-data-loss report that opens those release notes.
+
+Use the container image instead, which is published and is what `lemonade_service` deploys:
+
+```bash
+podman pull ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc210afc282aea5c23bc3af5674d991239d9620d46cdd4ccafd16f7375f
+```
+
+The data-loss warning concerns migrating pre-existing state from `.cache` to `.config` on Ubuntu and Arch; a fresh container install has nothing to migrate. Note also that 11.8.0 is the first release with `ds4`, so downgrading to 11.7.0 to get an RPM would cost you DeepSeek-V4-Flash entirely.
+
+### `lemonade pull DeepSeek-V4-Flash-DS4` fails with an unknown model
+
+The name in [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) is not the name that shipped. Use **`DeepSeek-V4-Flash-IQ2XXS-DS4`**, which is how the 11.8.0 catalog registers it.
+
+### Throughput collapses after deploying Lemonade, or a model OOMs on load
+
+Two inference stacks are holding the iGPU. `llamacpp-server` and `lemonade-server` are separate user units with no `Conflicts=` between them — systemd will happily run both, and the second one to allocate either OOMs or silently falls back to host memory at roughly a third of the expected rate.
+
+```bash
+systemctl --user status llamacpp-server lemonade-server
+cat /sys/class/drm/card*/device/mem_info_gtt_used     # the real diagnostic, not `free`
+```
+
+Stop whichever one you are not using. `lemonade_service` stops `llamacpp-server` on deploy and waits for GTT to drain; the reverse is **not** true — deploying a llama.cpp profile does not stop Lemonade, so do it yourself:
+
+```bash
+systemctl --user stop lemonade-server
+```
+
+### Streaming responses arrive all at once on `ds4`
+
+Known upstream limitation of the experimental `ds4` backend: deltas are delivered in one burst when generation completes rather than incrementally. Throughput is unaffected — only the streaming UX. There is nothing to configure.

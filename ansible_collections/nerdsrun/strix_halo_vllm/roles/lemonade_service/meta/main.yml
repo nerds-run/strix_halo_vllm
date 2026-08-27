@@ -1,0 +1,28 @@
+---
+galaxy_info:
+  role_name: lemonade_service
+  namespace: nerdsrun
+  author: nerdsrun
+  description: >-
+    Run Lemonade Server as a persistent rootless Podman container managed by
+    systemd Quadlet on AMD Strix Halo (gfx1151). Unlike llamacpp_service it is
+    a model router: one service loads and evicts several models on demand
+    across the llama.cpp/ROCm and ds4 (DwarfStar) engines, behind an
+    OpenAI-compatible API.
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - amd
+    - gpu
+    - lemonade
+    - rocm
+    - podman
+    - systemd
+    - strix_halo
+
+dependencies:
+  - role: nerdsrun.strix_halo_vllm.host_prereqs
