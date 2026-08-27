@@ -749,29 +749,36 @@ A second inference stack, deployed with `mise run deploy:lemonade`. Measured on 
 
 Same GGUF (`unsloth/Qwen3.8-27B-GGUF`, UD-Q4_K_XL), same box, different backend:
 
-| Path | Decode | ttft | Notes |
+| Path | Decode | Prefill | Notes |
 |---|---:|---:|---|
-| `qwen38` profile (Vulkan, RADV) | 12.3 | — | bandwidth-saturated, no conventional knob moves it |
-| **Lemonade `llamacpp:rocm`** | **17.4 - 18.5** | 0.35 - 0.47 s | **1.4 - 1.5x** |
+| `qwen38` profile (Vulkan, RADV) | 12.3 | 360.0 @ 8K | bandwidth-saturated, no conventional knob moves it |
+| **Lemonade `llamacpp:rocm`** | **18.5 - 27.0** | **360.0 - 364.0** @ 7.7-9.1K | **1.5 - 2.2x decode, prefill unchanged** |
+
+Prefill matching the Vulkan profile to within 1% while decode nearly doubles is the signature of speculative decoding rather than a faster backend: prefill is compute-bound and unaffected, decode emits several tokens per weight read.
 
 The gain is not the ROCm backend on its own — **Lemonade turns on MTP speculative decoding automatically** for this model (the catalog entry carries an `mtp` label). Measured draft acceptance was **0.48 - 0.51**, mean accepted length 2.4 - 2.5 of the drafted tokens.
 
 Two things follow. First, this is the same lever the `qwen38-fp4` profile uses, but reached without the ROCmFPX fork and without giving up vision. Second, acceptance here is markedly lower than the 0.93 that profile sees on code, so the multiple is correspondingly smaller — 1.4x rather than 2.4x. Acceptance is workload-dependent, and these figures came from short prose prompts.
 
-**Prefill is not characterised.** The only prefill numbers observed were on 17 - 21 token prompts (≈61 t/s), and this document's own rule applies: never characterise prefill from a short prompt. Treat prefill as unmeasured on this path.
+The decode range is real, not noise: 26.95 tok/s came from a 7,738-token prompt and 18.48 from a 9,139-token one, both from live UI traffic rather than synthetic prompts. Speculative throughput tracks draft acceptance, which is workload-dependent — the same caveat the `qwen38-fp4` profile carries.
 
-### DeepSeek-V4-Flash on ds4 (DwarfStar)
+### DeepSeek-V4-Flash — ds4 vs llama.cpp/ROCm, and why ds4 was removed
 
-`DeepSeek-V4-Flash-IQ2XXS-DS4`, 81 GB at roughly 2.3 bpw, ctx 32768.
+Both engines were deployed and measured on this box, at ctx 32768.
 
-| Source | Decode | Measured by |
-|---|---:|---|
-| **Lemonade + ds4, warm** | **12.8 t/s** | **here** |
-| Lemonade + ds4, `--ssd-streaming-cache-experts 96GB` | 11.9 t/s | here |
-| ds4 driven directly, upstream's own figure | 16.45 t/s | [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) — **not measured here** |
-| `deepseek-v4` profile (llama.cpp/ROCm, 2.90 bpw) | 17.1 t/s | here, different quant |
+| Path | Decode | Quant | Residency | Telemetry | Disk added |
+|---|---:|---|---|---|---:|
+| **Lemonade + `llamacpp:rocm`** | **17.08 t/s** | 2.90 bpw | fully resident, 103.8 GB GTT | works (`ttft=0.32-0.50s`) | **0 GB** |
+| Lemonade + `ds4`, warm | 12.8 t/s | ~2.3 bpw IQ2XXS | SSD-streamed | broken (`ttft=0`, `tps=0`) | 81 GB |
+| Lemonade + `ds4`, `--ssd-streaming-cache-experts 96GB` | 11.9 t/s | ~2.3 bpw | partial, 72.7 GB | broken | 81 GB |
+| `deepseek-v4` profile, standalone | 17.1 t/s | 2.90 bpw | resident | n/a | 0 GB |
+| ds4 driven directly, **upstream's own figure** | 16.45 t/s | ~2.3 bpw | full | — | **not measured here** |
 
-**We are ~25% below upstream's number for the same engine and quant, and below the llama.cpp path this collection already had.** The most likely cause is identified and is not a misconfiguration:
+**`llamacpp:rocm` wins on every measured axis**, so `ds4` was removed and its 81 GB deleted. Lemonade's llama.cpp is **b10469**, which carries the `deepseek4` arch and is *newer* than the b10217 the `deepseek-v4` profile pins — the second engine was buying nothing. Serving the quant already on disk through `extra_models_dir` reproduces the standalone profile's throughput (17.08 against 17.1) at no storage cost.
+
+The ds4 measurements are kept because the reason it lost is specific and could change:
+
+**We measured ~25% below upstream's own figure for the same engine and quant.** That is not a misconfiguration on this side:
 
 #### Lemonade forces `--ssd-streaming`, and it cannot be turned off
 
@@ -797,6 +804,8 @@ Observed behaviour is consistent with streaming throughout: load reports success
   - **Do not benchmark against a shared server.** Queued requests inherit the wait of whatever is ahead of them, which silently corrupts any timing measured from the client side.
   - Model-switching contends for the same slot, so a `lemonade load` issued during a long generation waits too.
 
-#### What has not been tried
+#### What has not been tried, if ds4 is ever revisited
 
-`--power` is already at its default maximum of 100 and the GPU is pinned to `high`, so neither is a candidate. `--prefill-chunk` (default 4096) affects prefill, which is unmeasured here. `--batched-session` and `--threads` are untested. None of these address residency, which remains the leading hypothesis.
+`--power` is already at its default maximum of 100 and the GPU is pinned to `high`, so neither is a candidate. `--prefill-chunk` (default 4096) affects prefill, which is unmeasured here. `--batched-session` and `--threads` are untested. None address residency, which remains the leading hypothesis — and residency is not reachable while Lemonade injects `--ssd-streaming` unconditionally.
+
+**The condition for reconsidering ds4** is upstream gating that flag on available GTT rather than assuming a 64 GB carveout. Even then it must clear 17.1 tok/s on a comparable quant to be worth 81 GB, since llama.cpp/ROCm already serves this model from disk the fleet already holds.

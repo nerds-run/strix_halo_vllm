@@ -300,11 +300,30 @@
     that:
       - item in (lemonade_service_catalog.stdout | default(''))
     fail_msg: >-
-      '{{ item }}' is not in `lemonade list`. If the name is right, the
-      memory-pool filter has hidden it: on gfx1151 Lemonade reads the pool as
-      vram_gb (0.5 GB) unless enable_dgpu_gtt is set, and then drops every
-      streaming (ds4) model with no error. See docs/TROUBLESHOOTING.md.
-  loop: "{{ lemonade_models }}"
+      '{{ item }}' is not in `lemonade list`. Two causes look identical from
+      outside. If it is a lemonade_required_models entry, the
+      extra_models_dir mount is wrong — check that
+      {{ lemonade_extra_models_mount }} is populated inside the container.
+      Otherwise the memory-pool filter has hidden it: on gfx1151 Lemonade
+      reads the pool as vram_gb (0.5 GB) unless enable_dgpu_gtt is set. See
+      docs/TROUBLESHOOTING.md.
+  loop: "{{ lemonade_models + lemonade_required_models }}"
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+
+# The extra.* names are derived from the directory that holds the GGUF, so
+# they are long and carry the uploader's handle. Alias them to the profile
+# name the rest of this collection uses.
+- name: Bind friendly aliases for auto-discovered models
+  ansible.builtin.command:
+    cmd: >-
+      podman exec {{ lemonade_container_name }}
+      lemonade alias add {{ item.key }} {{ item.value }}
+  become: false
+  loop: "{{ lemonade_aliases | dict2items }}"
+  register: lemonade_service_alias
+  changed_when: "'already' not in (lemonade_service_alias.stdout | default('') | lower)"
   when: lemonade_enabled | bool
   tags:
     - lemonade
@@ -353,7 +372,9 @@
       API        : http://{{ lemonade_host }}:{{ lemonade_port }}/api/v1
       Web UI     : http://127.0.0.1:{{ lemonade_port }}
       Backends   : {{ lemonade_backends | join(', ') }}
-      Models     : {{ lemonade_models | join(', ') }}
+      Downloaded : {{ lemonade_models | join(', ') }}
+      From disk  : {{ lemonade_required_models | join(', ') }}
+      Aliases    : {{ lemonade_aliases | dict2items | map(attribute='key') | join(', ') }}
 
       Lemonade routes between models on demand — there is no per-model unit.
       Only one inference stack can hold the GPU: this role stopped

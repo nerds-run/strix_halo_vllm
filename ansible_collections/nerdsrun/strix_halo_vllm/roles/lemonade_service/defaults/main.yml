@@ -89,9 +89,16 @@ lemonade_extra_models_mount: "/models"
 # GPU-agnostic and there is no rocm/vulkan image variant to choose. Installing
 # a backend downloads it plus its runtime: llamacpp:rocm pulls llama.cpp
 # b10470 and the TheRock ROCm 7.14.0 gfx1151 runtime (~1.8 GB).
+# ds4 (DwarfStar) is deliberately NOT installed. It is the only engine that
+# reads antirez's asymmetric IQ2XXS quant, but measured head-to-head on this
+# box it loses to llama.cpp/ROCm on every axis: 12.8 tok/s against 17.08, a
+# coarser quant (~2.3 bpw vs 2.90 bpw verified 90.8% token-identical against
+# the full-precision API), forced SSD streaming that cannot be turned off, and
+# broken telemetry (ttft=0, tps=0). See docs/PERFORMANCE.md for the numbers.
+# Re-add 'ds4:rocm' here and the IQ2XXS model below if upstream gates
+# --ssd-streaming on available GTT.
 lemonade_backends:
   - llamacpp:rocm
-  - ds4:rocm
 
 # Applied with `lemonade config set k=v`, then the service is restarted —
 # model filtering is evaluated at startup, so a config change is invisible
@@ -114,12 +121,29 @@ lemonade_config:
   llamacpp.backend: rocm
   extra_models_dir: "{{ lemonade_extra_models_mount if lemonade_extra_models_host_dir | length > 0 else '' }}"
 
-# Pulled after the backends are installed. Names must match the catalog
-# exactly (`lemonade list`); the DS4 entry is registered under its quant, not
-# the bare model name.
+# Models Lemonade downloads itself. Names must match `lemonade list` exactly.
+#
+# Qwen3.8-27B is deliberately downloaded even though ~/models already holds
+# the same GGUF and it is visible via extra_models_dir. The catalog entry is
+# not equivalent to the bare file: it declares the `mmproj` sidecar (vision)
+# and carries the `mtp` label that switches on speculative decoding. That is
+# where 26.95 tok/s at a 7.7K prompt comes from, against 12.3 for the same
+# weights on the Vulkan `qwen38` profile. An auto-discovered extra.* entry is
+# a bare GGUF with neither. ~17 GB is the price of vision plus ~2x decode.
 lemonade_models:
   - Qwen3.8-27B-GGUF
-  - DeepSeek-V4-Flash-IQ2XXS-DS4
+
+# Models that must resolve in the catalog but are NOT downloaded here —
+# they come from extra_models_dir, already on disk for llamacpp_service.
+# Deploy fails if one is missing, which is the signal that the mount or the
+# memory-pool filter is wrong rather than the name.
+lemonade_required_models:
+  - Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF
+
+# Friendly aliases for the auto-generated extra.* names, which are derived
+# from the directory and are unusable in a chat UI.
+lemonade_aliases:
+  deepseek-v4: Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF
 
 # systemd cannot express Conflicts= across the user/system boundary, and both
 # stacks are user-scoped but independent, so nothing stops them from claiming

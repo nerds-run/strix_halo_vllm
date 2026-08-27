@@ -127,26 +127,47 @@ When using `llamacpp` mode, select a model profile with `llamacpp_model_profile`
 
 ## Lemonade Server (multi-model router)
 
-`mise run deploy:lemonade` deploys [Lemonade Server](https://lemonade-server.ai) **11.8.0** as a second, independent inference stack. It is not another llama.cpp profile — it is a *router*: one systemd unit that loads and evicts several models on demand across several engines, behind one OpenAI-compatible endpoint on port **13305**.
+`mise run deploy:lemonade` deploys [Lemonade Server](https://lemonade-server.ai) **11.8.0** as a second, independent inference stack. It is not another llama.cpp profile — it is a *router*: one systemd unit that loads and evicts models on demand across engines, behind one OpenAI-compatible endpoint on port **13305** (`/v1`, `/api/v1` and `/v0` all answer).
 
-| Model | Engine | Size | Why it is here |
+| Model | Source | Decode | Notes |
 |---|---|---:|---|
-| `Qwen3.8-27B-GGUF` | llama.cpp / **ROCm** | 17.2 GB | Same UD-Q4_K_XL GGUF the `qwen38` profile serves, but on ROCm instead of Vulkan, with the vision projector attached |
-| `DeepSeek-V4-Flash-IQ2XXS-DS4` | **ds4 (DwarfStar)** | 81 GB | The capability flagship on [antirez/ds4](https://github.com/antirez/ds4), a small self-contained C engine written for this model. It is the **only** engine that reads this asymmetric quant — llama.cpp cannot |
+| `Qwen3.8-27B-GGUF` | downloaded (17.2 GB) | **18.5 - 27.0 tok/s** | vision + MTP speculative decoding, both from the catalog entry |
+| `deepseek-v4` | **already on disk** (0 GB added) | **17.1 tok/s** | alias for the `deepseek-v4` profile's own 2.90 bpw quant, served through Lemonade |
 
-**Only one stack can hold the GPU.** systemd cannot express `Conflicts=` between these units, so the role stops `llamacpp-server` and waits for the driver to release GTT before starting. Going back is `mise run deploy:llamacpp:<profile>`, which does not stop Lemonade — do that yourself with `systemctl --user stop lemonade-server`.
+Both run on **llama.cpp/ROCm** (b10469 + TheRock 7.14.0). Only one inference stack can hold the GPU: the role stops `llamacpp-server` and waits for GTT to drain. The reverse is not automatic — `systemctl --user stop lemonade-server` before redeploying a llama.cpp profile.
 
-### Three things that will cost you a day if you do not know them
+### Why this is faster than the equivalent profiles
 
-> **1. `enable_dgpu_gtt` is mandatory on Strix Halo, and the failure is silent.** Lemonade sizes a device's memory pool from the JSON key it enumerated the GPU under, and only `amd_igpu` gets the `max(vram, GTT)` behaviour. This APU enumerates as `amd_gpu`, so the pool is read as `vram_gb` alone — **0.5 GB**, the BIOS carveout — ignoring the 124 GB of GTT the entire fleet actually runs on. Every model whose resident working set exceeds 0.5 GB is then filtered out of the catalog. The only symptom is that `DeepSeek-V4-Flash-IQ2XXS-DS4` is **absent from `lemonade list`**, with no error in any log, which looks exactly like a wrong model name. Only streaming backends (`ds4`) are affected, so the llama.cpp models stay visible and the bug reads as a ds4 problem rather than a device-detection one. The role sets this by default.
+**Qwen3.8-27B is 1.5 - 2.2x faster here than the `qwen38` profile serving the identical GGUF** — 18.5-27.0 tok/s against 12.3. Prefill is unchanged (360-364 t/s at 7.7-9.1K prompts, matching the Vulkan profile exactly), so it is purely a decode win. The cause is not the ROCm backend: Lemonade reads the `mtp` label on the catalog entry and turns on **speculative decoding automatically**. That is the same lever `qwen38-fp4` pulls, but without the ROCmFPX fork and **without giving up vision**. Throughput varies with draft acceptance, hence the range.
+
+### `extra_models_dir` — the GGUF tree is mounted, not copied
+
+Lemonade stores its own downloads in HuggingFace cache layout and cannot read the flat `--local-dir` tree `llamacpp_service` builds. Rather than keep two copies, the role bind-mounts `llamacpp_model_dir` read-only and points `extra_models_dir` at it, so everything already on disk appears as an `extra.*` model at **zero additional storage**. `lemonade_aliases` then binds a usable name to the auto-generated one.
+
+`Qwen3.8-27B-GGUF` is the deliberate exception, downloaded even though the same GGUF is already mounted: the catalog entry declares the `mmproj` sidecar and the `mtp` label, and an auto-discovered bare GGUF carries neither. ~17 GB buys vision plus roughly double the decode.
+
+### DwarfStar (`ds4`) was deployed, measured, and removed
+
+[ds4](https://github.com/antirez/ds4) is antirez's self-contained DeepSeek-V4 engine, and Lemonade 11.8.0 ships it as an experimental backend. It was deployed here in full and then removed on the numbers, not on taste:
+
+| DeepSeek-V4-Flash path | Decode | Quant | Residency | Telemetry |
+|---|---:|---|---|---|
+| Lemonade + `ds4` | 12.8 | ~2.3 bpw IQ2XXS | SSD-streamed, cannot be disabled | broken (`ttft=0`, `tps=0`) |
+| **Lemonade + `llamacpp:rocm`** | **17.1** | **2.90 bpw**, verified 90.8% token-identical | **fully resident (103.8 GB)** | works |
+
+Lemonade's llama.cpp build carries the `deepseek4` arch and is *newer* than the b10217 the `deepseek-v4` profile pins, so the second engine buys nothing. The 81 GB IQ2XXS download was deleted. See [PERFORMANCE.md](ansible_collections/nerdsrun/strix_halo_vllm/docs/PERFORMANCE.md#lemonade-server-1180) for the full measurement, including why `--ssd-streaming` is the likely cause and cannot be worked around.
+
+### Three things that will cost you a day
+
+> **1. `enable_dgpu_gtt` is mandatory on Strix Halo, and the failure is silent.** Lemonade sizes a device's memory pool from the JSON key it enumerated the GPU under, and only `amd_igpu` gets `max(vram, GTT)`. This APU enumerates as `amd_gpu`, so the pool reads as `vram_gb` alone — **0.5 GB**, the BIOS carveout — ignoring the 124 GB of GTT the fleet actually runs on. Models are then filtered out of the catalog with no error anywhere, which looks exactly like a wrong model name. The role sets this by default.
 >
-> **2. There is no Fedora RPM for 11.8.0.** The release notes link to `lemonade-server-11.8.0-fc43.x86_64.rpm`, but that asset — along with every `.deb` and the macOS `.pkg` — **is not attached to the release** and the URL 404s. v11.7.0 has all 13 assets; v11.8.0 has 6. The Linux packages were evidently pulled after the [configuration-data-loss report](https://github.com/lemonade-sdk/lemonade/releases/tag/v11.8.0) that opens the release notes. This deployment therefore uses the container image, which is published and which fits this collection's rootless-Podman idiom anyway. The data-loss warning names Ubuntu and Arch and concerns migrating pre-existing state from `.cache` to `.config`; a fresh container install has nothing to migrate.
+> **2. Browsers get 403 while curl gets 200.** Lemonade validates the `Origin` header and permits only loopback and desktop schemes, so the web UI opened over the LAN loads the page and then fails every chat request. Non-browser clients send no `Origin` at all, so the endpoint looks healthy from the command line while the UI is dead. `lemonade_allowed_origins` derives the box's LAN origin.
 >
-> **3. The shipped model name is not the name in the upstream PR.** [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) registers the model as `DeepSeek-V4-Flash-DS4`; the catalog that actually shipped in 11.8.0 names it **`DeepSeek-V4-Flash-IQ2XXS-DS4`**. `lemonade pull` against the PR's name fails.
+> **3. There is no Fedora RPM for 11.8.0.** The release notes link to one; the asset is not attached and the URL 404s. v11.7.0 published 13 assets, v11.8.0 published 6 — the Linux packages were withdrawn after the configuration-data-loss report that opens those notes. This deployment uses the container image, which is published and fits this collection's rootless-Podman idiom anyway.
 
-### Storage
+### One long generation blocks everything
 
-Lemonade stores models in the HuggingFace cache layout inside a Podman named volume, and **cannot share** the flat `--local-dir` tree under `~/models` that `llamacpp_service` builds. A model served by both stacks is on disk twice — Qwen3.8-27B costs ~17 GB in each. Budget ~100 GB for the two models above on top of whatever `~/models` already holds.
+`max_loaded_models` is **1**. A realistic UI prompt ("build me a single-page app") runs tens of thousands of tokens, which at these rates is *tens of minutes*, and every other client — including `lemonade load` — queues behind it and eventually times out. That reads exactly like a hung server and is not one. `podman logs --tail 5 lemonade-server` shows a live token counter; a rising count means it is working, and restarting throws the work away.
 
 ---
 

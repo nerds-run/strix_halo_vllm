@@ -572,30 +572,68 @@
         # The ds4 recipe is what makes this deployment different from
         # llamacpp_service; losing it silently downgrades DeepSeek-V4 to
         # "model not found" because no other engine reads its quant.
-        - name: "Assert both inference backends are installed"
+        - name: "Assert llamacpp:rocm is the serving backend"
           ansible.builtin.assert:
             that:
               - "'llamacpp:rocm' in lemonade_backends"
-              - "'ds4:rocm' in lemonade_backends"
             fail_msg: >-
-              Both backends are required: llamacpp:rocm serves Qwen3.8-27B,
-              ds4:rocm is the only engine that reads DeepSeek-V4-Flash's
-              asymmetric quant.
+              llamacpp:rocm serves every model in this deployment. Its build
+              carries the deepseek4 arch, which is why DeepSeek-V4-Flash does
+              not need a second engine.
 
-        # The upstream PR that added ds4 registers the model as
-        # `DeepSeek-V4-Flash-DS4`; the catalog that actually shipped in
-        # v11.8.0 names it `DeepSeek-V4-Flash-IQ2XXS-DS4`. `lemonade pull`
-        # against the PR's name fails, so pin the shipped name.
-        - name: "Assert model names match the shipped v11.8.0 catalog"
+        # ds4 was deployed, measured head-to-head, and removed. Re-adding it
+        # is a real decision with a measured cost, not a default to drift
+        # back into: 12.8 tok/s against llamacpp:rocm's 17.08 on the same
+        # model, a coarser quant, forced SSD streaming that cannot be
+        # disabled, and telemetry that reports ttft=0/tps=0.
+        - name: "Assert the ds4 backend has not been reintroduced silently"
           ansible.builtin.assert:
             that:
-              - "'Qwen3.8-27B-GGUF' in lemonade_models"
-              - "'DeepSeek-V4-Flash-IQ2XXS-DS4' in lemonade_models"
-              - "'DeepSeek-V4-Flash-DS4' not in lemonade_models"
+              - "'ds4:rocm' not in lemonade_backends"
+              - "lemonade_models | select('search', 'DS4') | list | length == 0"
             fail_msg: >-
-              Model names must match `lemonade list` exactly. The ds4 model
-              is registered under its quant (IQ2XXS); the bare name from the
-              upstream PR was never shipped.
+              ds4 is back in the defaults. It was removed on measurement, not
+              on taste — see docs/PERFORMANCE.md. If upstream has gated
+              --ssd-streaming on available GTT, re-measure before restoring
+              it, and update this assertion with the new numbers.
+
+        # Downloading a model that extra_models_dir already exposes wastes
+        # tens of GB. The one deliberate exception is Qwen3.8-27B, whose
+        # catalog entry adds the mmproj sidecar and the mtp label that a bare
+        # auto-discovered GGUF does not carry.
+        - name: "Assert only the catalog-enriched model is downloaded"
+          ansible.builtin.assert:
+            that:
+              - lemonade_models == ['Qwen3.8-27B-GGUF']
+            fail_msg: >-
+              lemonade_models should hold only models whose catalog entry adds
+              something the raw GGUF lacks (vision projector, mtp label).
+              Anything already under llamacpp_model_dir belongs in
+              lemonade_required_models, which costs no disk.
+
+        - name: "Assert DeepSeek is served from disk, not re-downloaded"
+          ansible.builtin.assert:
+            that:
+              - lemonade_required_models | select('search', 'DeepSeek-V4-Flash')
+                | list | length > 0
+              - lemonade_extra_models_host_dir | length > 0
+              - lemonade_config['extra_models_dir'] | length > 0
+            fail_msg: >-
+              DeepSeek-V4-Flash must come from the mounted GGUF tree. Without
+              extra_models_dir the same 97 GB quant would be downloaded a
+              second time into the Podman volume.
+
+        - name: "Assert every alias points at a required model"
+          ansible.builtin.assert:
+            that:
+              - item.value in lemonade_required_models
+            fail_msg: >-
+              Alias '{{ item.key }}' targets '{{ item.value }}', which is not
+              in lemonade_required_models — `lemonade alias add` would bind it
+              to a name the catalog cannot resolve.
+          loop: "{{ lemonade_aliases | dict2items }}"
+          loop_control:
+            label: "{{ item.key }}"
 
         # A silent image move already cost this fleet 33% of a profile's
         # decode once; both the `latest` and `vX.Y.Z` tags move.

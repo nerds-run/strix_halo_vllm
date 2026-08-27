@@ -591,9 +591,22 @@ podman pull ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc210afc282aea5c23b
 
 The data-loss warning concerns migrating pre-existing state from `.cache` to `.config` on Ubuntu and Arch; a fresh container install has nothing to migrate. Note also that 11.8.0 is the first release with `ds4`, so downgrading to 11.7.0 to get an RPM would cost you DeepSeek-V4-Flash entirely.
 
+### A model under `~/models` does not show up in `lemonade list`
+
+Models on disk reach Lemonade through `extra_models_dir`, which requires the bind mount to be present and populated *inside* the container:
+
+```bash
+podman exec lemonade-server ls /models | head
+podman exec lemonade-server sh -c 'cat /opt/lemonade/.config/lemonade/config.json'   # extra_models_dir must be "/models"
+```
+
+If `/models` is empty the Quadlet lost its `Volume=` line; re-run `mise run deploy:lemonade`. If it is populated but the model is still absent, the memory-pool filter is the other cause — see the `enable_dgpu_gtt` entry above.
+
+Discovered names are derived from the **directory**, not the file, so `~/models/Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF/` registers under that whole string. Use `lemonade_aliases` to bind something usable. Precedence is registered > imported > built-in, so a downloaded model with the same bare name shadows a mounted one; `extra.NAME` addresses the mounted copy explicitly.
+
 ### `lemonade pull DeepSeek-V4-Flash-DS4` fails with an unknown model
 
-The name in [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) is not the name that shipped. Use **`DeepSeek-V4-Flash-IQ2XXS-DS4`**, which is how the 11.8.0 catalog registers it.
+Two separate problems. The name in [PR #3047](https://github.com/lemonade-sdk/lemonade/pull/3047) is not the name that shipped — the 11.8.0 catalog registers `DeepSeek-V4-Flash-IQ2XXS-DS4`. But **this deployment no longer installs `ds4` at all**: measured head-to-head it lost to `llamacpp:rocm` on the same model (12.8 vs 17.08 tok/s, on a coarser quant, with broken telemetry), so the backend was uninstalled and the 81 GB download deleted. Use `deepseek-v4`, which serves the better quant already on disk. See [PERFORMANCE](PERFORMANCE.md#lemonade-server-1180).
 
 ### Throughput collapses after deploying Lemonade, or a model OOMs on load
 
@@ -623,6 +636,12 @@ A rising `gen=` counter means the server is working normally; restarting discard
 
 This also invalidates client-side timing: never benchmark against a server that is serving someone else, because a queued request inherits the wait of whatever is ahead of it.
 
-### Streaming responses arrive all at once on `ds4`
+### Streaming responses arrive all at once, and the token counters read zero
 
-Known upstream limitation of the experimental `ds4` backend: deltas are delivered in one burst when generation completes rather than incrementally. Throughput is unaffected — only the streaming UX. There is nothing to configure.
+Both are symptoms of the experimental `ds4` backend, which this deployment no longer installs. Its deltas arrive in one burst when generation completes rather than incrementally, so Lemonade never observes a first token and logs `ttft=0.00s, tps=0.00` — the UI's rate counters follow. The API `usage` block stays correct throughout.
+
+On `llamacpp:rocm` both work normally (`ttft=0.32-0.50s` measured). If you see this, check whether something reinstalled `ds4:rocm`:
+
+```bash
+podman exec lemonade-server lemonade backends --all | grep ds4
+```
