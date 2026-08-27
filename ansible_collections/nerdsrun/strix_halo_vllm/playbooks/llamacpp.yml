@@ -7,3 +7,14 @@
     - role: nerdsrun.strix_halo_vllm.kernel_tuning
     - role: nerdsrun.strix_halo_vllm.gpu_tuning
     - role: nerdsrun.strix_halo_vllm.llamacpp_service
+
+    # Open WebUI bakes its backend URL in at container creation, so every
+    # path that changes which stack owns the GPU has to repoint it — not just
+    # the one that switches INTO this stack. Runs only when ui_enabled; the
+    # role recreates the container if the URL drifted, and the chat history
+    # volume survives that.
+    - role: nerdsrun.strix_halo_vllm.openwebui_ui
+      vars:
+        strix_halo_mode: llamacpp
+      tags:
+        - ui

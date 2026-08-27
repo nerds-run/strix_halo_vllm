@@ -75,13 +75,20 @@
       changed_when: false
       failed_when: false
 
-    - name: Remove Open WebUI container when its backend URL is stale
+    # An ABSENT OPENAI_API_BASE_URL is drift as much as a wrong one: a
+    # hand-made or older container without it would otherwise be skipped by
+    # the existence check below and left with no backend at all, while the
+    # role cheerfully prints the URL it thinks is in effect. The rc guard is
+    # what separates "the variable is not set" (rc 0, empty stdout — stale)
+    # from "inspect itself failed" (rc non-zero via pipefail — leave the
+    # container alone rather than churn on a transient podman error).
+    - name: Remove Open WebUI container when its backend URL is stale or absent
       ansible.builtin.command:
         cmd: "podman rm -f {{ openwebui_container_name }}"
       when:
         - openwebui_ui_exists.rc == 0
-        - (openwebui_ui_current_url.stdout | default('') | trim) | length > 0
-        - (openwebui_ui_current_url.stdout | trim) != openwebui_ui_resolved_api_url
+        - openwebui_ui_current_url.rc | default(1) == 0
+        - (openwebui_ui_current_url.stdout | default('') | trim) != openwebui_ui_resolved_api_url
       changed_when: true
 
     - name: Re-check container existence after any stale removal
