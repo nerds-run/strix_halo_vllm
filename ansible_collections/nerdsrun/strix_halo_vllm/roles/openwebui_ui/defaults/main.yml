@@ -7,6 +7,7 @@ openwebui_data_volume: "open-webui"
 openwebui_auth_enabled: true
 firewall_open_ui_port: false
 # API base URL — auto-resolved in tasks based on strix_halo_mode.
+# lemonade default: http://127.0.0.1:13305/v1
 # Override here to point at a custom endpoint.
 # vLLM default: http://127.0.0.1:8000/v1
 # llama.cpp default: http://127.0.0.1:8080/v1

@@ -96,7 +96,6 @@
               - "'minimax' in llamacpp_model_profiles"
               - "'lightning' in llamacpp_model_profiles"
               - "'coder-next' in llamacpp_model_profiles"
-              - "'deepseek' in llamacpp_model_profiles"
               - "llamacpp_model_profiles.big.repo is defined"
               - "llamacpp_model_profiles.coder.jinja | bool"
               - "llamacpp_model_profiles.coder.repeat_penalty | float > 0"
@@ -158,22 +157,21 @@
               - "llamacpp_model_profiles.minimax.cache_type_v in ['q4_0', 'q8_0']"
             fail_msg: "minimax profile is missing MiniMax-M2.7 required launch params"
 
-        - name: "Assert deepseek profile has required DeepSeek-V4-Flash launch config"
+        # The Vulkan-targeted `deepseek` profile was REMOVED, not re-gated.
+        # It only ever existed to hold the model against an image that cannot
+        # load `deepseek4`; `deepseek-v4` on ROCm supersedes it entirely, and
+        # a permanently-gated profile is an invitation to ungate it. Its
+        # weights (118 GB) were deleted, so reintroducing the name would mean
+        # a re-download of a model that is already served better.
+        - name: "Assert the Vulkan deepseek profile stays removed"
           ansible.builtin.assert:
             that:
-              - "llamacpp_model_profiles.deepseek.repo == 'unsloth/DeepSeek-V4-Flash-0731-GGUF'"
-              # UD-IQ3_XXS (104.2 GB), NOT UD-Q3_K_XL — that tier is 128.2 GB
-              # and cannot fit 128 GB of unified memory. Pinned so the larger
-              # quant can't be reintroduced without tripping this test.
-              - "'UD-IQ3_XXS' in llamacpp_model_profiles.deepseek.file"
-              - "'UD-Q3_K_XL' not in llamacpp_model_profiles.deepseek.file"
-              - "llamacpp_model_profiles.deepseek.ctx_size | int == 131072"
-              - "llamacpp_model_profiles.deepseek.jinja | bool"
-              # KV quantization is on by default for this profile.
-              - "llamacpp_model_profiles.deepseek.cache_type_k == 'q8_0'"
-              - "llamacpp_model_profiles.deepseek.cache_type_v == 'q8_0'"
-              - "'--reasoning-format auto' in llamacpp_model_profiles.deepseek.extra_args"
-            fail_msg: "deepseek profile is missing required DeepSeek-V4-Flash launch params or its unsupported gate"
+              - "'deepseek' not in llamacpp_model_profiles"
+              - "'deepseek-v4' in llamacpp_model_profiles"
+            fail_msg: >-
+              The bare `deepseek` profile is back. It targets the Vulkan image,
+              where the deepseek4 arch has no implementation, and its 118 GB of
+              weights were deleted. Use `deepseek-v4` (ROCm) instead.
 
         # deepseek was ungated on 2026-08-13 after it was verified to run.
         # The guard mechanism stays in the role for future use; no profile
@@ -784,3 +782,54 @@
           loop: "{{ _lemon_docs.results }}"
           loop_control:
             label: "{{ item.item | basename }}"
+
+    - name: "Test every backend playbook repoints the UI"
+      block:
+        # Open WebUI bakes its backend URL in at creation, so a playbook that
+        # changes which stack owns the GPU and does NOT run openwebui_ui
+        # leaves the UI pointing at a port that Conflicts= now guarantees is
+        # dead. Switching INTO Lemonade was fixed first; the reverse
+        # transitions are just as broken and just as silent.
+        - name: "Read the backend deployment playbooks"
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../playbooks/{{ item }}"
+          register: _backend_plays
+          loop:
+            - lemonade.yml
+            - llamacpp.yml
+            - service.yml
+          loop_control:
+            label: "{{ item }}"
+
+        - name: "Assert each one runs openwebui_ui with its own mode"
+          ansible.builtin.assert:
+            that:
+              - "'openwebui_ui' in (item.content | b64decode)"
+              - "'strix_halo_mode:' in (item.content | b64decode)"
+            fail_msg: >-
+              {{ item.item }} changes which stack owns the GPU but does not
+              run openwebui_ui with a strix_halo_mode. The UI would keep its
+              previous backend URL and fail every request with no clue why.
+          loop: "{{ _backend_plays.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        # An absent OPENAI_API_BASE_URL is drift too — otherwise a hand-made
+        # container without it is skipped by the existence check and left with
+        # no backend, while the role prints the URL it believes is in effect.
+        - name: "Read the openwebui_ui tasks"
+          ansible.builtin.slurp:
+            src: "{{ playbook_dir }}/../../roles/openwebui_ui/tasks/main.yml"
+          register: _ui_tasks
+
+        - name: "Assert an absent backend URL counts as stale"
+          ansible.builtin.assert:
+            that:
+              - "'stale or absent' in (_ui_tasks.content | b64decode)"
+              - >-
+                (_ui_tasks.content | b64decode)
+                | regex_search('stdout \\| default\\(.{0,4}\\) \\| trim\\) \\| length > 0') is none
+            fail_msg: >-
+              The drift check must treat an empty OPENAI_API_BASE_URL as stale.
+              A `length > 0` guard skips exactly the containers that most need
+              recreating — the ones with no backend configured at all.

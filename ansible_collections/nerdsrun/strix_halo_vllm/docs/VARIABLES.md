@@ -78,7 +78,7 @@ Pin the amdgpu (gfx1151) iGPU to a high-performance state so Vulkan compute work
 | `llamacpp_enabled` | bool | `true` | Enable the llama.cpp server |
 | `llamacpp_host` | string | `"0.0.0.0"` | llama.cpp bind address |
 | `llamacpp_port` | int | `8080` | llama.cpp listen port |
-| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `qwen38`, `qwen38-fp4`, `nemotron`, `lightning`, `super`, `coder-next`, `minimax`, `deepseek-v4`, or `deepseek` (gated -- see `unsupported_reason`) |
+| `llamacpp_model_profile` | string | `"big"` | Model profile: `big`, `coder`, `fast`, `qwen38`, `qwen38-fp4`, `nemotron`, `lightning`, `super`, `coder-next`, `minimax`, or `deepseek-v4` |
 | `llamacpp_model_profiles` | dict | (see defaults) | Profile definitions. Per-profile keys: `repo`, `file`, `include`, `ctx_size`, `temp`, `top_p`, `top_k`, `min_p`, `jinja`, `repeat_penalty`, `presence_penalty`, `batch_size`, `ubatch_size`, `cache_type_k`, `cache_type_v`, `parallel_slots`, `mmproj_file`, `draft_file`, `draft_ngl`, `extra_args`, `unsupported_reason`. `repeat_penalty` / `presence_penalty` of `0` omit the flag entirely rather than passing `0`. `include` accepts a string (one glob) **or a list** — each pattern becomes its own repeated `--include` flag, which is required: `hf download --include "a" "b"` silently reparses the trailing patterns as positional filenames and discards `--include` altogether. `mmproj_file` renders `--mmproj` (vision projector; vision is silently off without it). `draft_file` renders `--model-draft` plus `--spec-type` (`spec_type`, default `draft-mtp`), `--spec-draft-ngl` (`draft_ngl`, default 99) and `--spec-draft-n-max` (`spec_n_max`, default 4); `draft_repo` points the drafter at a different HF repo from the target and triggers a second download; `draft_device` / `main_device` render `--spec-draft-device` / `-dev`. `chat_template_kwargs` (dict) renders `--chat-template-kwargs` as JSON — used to pin a default `reasoning_effort`.
 
 **Backend is a per-profile property.** Most profiles use the global Vulkan `llamacpp_image`; two override it:
@@ -144,6 +144,7 @@ This is what lets `deepseek-v4` be served by Lemonade at **17.08 tok/s with 0 GB
 Two practical notes:
 
 - **Discovered names come from the directory**, e.g. `Kevletesteur_DeepSeek-V4-Flash-0731-StrixHalo-Verified-GGUF`. Bind something usable with `lemonade_aliases`.
+- **Sharded models produce cosmetic junk entries.** The scan walks subdirectories, so a repo laid out as `UD-Q4_K_XL/model-00001-of-00003.gguf` registers under the quant directory name, and the model picker gains entries like `UD-Q4_K_XL`, `Q8_0` and `MTP`. They are harmless — loading one works — but they are noise. Alias the models you actually use and ignore the rest, or narrow `lemonade_extra_models_host_dir` to a curated directory if the clutter matters more than sharing the whole tree.
 - **Precedence is registered > imported > built-in**, so a downloaded model of the same bare name shadows a mounted one. `extra.NAME` addresses the mounted copy explicitly.
 
 ### `enable_dgpu_gtt` — why a model silently disappears without it

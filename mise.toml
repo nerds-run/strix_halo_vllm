@@ -154,10 +154,6 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY 
 description = "Deploy llama.cpp — minimax profile (MiniMax-M2.7 229B/10B, agentic/long-context)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=minimax"
 
-[tasks."deploy:llamacpp:deepseek"]
-description = "Deploy llama.cpp — deepseek profile (DeepSeek-V4-Flash-0731, EXPERIMENTAL — gated, no Vulkan support yet)"
-run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=deepseek"
-
 [tasks."deploy:all"]
 description = "Run full deployment (toolbox + service + all components)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/site.yml -i $INVENTORY"

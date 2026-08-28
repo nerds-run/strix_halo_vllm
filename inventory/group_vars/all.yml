@@ -13,6 +13,15 @@ strix_halo_kernel_reboot_allowed: true
 
 # UI & networking
 ui_enabled: true
+
+# This deployment's Open WebUI was created by hand as `open-webui-ling`, not
+# under the role's default name. Without these overrides the role does not see
+# it: it tries to create a second `open-webui` container, which cannot bind
+# port 3000 and dies in Created state, while the real UI keeps pointing at
+# whatever backend it was born with. Chat history lives in the same-named
+# volume, so the role can recreate the container without losing it.
+openwebui_container_name: "open-webui-ling"
+openwebui_data_volume: "open-webui-ling"
 firewall_open_ui_port: true
 firewall_open_vllm_port: true
 
