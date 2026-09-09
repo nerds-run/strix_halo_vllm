@@ -14,38 +14,73 @@
     - lemonade
     - lemonade_slots
 
-- name: "Submit per-model slot options to Lemonade"
+- name: "Validate the slot configuration without applying it"
   ansible.builtin.uri:
     url: >-
       http://127.0.0.1:{{ lemonade_port }}/api/v1/models/{{ lemonade_slot_target_model }}/options
     method: POST
     body_format: json
-    body:
-      ctx_size: "{{ lemonade_slot_ctx_size | int }}"
-      llamacpp_args: "{{ lemonade_slot_llamacpp_args | trim }}"
-      # Keep the catalog's own args (sampling defaults, the chat-template
-      # kwargs, --spec-type draft-mtp). We are overriding three flags, not
-      # replacing the model's tuned baseline.
-      merge_args: true
+    # dry_run validates and does NOT persist, so this costs no eviction. It is
+    # the one chance to catch a rejected ctx_size (Lemonade advertises
+    # max_context_window 262144 for this model, and we ask for a multiple of it)
+    # before the model is torn down.
+    body: "{{ {'ctx_size': lemonade_slot_ctx_size | int,
+               'llamacpp_args': lemonade_slot_llamacpp_args | trim,
+               'merge_args': true,
+               'dry_run': true} }}"
   become: false
-  register: lemonade_slot_apply
-  changed_when: lemonade_slot_apply.status == 200
+  register: lemonade_slot_dryrun
+  changed_when: false
   when: lemonade_enabled | bool
   tags:
     - lemonade
     - lemonade_slots
 
-- name: "Reload the model so the new options take effect"
+# One atomic call rather than "save options, then reload". /v1/load takes the
+# recipe options directly, so a failure here cannot leave persisted options
+# that only surface on some later load — which is exactly the confusing
+# half-applied state the two-step version could produce.
+#
+# EVICTION: this tears down and relaunches llama-server. Anything mid-request
+# against the old process is interrupted.
+- name: "Load the model with the slot configuration"
   ansible.builtin.uri:
     url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/load"
     method: POST
     body_format: json
-    body:
-      model_name: "{{ lemonade_slot_target_model }}"
-    timeout: "{{ lemonade_slot_load_timeout }}"
+    body: "{{ {'model_name': lemonade_slot_target_model,
+               'ctx_size': lemonade_slot_ctx_size | int,
+               'llamacpp_args': lemonade_slot_llamacpp_args | trim,
+               'merge_args': true,
+               'save_options': true} }}"
+    timeout: "{{ lemonade_slot_load_timeout | int }}"
   become: false
-  register: lemonade_slot_reload
-  changed_when: lemonade_slot_reload.status == 200
+  register: lemonade_slot_load
+  changed_when: lemonade_slot_load.status == 200
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Read back the launched command"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
+    method: GET
+    status_code: 200
+  become: false
+  register: lemonade_slot_health
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Extract the rendered argv for the target model"
+  ansible.builtin.set_fact:
+    lemonade_slot_argv: >-
+      {{ (lemonade_slot_health.json.all_models_loaded
+          | selectattr('model_name', 'equalto', lemonade_slot_target_model)
+          | map(attribute='launch_command') | first | default([]))
+         | join(' ') }}
   when: lemonade_enabled | bool
   tags:
     - lemonade
@@ -77,6 +112,29 @@
           | selectattr('model_name', 'equalto', lemonade_slot_target_model)
           | map(attribute='launch_command') | first | default([]))
          | join(' ') }}
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# Distinguish a model that never came up from one that came up wrong. An
+# unknown flag makes llama-server refuse to start, and without this the argv
+# comparison below would report a mismatch and hide the real cause.
+- name: "Assert the model actually loaded"
+  ansible.builtin.assert:
+    that:
+      - lemonade_slot_health.json.all_models_loaded | default([]) | length > 0
+      - >-
+        lemonade_slot_health.json.all_models_loaded
+        | selectattr('model_name', 'equalto', lemonade_slot_target_model)
+        | selectattr('backend_health', 'equalto', 'ready') | list | length > 0
+    fail_msg: >-
+      {{ lemonade_slot_target_model }} did not come up ready after applying
+      profile '{{ lemonade_slot_profile }}'. A flag llama-server does not
+      recognise will refuse the launch outright — check the args
+      '{{ lemonade_slot_llamacpp_args | trim }}' against this build before
+      reading the argv comparison below.
+    success_msg: "Model reloaded and reports backend_health=ready"
   when: lemonade_enabled | bool
   tags:
     - lemonade

@@ -160,3 +160,46 @@ class TestMemoryModel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConstantsMatchAnsible(unittest.TestCase):
+    """The Python sweep and the Ansible deploy guard each carry their own copy
+    of the model geometry. Both are anchored to the same hardware measurement,
+    but nothing stops one file's constant from being updated without the other
+    — at which point the guard and the benchmark describe different machines.
+    This test makes the agreement enforced rather than merely asserted.
+    """
+
+    DEFAULTS = os.path.join(
+        os.path.dirname(__file__), "..", "..",
+        "ansible_collections", "nerdsrun", "strix_halo_vllm",
+        "roles", "lemonade_service", "defaults", "main.yml",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        import re as _re
+        with open(cls.DEFAULTS) as fh:
+            text = fh.read()
+        cls.vals = {}
+        for key in (
+            "lemonade_slot_model_gib",
+            "lemonade_slot_kv_kib_per_token",
+            "lemonade_slot_ckpt_mib",
+            "lemonade_gtt_budget_gib",
+        ):
+            m = _re.search(rf"^{key}:\s*([\d.]+)\s*$", text, _re.M)
+            assert m, f"{key} not found in {cls.DEFAULTS}"
+            cls.vals[key] = float(m.group(1))
+
+    def test_model_size_matches(self):
+        self.assertEqual(self.vals["lemonade_slot_model_gib"], ss.MODEL_GIB)
+
+    def test_kv_per_token_matches(self):
+        self.assertEqual(self.vals["lemonade_slot_kv_kib_per_token"], ss.KV_KIB_PER_TOKEN)
+
+    def test_checkpoint_size_matches(self):
+        self.assertEqual(self.vals["lemonade_slot_ckpt_mib"], ss.CKPT_MIB)
+
+    def test_budget_matches(self):
+        self.assertEqual(self.vals["lemonade_gtt_budget_gib"], ss.BUDGET_GIB)
