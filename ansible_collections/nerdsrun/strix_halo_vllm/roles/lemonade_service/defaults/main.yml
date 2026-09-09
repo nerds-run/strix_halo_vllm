@@ -13,10 +13,23 @@ lemonade_container_name: lemonade-server
 
 # Pinned by digest, same discipline as llamacpp_image. The `latest` and
 # `vX.Y.Z` tags both move; a silent image move already cost this fleet 33% of
-# a profile's decode once. This digest is the linux/amd64 manifest of v11.8.0.
-lemonade_version: "11.8.0"
+# a profile's decode once. This digest is the linux/amd64 manifest of v11.9.0.
+#
+# 11.9.0 brings three things that matter here: llama.cpp b10723 (adds Qwen3-Next
+# support, and our Qwen3.8-27B is arch `qwen35` — the Qwen3-Next family), the
+# fixed 120s prefill timeout becoming a 600s configurable `global_timeout`
+# (26K-token prompts already take ~86s before any slot contention), and the
+# `llamacpp-hrx` backend.
+#
+# HRX is NOT enabled here. It is AMD's HRX runtime in early access, Linux and
+# gfx1100/gfx1151 only — which is exactly this hardware — claiming 30-50%
+# prefill uplift over Vulkan/HIP. It was tuned on Qwen3-30B-A3B, not on our
+# weights, so it is a benchmark hypothesis rather than a default. Switch with
+# `llamacpp.backend: hrx` and measure it as its own variable; do not combine it
+# with a slot change.
+lemonade_version: "11.9.0"
 lemonade_image: >-
-  ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc210afc282aea5c23bc3af5674d991239d9620d46cdd4ccafd16f7375f
+  ghcr.io/lemonade-sdk/lemonade-server@sha256:7c780707cd695392a8680f557c7c1d55521383a71b1c4c5a9d9e6a226a1bee91
 
 lemonade_host: "0.0.0.0"
 lemonade_port: 13305
@@ -170,3 +183,67 @@ lemonade_stop_conflicting_services:
 lemonade_gtt_drain_timeout: 120
 
 firewall_open_lemonade_port: false
+
+# ---------------------------------------------------------------------------
+# Slot / context profiles
+# ---------------------------------------------------------------------------
+# Slots SUBDIVIDE llama-server's context rather than each getting their own, so
+# holding a full 262144-token window per request means asking for
+# parallel x 262144 in TOTAL. Verified live via /props total_slots and
+# /slots[0].n_ctx — never from the rendered flag.
+#
+# `--parallel 1` is Lemonade's own catalog default for Qwen3.8-27B (it became
+# the llamacpp backend default in 11.8.0), NOT something this repo sets. We
+# override it per-model through POST /api/v1/models/{id}/options, which needs
+# no re-pull of the 17 GB weights.
+lemonade_slot_profile: "single"
+
+lemonade_slot_profiles:
+  single:
+    parallel: 1
+    ctx_per_slot: 262144
+  dual:
+    parallel: 2
+    ctx_per_slot: 262144
+  triple:
+    parallel: 3
+    ctx_per_slot: 262144
+
+# Recurrent-state checkpoints are kept PER SLOT and serialized fp32 into host
+# RAM, so this term scales with slot count, not with context. At the llama.cpp
+# default of 32 that is ~4.7 GiB per slot on this geometry
+# (ggml-org/llama.cpp#27211); the Vulkan `qwen38` profile already pins 8 for
+# the same reason. Fewer checkpoints means more recompute on slot rollback.
+lemonade_ctx_checkpoints: 8
+
+# In-memory prompt-cache pool. The llama.cpp default is 8192 MiB, and on this
+# workload that is far too small: cache entries measure 1.3-2.6 GiB each, so
+# the pool holds three to five of them and logs
+#   "srv alloc: - making room for prompt cache entry, removing oldest entry"
+# on essentially every request. 76 of 83 requests in a 48h sample paid a full
+# prefill as a result. This is a benchmark axis, not a settled value.
+lemonade_cache_ram_mib: 8192
+
+# Ceiling for the memory guard, in GiB. NOT the 124 GiB GTT maximum: buff/cache
+# holds the 16.7 GB GGUF, and pinning GTT past roughly this point evicts it and
+# triggers the documented throughput cliff (deepseek-v4 measured 120 of 125 GB
+# resident, buff/cache collapsed to ~1 GB, decode 3.88 tok/s against ~20-27).
+lemonade_gtt_budget_gib: 85
+
+# Memory geometry of the model the slot profile applies to. Parsed from the
+# GGUF header on hardware (arch qwen35, block_count 65, head_count_kv 4,
+# key_length = value_length = 256, ssm.inner_size 6144):
+#   16 attention layers x 4 kv_heads x (256 + 256) x 2 B = 64 KiB per token
+#   weights 16746 MiB + mmproj-F16 885 MiB = 17.22 GiB
+# These are per-model facts — re-derive them before pointing this at other
+# weights. `lemonade bench` is the way to confirm.
+lemonade_slot_model_gib: 17.22
+lemonade_slot_kv_kib_per_token: 64
+lemonade_slot_ckpt_mib: 149.6
+lemonade_slot_target_model: "Qwen3.8-27B-GGUF"
+
+# Seconds to allow for a model reload when applying a slot profile. Loading
+# ~17 GB of weights plus allocating KV for the full context takes tens of
+# seconds; Lemonade's own prefill timeout became 600s in 11.9.0 for the same
+# reason.
+lemonade_slot_load_timeout: 600

@@ -1,0 +1,25 @@
+---
+# Unit-test harness for the Lemonade slot-profile computation.
+#
+# The task file is included BY PATH rather than through include_role, so the
+# role's meta dependency on host_prereqs (which asserts Fedora + gfx1151) does
+# not run. The computation under test needs neither hardware nor a container,
+# and this keeps the scenario runnable in CI on any host.
+- name: Converge
+  hosts: all
+  gather_facts: false
+  vars_files:
+    - ../../roles/lemonade_service/defaults/main.yml
+  tasks:
+    - name: "Compute slot args for the default profile"
+      ansible.builtin.include_tasks: ../../roles/lemonade_service/tasks/slot_args.yml
+
+    - name: "Report computed values"
+      ansible.builtin.debug:
+        msg: >-
+          profile={{ lemonade_slot_profile }}
+          parallel={{ lemonade_slot_parallel }}
+          ctx_size={{ lemonade_slot_ctx_size }}
+          est_gib={{ lemonade_slot_est_gib }}
+          est_total_gib={{ lemonade_slot_est_total_gib }}
+          args='{{ lemonade_slot_llamacpp_args }}'

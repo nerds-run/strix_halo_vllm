@@ -1,0 +1,106 @@
+---
+# Apply a slot/context profile to one Lemonade-managed model.
+#
+# Uses POST /api/v1/models/{id}/options (added in Lemonade 11.7.0), which
+# persists per-model recipe options WITHOUT re-pulling the weights — a re-pull
+# would mean re-downloading ~17 GB to change one integer.
+#
+# EVICTION WARNING: new options only take effect when the model next loads, so
+# this reloads it. Anything mid-request against the old process is interrupted.
+
+- name: "Compute the slot configuration"
+  ansible.builtin.include_tasks: slot_args.yml
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Submit per-model slot options to Lemonade"
+  ansible.builtin.uri:
+    url: >-
+      http://127.0.0.1:{{ lemonade_port }}/api/v1/models/{{ lemonade_slot_target_model }}/options
+    method: POST
+    body_format: json
+    body:
+      ctx_size: "{{ lemonade_slot_ctx_size | int }}"
+      llamacpp_args: "{{ lemonade_slot_llamacpp_args | trim }}"
+      # Keep the catalog's own args (sampling defaults, the chat-template
+      # kwargs, --spec-type draft-mtp). We are overriding three flags, not
+      # replacing the model's tuned baseline.
+      merge_args: true
+  become: false
+  register: lemonade_slot_apply
+  changed_when: lemonade_slot_apply.status == 200
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Reload the model so the new options take effect"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/load"
+    method: POST
+    body_format: json
+    body:
+      model_name: "{{ lemonade_slot_target_model }}"
+    timeout: "{{ lemonade_slot_load_timeout }}"
+  become: false
+  register: lemonade_slot_reload
+  changed_when: lemonade_slot_reload.status == 200
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# THE READBACK GUARD.
+#
+# Never trust the flag we submitted. Lemonade merges our args with the
+# catalog's, the catalog already emits `--parallel 1`, and llama.cpp takes the
+# LAST occurrence of a repeated flag — so a merge that orders them the wrong
+# way yields a server quietly running a different slot count than we asked for.
+# The only authority is the argv the server was actually launched with.
+- name: "Read back the launched command"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
+    method: GET
+    status_code: 200
+  become: false
+  register: lemonade_slot_health
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Extract the rendered argv for the target model"
+  ansible.builtin.set_fact:
+    lemonade_slot_argv: >-
+      {{ (lemonade_slot_health.json.all_models_loaded
+          | selectattr('model_name', 'equalto', lemonade_slot_target_model)
+          | map(attribute='launch_command') | first | default([]))
+         | join(' ') }}
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Assert the server actually launched with the requested slot count"
+  ansible.builtin.assert:
+    that:
+      # The flag must be present exactly once, and carry our value. A second
+      # occurrence means the merge lost the argument and the declared slot
+      # count is a lie.
+      - (lemonade_slot_argv | regex_findall('--parallel')) | length == 1
+      - "'--parallel ' ~ lemonade_slot_parallel in lemonade_slot_argv"
+      - "'--ctx-size ' ~ lemonade_slot_ctx_size in lemonade_slot_argv"
+    fail_msg: >-
+      Lemonade launched llama-server with an argv that does not match the
+      requested profile '{{ lemonade_slot_profile }}'
+      ({{ lemonade_slot_parallel }} slots, ctx {{ lemonade_slot_ctx_size }}).
+      Rendered argv: {{ lemonade_slot_argv }}
+    success_msg: >-
+      Verified live: {{ lemonade_slot_parallel }} slot(s),
+      ctx {{ lemonade_slot_ctx_size }}
+      ({{ lemonade_slot_ctx_size | int // (lemonade_slot_parallel | int) }} per request)
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots

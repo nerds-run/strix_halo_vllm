@@ -154,6 +154,18 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY 
 description = "Deploy llama.cpp — minimax profile (MiniMax-M2.7 229B/10B, agentic/long-context)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=minimax"
 
+[tasks."lemonade:slots:1"]
+description = "Lemonade: 1 slot(s) x 262144 ctx (single profile)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade_slots.yml -i $INVENTORY -e lemonade_slot_profile=single"
+
+[tasks."lemonade:slots:2"]
+description = "Lemonade: 2 slot(s) x 262144 ctx (dual profile)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade_slots.yml -i $INVENTORY -e lemonade_slot_profile=dual"
+
+[tasks."lemonade:slots:3"]
+description = "Lemonade: 3 slot(s) x 262144 ctx (triple profile)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade_slots.yml -i $INVENTORY -e lemonade_slot_profile=triple"
+
 [tasks."deploy:all"]
 description = "Run full deployment (toolbox + service + all components)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/site.yml -i $INVENTORY"

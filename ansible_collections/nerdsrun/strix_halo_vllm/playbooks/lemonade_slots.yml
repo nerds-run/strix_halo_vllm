@@ -1,0 +1,27 @@
+---
+# Apply a slot/context profile to the running Lemonade deployment.
+#
+# Deliberately NOT part of lemonade.yml: this reloads the model, interrupting
+# anything mid-request, so it is an explicit on-demand operation rather than
+# something a routine converge does as a side effect.
+#
+#   mise run lemonade:slots:1   # 1 slot  x 262144  (full window, default)
+#   mise run lemonade:slots:2   # 2 slots x 262144  (524288 total)
+#   mise run lemonade:slots:3   # 3 slots x 262144  (786432 total)
+#
+# Slots SUBDIVIDE context, so each profile asks for parallel x 262144 in total
+# to keep a full native window per request. The role refuses any combination
+# that would exceed lemonade_gtt_budget_gib, and verifies the result against
+# the argv the server actually launched with rather than the flag submitted.
+- name: Apply a Lemonade slot profile
+  hosts: all
+  gather_facts: true
+
+  tasks:
+    - name: "Apply the slot profile"
+      ansible.builtin.include_role:
+        name: nerdsrun.strix_halo_vllm.lemonade_service
+        tasks_from: apply_slots
+      tags:
+        - lemonade
+        - lemonade_slots
