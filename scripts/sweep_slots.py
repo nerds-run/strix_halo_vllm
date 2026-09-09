@@ -174,6 +174,92 @@ def parse_cache_evictions(log_text: str) -> dict:
     }
 
 
+# --- Prefix-reuse workload ------------------------------------------------
+
+# One paragraph of filler, repeated to reach the requested prefix length. The
+# content is irrelevant — what matters is that every request shares a long,
+# identical prefix, because that is the shape of the traffic this box actually
+# serves (the same ~9463-token prompt, over and over) and the shape an
+# undersized prompt-cache pool destroys.
+_FILLER = (
+    "The deployment runs llama.cpp behind Lemonade on an AMD Ryzen AI Max 395 "
+    "with 128 GB of unified memory, serving a hybrid linear-attention model "
+    "where only sixteen of sixty-five layers carry a KV cache. "
+)
+
+
+# A cached entry for a ~9.5K-token prefix measures ~1.5 GiB on this model —
+# taken from the eviction lines the live server logs, not from theory.
+CACHE_ENTRY_GIB = 1.5
+
+
+def build_prefix_reuse_workload(
+    prefix_tokens: int, n_requests: int, distinct_prefixes: int = 1
+) -> list[str]:
+    """N prompts drawn from `distinct_prefixes` long prefixes, cycled.
+
+    Cycled rather than blocked: a prefix has to come back AFTER the others have
+    had a chance to evict it, which is what makes an undersized pool show up.
+    Running each prefix's requests consecutively would only ever measure one
+    cold prefill followed by guaranteed hits.
+
+    Roughly 4 characters per token is close enough — the prefix only has to be
+    long enough to dominate prefill, not to hit an exact count.
+    """
+    reps = max(1, (prefix_tokens * 4) // len(_FILLER))
+    prefixes = [
+        f"Document {d}. " + (_FILLER * reps) for d in range(distinct_prefixes)
+    ]
+    return [
+        f"{prefixes[i % distinct_prefixes]}"
+        f"\n\nQuestion {i}: summarise the document above in {i + 3} words."
+        for i in range(n_requests)
+    ]
+
+
+def pool_will_thrash(distinct_prefixes: int, cache_ram_mib: int) -> bool:
+    """Whether the working set is too big for the pool to hold.
+
+    This is the production failure: entries are ~1.5 GiB, the default pool is
+    8 GiB, so anything past ~5 live prefixes evicts on every request.
+    """
+    return distinct_prefixes * CACHE_ENTRY_GIB > cache_ram_mib / 1024
+
+
+def extract_delta_text(chunk: dict) -> str:
+    """Text from one streaming chunk, counting reasoning as well as content.
+
+    Qwen3.8 emits most of a short response as `reasoning_content`; counting
+    only `content` under-counts tokens badly and can report no decode at all.
+    """
+    try:
+        delta = chunk["choices"][0]["delta"]
+    except (KeyError, IndexError, TypeError):
+        return ""
+    return (delta.get("reasoning_content") or "") + (delta.get("content") or "")
+
+
+def summarize_cache_benefit(ttfts: list[float]) -> dict:
+    """Compare the first request's TTFT against the rest.
+
+    The first pays a full prefill by definition. If the rest also do, the pool
+    could not hold the entry between requests — which is the thrash already
+    visible in production, not a property of the model.
+    """
+    if len(ttfts) < 2:
+        return {"cache_effective": None, "first_s": ttfts[0] if ttfts else None,
+                "rest_mean_s": None, "speedup": None}
+    first = ttfts[0]
+    rest = sum(ttfts[1:]) / len(ttfts[1:])
+    speedup = (first / rest) if rest > 0 else float("inf")
+    return {
+        "cache_effective": speedup >= 2.0,
+        "first_s": round(first, 2),
+        "rest_mean_s": round(rest, 2),
+        "speedup": round(speedup, 2),
+    }
+
+
 # --- Live driver ----------------------------------------------------------
 
 def _api(host: str, port: int, path: str, body: dict | None = None, timeout: int = 900):
@@ -222,6 +308,70 @@ def apply_config(host: str, port: int, model: str, cfg: SweepConfig) -> tuple[bo
     return ok, why, argv
 
 
+def run_workload(
+    host: str, port: int, model: str, prompts: list[str], max_tokens: int = 64,
+    concurrency: int = 1,
+) -> dict:
+    """Send the prompts and measure TTFT plus decode rate for each.
+
+    Streaming, because TTFT is the number the cache-ram axis moves and it is
+    only observable on the first token, not on total latency.
+    """
+    import concurrent.futures as _cf
+
+    def one(prompt: str) -> dict:
+        body = json.dumps({
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": True,
+        }).encode()
+        req = urllib.request.Request(
+            f"http://{host}:{port}/api/v1/chat/completions",
+            data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        t0 = time.perf_counter()
+        ttft = None
+        ntok = 0
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                if extract_delta_text(chunk):
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                    ntok += 1
+        total = time.perf_counter() - t0
+        decode = (ntok - 1) / (total - ttft) if ttft and total > ttft and ntok > 1 else 0.0
+        return {"ttft_s": ttft or total, "total_s": total, "tokens": ntok,
+                "decode_tps": round(decode, 2)}
+
+    if concurrency > 1:
+        with _cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
+            runs = list(ex.map(one, prompts))
+    else:
+        runs = [one(p) for p in prompts]
+
+    ttfts = [r["ttft_s"] for r in runs]
+    decodes = [r["decode_tps"] for r in runs if r["decode_tps"] > 0]
+    return {
+        "runs": runs,
+        "ttft_first_s": round(ttfts[0], 2) if ttfts else None,
+        "ttft_mean_s": round(sum(ttfts) / len(ttfts), 2) if ttfts else None,
+        "decode_tps_mean": round(sum(decodes) / len(decodes), 2) if decodes else None,
+        "cache": summarize_cache_benefit(ttfts),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="192.168.68.60")
@@ -234,6 +384,17 @@ def main() -> int:
     ap.add_argument("--best-cache-ram", type=int, default=None,
                     help="Pin Phase B to this pool size instead of the max")
     ap.add_argument("--ctx-checkpoints", type=int, default=8)
+    ap.add_argument("--prefix-tokens", type=int, default=9500,
+                    help="Shared-prefix length; defaults to the size the box actually serves")
+    ap.add_argument("--requests", type=int, default=12,
+                    help="Requests per config, cycled over the distinct prefixes")
+    ap.add_argument("--distinct-prefixes", type=int, default=8,
+                    help="Distinct long prefixes in the working set. The default "
+                         "exceeds the 8 GiB pool (~1.5 GiB per entry), reproducing "
+                         "the eviction thrash seen in production.")
+    ap.add_argument("--max-tokens", type=int, default=64)
+    ap.add_argument("--baseline-only", action="store_true",
+                    help="Benchmark the CURRENTLY LOADED config and exit. No reload, no eviction.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the matrix and the memory estimates; touch nothing")
     ap.add_argument("--out", default="benchmark_results")
@@ -267,6 +428,39 @@ def main() -> int:
         print("\n--dry-run: nothing applied.")
         return 0
 
+    prompts = build_prefix_reuse_workload(
+        args.prefix_tokens, args.requests, args.distinct_prefixes)
+    if pool_will_thrash(args.distinct_prefixes, 8192):
+        print(f"\nWorking set: {args.distinct_prefixes} prefixes x ~{CACHE_ENTRY_GIB} GiB "
+              f"= ~{args.distinct_prefixes * CACHE_ENTRY_GIB:.1f} GiB — "
+              f"exceeds the 8192 MiB default pool, as intended.")
+
+    if args.baseline_only:
+        # Measures whatever is loaded right now. No options written, no reload,
+        # so nothing is evicted — this is the "before" number.
+        health = _api(args.host, args.port, "/health")
+        argv = ""
+        for m in health.get("all_models_loaded", []):
+            if m.get("model_name") == args.model:
+                argv = " ".join(m.get("launch_command", []))
+        print(f"Benchmarking the loaded config (no reload).\n  argv: {argv}\n")
+        bench = run_workload(args.host, args.port, args.model, prompts,
+                             args.max_tokens, concurrency=1)
+        print(f"  TTFT first    : {bench['ttft_first_s']}s")
+        print(f"  TTFT mean     : {bench['ttft_mean_s']}s")
+        print(f"  decode tok/s  : {bench['decode_tps_mean']}")
+        print(f"  cache verdict : {bench['cache']}")
+        out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = out / f"slot_baseline_{stamp}.json"
+        path.write_text(json.dumps(
+            {"generated": stamp, "model": args.model, "argv": argv,
+             "gtt_used_mib": gtt_used_mib(args.host, args.ssh_key),
+             "prefix_tokens": args.prefix_tokens, "requests": args.requests,
+             "bench": bench}, indent=2))
+        print(f"\nWrote {path}")
+        return 0
+
     print(f"\nEach step reloads {args.model}, interrupting in-flight requests.")
     results = []
     for i, cfg in enumerate(matrix, 1):
@@ -283,10 +477,16 @@ def main() -> int:
             results.append({**asdict(cfg), "applied": False, "error": why, "argv": argv})
             continue
         after = gtt_used_mib(args.host, args.ssh_key)
+        bench = run_workload(args.host, args.port, args.model, prompts,
+                             args.max_tokens, concurrency=cfg.parallel)
+        print(f"  GTT {after} MiB (est {estimate_gtt_gib(cfg.ctx_size, cfg.parallel, cfg.ctx_checkpoints)} GiB)"
+              f"  TTFT {bench['ttft_first_s']}s -> {bench['cache']['rest_mean_s']}s"
+              f"  decode {bench['decode_tps_mean']} tok/s")
         results.append({
             **asdict(cfg), "applied": True, "argv": argv,
             "gtt_before_mib": before, "gtt_after_mib": after,
             "gtt_est_gib": estimate_gtt_gib(cfg.ctx_size, cfg.parallel, cfg.ctx_checkpoints),
+            "bench": bench,
         })
 
     out = Path(args.out)

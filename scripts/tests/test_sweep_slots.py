@@ -203,3 +203,101 @@ class TestConstantsMatchAnsible(unittest.TestCase):
 
     def test_budget_matches(self):
         self.assertEqual(self.vals["lemonade_gtt_budget_gib"], ss.BUDGET_GIB)
+
+
+class TestPrefixReuseWorkload(unittest.TestCase):
+    """The cache-ram axis is only measurable with a workload that REUSES a long
+    prefix — that is what the production traffic does (in=9463 over and over)
+    and what an undersized pool destroys. A workload of unrelated prompts would
+    show no difference between an 8 GiB and a 48 GiB pool.
+    """
+
+    def test_all_requests_share_the_prefix(self):
+        w = ss.build_prefix_reuse_workload(prefix_tokens=2000, n_requests=5)
+        prefixes = {p[: len(w[0]) - 200] for p in w}
+        self.assertEqual(len(prefixes), 1, "requests must share a common prefix")
+
+    def test_suffixes_differ(self):
+        w = ss.build_prefix_reuse_workload(prefix_tokens=2000, n_requests=5)
+        self.assertEqual(len(set(w)), 5, "each request needs a distinct suffix")
+
+    def test_request_count(self):
+        self.assertEqual(len(ss.build_prefix_reuse_workload(1000, 8)), 8)
+
+    def test_prefix_length_is_roughly_requested(self):
+        """Rough is fine — we need the prefix big enough to dominate prefill,
+        not an exact token count."""
+        w = ss.build_prefix_reuse_workload(prefix_tokens=4000, n_requests=2)
+        approx_tokens = len(w[0]) / 4
+        self.assertGreater(approx_tokens, 3000)
+        self.assertLess(approx_tokens, 6000)
+
+    def test_cache_benefit_summary_flags_a_thrashing_pool(self):
+        """First request pays full prefill; the rest should not. If they do,
+        the pool is too small for the working set."""
+        thrashing = ss.summarize_cache_benefit([26.4, 26.3, 26.5, 26.4])
+        self.assertFalse(thrashing["cache_effective"])
+        healthy = ss.summarize_cache_benefit([26.4, 0.8, 0.7, 0.9])
+        self.assertTrue(healthy["cache_effective"])
+        self.assertGreater(healthy["speedup"], 10)
+
+    def test_single_request_is_inconclusive_not_a_crash(self):
+        r = ss.summarize_cache_benefit([26.4])
+        self.assertIsNone(r["cache_effective"])
+
+
+class TestStreamDeltaExtraction(unittest.TestCase):
+    """Qwen3.8 is a reasoning model: with a short max_tokens most of the stream
+    arrives as `reasoning_content`, and only a token or two as `content`.
+    Counting `content` alone made the baseline run report decode_tps None.
+    """
+
+    def test_counts_plain_content(self):
+        chunk = {"choices": [{"delta": {"content": "hello"}}]}
+        self.assertEqual(ss.extract_delta_text(chunk), "hello")
+
+    def test_counts_reasoning_content(self):
+        chunk = {"choices": [{"delta": {"reasoning_content": "thinking..."}}]}
+        self.assertEqual(ss.extract_delta_text(chunk), "thinking...")
+
+    def test_counts_both_when_present(self):
+        chunk = {"choices": [{"delta": {"reasoning_content": "a", "content": "b"}}]}
+        self.assertEqual(ss.extract_delta_text(chunk), "ab")
+
+    def test_empty_delta_is_empty_string(self):
+        self.assertEqual(ss.extract_delta_text({"choices": [{"delta": {}}]}), "")
+
+    def test_malformed_chunk_does_not_raise(self):
+        self.assertEqual(ss.extract_delta_text({}), "")
+
+
+class TestWorkingSetExceedsPool(unittest.TestCase):
+    """Reproducing the production thrash needs MORE distinct prefixes than the
+    pool can hold. With one shared prefix an 8 GiB pool caches it fine and the
+    cache-ram axis measures nothing — which is exactly what the first baseline
+    run showed (5.6x speedup, no thrash).
+    """
+
+    def test_distinct_prefixes_are_distinct(self):
+        w = ss.build_prefix_reuse_workload(1000, n_requests=8, distinct_prefixes=4)
+        heads = {p[:2000] for p in w}
+        self.assertEqual(len(heads), 4)
+
+    def test_each_prefix_is_revisited(self):
+        """A prefix must come back AFTER others have evicted it — that is the
+        thrash. Visiting each once would only measure cold prefill."""
+        w = ss.build_prefix_reuse_workload(1000, n_requests=8, distinct_prefixes=4)
+        heads = [p[:2000] for p in w]
+        self.assertEqual(heads[0], heads[4], "prefixes must cycle, not run in blocks")
+        self.assertNotEqual(heads[0], heads[1])
+
+    def test_defaults_to_single_prefix(self):
+        w = ss.build_prefix_reuse_workload(1000, n_requests=4)
+        self.assertEqual(len({p[:2000] for p in w}), 1)
+
+    def test_estimates_pool_pressure(self):
+        """4 prefixes at ~1.5 GiB each need ~6 GiB; the 8 GiB default holds it.
+        8 prefixes do not — that is the config that reproduces production."""
+        self.assertFalse(ss.pool_will_thrash(distinct_prefixes=4, cache_ram_mib=8192))
+        self.assertTrue(ss.pool_will_thrash(distinct_prefixes=8, cache_ram_mib=8192))
+        self.assertFalse(ss.pool_will_thrash(distinct_prefixes=8, cache_ram_mib=49152))
