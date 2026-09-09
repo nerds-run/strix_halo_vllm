@@ -166,6 +166,10 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade_slots.yml -i $INVE
 description = "Lemonade: 3 slot(s) x 262144 ctx (triple profile)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade_slots.yml -i $INVENTORY -e lemonade_slot_profile=triple"
 
+[tasks."deploy:llamacpp:glm5"]
+description = "Deploy llama.cpp — glm5 profile (GLM-5.3-Flash 320B/18B glm5next, ROCm, builds its own image from source)"
+run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=glm5"
+
 [tasks."deploy:all"]
 description = "Run full deployment (toolbox + service + all components)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/site.yml -i $INVENTORY"
@@ -264,5 +268,5 @@ fi
 """
 
 [tasks."deploy:lemonade"]
-description = "Deploy Lemonade Server 11.8.0 (model router — Qwen3.8-27B on llama.cpp/ROCm + DeepSeek-V4-Flash on DwarfStar)"
+description = "Deploy Lemonade Server 11.9.0 (model router — Qwen3.8-27B on llama.cpp/ROCm + DeepSeek-V4-Flash on DwarfStar)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade.yml -i $INVENTORY"
