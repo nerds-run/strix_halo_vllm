@@ -62,30 +62,6 @@
     - lemonade
     - lemonade_slots
 
-- name: "Read back the launched command"
-  ansible.builtin.uri:
-    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
-    method: GET
-    status_code: 200
-  become: false
-  register: lemonade_slot_health
-  when: lemonade_enabled | bool
-  tags:
-    - lemonade
-    - lemonade_slots
-
-- name: "Extract the rendered argv for the target model"
-  ansible.builtin.set_fact:
-    lemonade_slot_argv: >-
-      {{ (lemonade_slot_health.json.all_models_loaded
-          | selectattr('model_name', 'equalto', lemonade_slot_target_model)
-          | map(attribute='launch_command') | first | default([]))
-         | join(' ') }}
-  when: lemonade_enabled | bool
-  tags:
-    - lemonade
-    - lemonade_slots
-
 # THE READBACK GUARD.
 #
 # Never trust the flag we submitted. Lemonade merges our args with the
