@@ -128,6 +128,18 @@ def _largest_affordable_pool(
     return max(affordable) if affordable else min(cache_ram_values)
 
 
+def resolve_concurrency(cfg: "SweepConfig", override: int | None) -> int:
+    """Offered load for a config.
+
+    Defaults to the slot count, which is convenient but NOT a controlled
+    comparison: driving 1 slot at load 1 and 2 slots at load 2 varies the slot
+    count and the offered load together. Pin the override to compare slots
+    honestly. Note `override or cfg.parallel` would be wrong — an override of 1
+    is falsy and must still be honoured.
+    """
+    return cfg.parallel if override is None else override
+
+
 def filter_phase(matrix: list[SweepConfig], phase: str) -> list[SweepConfig]:
     """Keep only the requested phase. Phases are approved and run separately,
     so a Phase A run must not quietly reload the box three more times."""
@@ -401,6 +413,10 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--baseline-only", action="store_true",
                     help="Benchmark the CURRENTLY LOADED config and exit. No reload, no eviction.")
+    ap.add_argument("--concurrency", type=int, default=None,
+                    help="Offered load, held constant across configs. Without it "
+                         "each config is driven at its own slot count, which "
+                         "varies load and slots together and cannot isolate either.")
     ap.add_argument("--phase", default="AB", choices=["A", "B", "AB"],
                     help="Which phase(s) to run. A = cache-ram at 1 slot, "
                          "B = slot count. Default runs both.")
@@ -488,15 +504,17 @@ def main() -> int:
             results.append({**asdict(cfg), "applied": False, "error": why, "argv": argv})
             continue
         after = gtt_used_mib(args.host, args.ssh_key)
+        conc = resolve_concurrency(cfg, args.concurrency)
         bench = run_workload(args.host, args.port, args.model, prompts,
-                             args.max_tokens, concurrency=cfg.parallel)
-        print(f"  GTT {after} MiB (est {estimate_gtt_gib(cfg.ctx_size, cfg.parallel, cfg.ctx_checkpoints)} GiB)"
+                             args.max_tokens, concurrency=conc)
+        print(f"  load {conc}  GTT {after} MiB (est {estimate_gtt_gib(cfg.ctx_size, cfg.parallel, cfg.ctx_checkpoints)} GiB)"
               f"  TTFT {bench['ttft_first_s']}s -> {bench['cache']['rest_mean_s']}s"
               f"  decode {bench['decode_tps_mean']} tok/s")
         results.append({
             **asdict(cfg), "applied": True, "argv": argv,
             "gtt_before_mib": before, "gtt_after_mib": after,
             "gtt_est_gib": estimate_gtt_gib(cfg.ctx_size, cfg.parallel, cfg.ctx_checkpoints),
+            "concurrency": conc,
             "bench": bench,
         })
 

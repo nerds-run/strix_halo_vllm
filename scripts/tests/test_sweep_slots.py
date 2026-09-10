@@ -319,3 +319,25 @@ class TestPhaseFilter(unittest.TestCase):
     def test_ab_keeps_everything(self):
         m = ss.build_matrix([8192, 24576], [1, 2])
         self.assertEqual(len(ss.filter_phase(m, "AB")), len(m))
+
+
+class TestConcurrencyControl(unittest.TestCase):
+    """Comparing 1 slot at concurrency 1 against 2 slots at concurrency 2
+    conflates two variables: it measures 'second slot' and 'second concurrent
+    request' together. To isolate the slot, both configs must be driven at the
+    SAME offered load — the load level where a slot could possibly help.
+    """
+
+    def test_defaults_to_the_slot_count(self):
+        cfg = ss.SweepConfig("B", 2, 524288, 24576)
+        self.assertEqual(ss.resolve_concurrency(cfg, None), 2)
+
+    def test_override_pins_load_across_configs(self):
+        one = ss.SweepConfig("B", 1, 262144, 24576)
+        two = ss.SweepConfig("B", 2, 524288, 24576)
+        self.assertEqual(ss.resolve_concurrency(one, 2), 2)
+        self.assertEqual(ss.resolve_concurrency(two, 2), 2)
+
+    def test_override_of_one_is_honoured_not_treated_as_falsy(self):
+        cfg = ss.SweepConfig("B", 3, 786432, 8192)
+        self.assertEqual(ss.resolve_concurrency(cfg, 1), 1)
