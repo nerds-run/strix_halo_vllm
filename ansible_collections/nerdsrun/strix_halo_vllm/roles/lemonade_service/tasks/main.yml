@@ -384,6 +384,45 @@
     - lemonade
     - lemonade_slots
 
+# Read first, so an unchanged deploy reports unchanged. Posting unconditionally
+# made every converge report changed, which destroys drift detection and any
+# idempotence check around this role.
+- name: "Read the currently saved recipe options"
+  ansible.builtin.uri:
+    url: >-
+      http://127.0.0.1:{{ lemonade_port }}/api/v1/models/{{ lemonade_slot_target_model }}/options
+    method: GET
+    headers: "{{ lemonade_slot_auth_headers }}"
+    status_code: [200, 404]
+  become: false
+  register: lemonade_service_opts_before
+  changed_when: false
+  failed_when: false
+  when:
+    - lemonade_enabled | bool
+    - lemonade_slot_target_model in (lemonade_models | default([]))
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# Plain mapping access, deliberately. json_query would pull in
+# community.general plus jmespath, and the documented bootstrap installs
+# ansible-core and ansible.posix only — a clean install would fail on an
+# unavailable-filter error before it ever reached the API call.
+- name: "Extract the saved options for comparison"
+  ansible.builtin.set_fact:
+    lemonade_service_opts_saved: >-
+      {{ (lemonade_service_opts_before.json | default({}, true)).get('saved', {})
+         if (lemonade_service_opts_before.json is defined
+              and lemonade_service_opts_before.json is mapping)
+         else {} }}
+  when:
+    - lemonade_enabled | bool
+    - lemonade_slot_target_model in (lemonade_models | default([]))
+  tags:
+    - lemonade
+    - lemonade_slots
+
 - name: "Persist per-model recipe options"
   ansible.builtin.uri:
     url: >-
@@ -397,10 +436,21 @@
     status_code: [200, 201]
   become: false
   register: lemonade_service_opts
-  changed_when: lemonade_service_opts.status in [200, 201]
+  changed_when: true
   when:
     - lemonade_enabled | bool
     - lemonade_slot_target_model in (lemonade_models | default([]))
+    # Only post when what is saved differs from what we want. All THREE
+    # submitted fields are compared: skipping on ctx_size and llamacpp_args
+    # alone would leave a model whose saved merge_args is false in a state
+    # different from the requested body — reachable through the same options
+    # API, or through the sweep's restore path, which restores merge_args.
+    - >-
+      (lemonade_service_opts_saved.get('ctx_size', 0) | int)
+        != (lemonade_slot_ctx_size | int)
+      or (lemonade_service_opts_saved.get('llamacpp_args', '') | trim)
+        != (lemonade_slot_llamacpp_args | trim)
+      or not (lemonade_service_opts_saved.get('merge_args', false) | bool)
   tags:
     - lemonade
     - lemonade_slots

@@ -13,9 +13,38 @@ Run after any config change, and after any Lemonade or llama.cpp upgrade:
 Read-only: it sends a handful of requests and never reloads the model.
 If a check fails, the docs are wrong rather than the box.
 """
-import json, subprocess, time, urllib.request, random, string
-H, P, M = "192.168.68.60", 13305, "Qwen3.8-27B-GGUF"
-KEY = "/home/abanna/Development/nerdsrun/amdllmv/.ssh/framework_fedora"
+import argparse, json, os, re, subprocess, sys, time, urllib.request, random, string
+
+
+def _from_inventory(path="inventory/hosts.yml"):
+    """Read ansible_host / ansible_user out of the inventory rather than
+    hard-coding one operator's box into a script meant to be reusable."""
+    host = user = None
+    try:
+        with open(path) as fh:
+            for line in fh:
+                m = re.search(r"ansible_host:\s*(\S+)", line)
+                if m:
+                    host = m.group(1)
+                m = re.search(r"ansible_user:\s*(\S+)", line)
+                if m:
+                    user = m.group(1)
+    except OSError:
+        pass
+    return host, user
+
+
+_inv_host, _inv_user = _from_inventory()
+_ap = argparse.ArgumentParser(description=__doc__,
+                              formatter_class=argparse.RawDescriptionHelpFormatter)
+_ap.add_argument("--host", default=_inv_host or "127.0.0.1")
+_ap.add_argument("--port", type=int, default=13305)
+_ap.add_argument("--model", default="Qwen3.8-27B-GGUF")
+_ap.add_argument("--ssh-key", default=".ssh/framework_fedora")
+_ap.add_argument("--ssh-user", default=_inv_user or "")
+_args = _ap.parse_args()
+H, P, M = _args.host, _args.port, _args.model
+KEY = os.path.abspath(_args.ssh_key)
 F = ("The deployment runs llama.cpp behind Lemonade on an AMD Ryzen AI Max 395 "
      "with 128 GB of unified memory, serving a hybrid linear-attention model "
      "where only sixteen of sixty-five layers carry a KV cache. ")
@@ -23,8 +52,12 @@ ok = lambda b: "PASS" if b else "**FAIL**"
 results = []
 
 def ssh(c):
-    return subprocess.run(["ssh","-i",KEY,"-o","BatchMode=yes",f"abanna@{H}",c],
-        capture_output=True,text=True,timeout=90,env={"SSH_AUTH_SOCK":""}).stdout.strip()
+    tgt = f"{_args.ssh_user}@{H}" if _args.ssh_user else H
+    r = subprocess.run(["ssh","-i",KEY,"-o","BatchMode=yes",tgt,c],
+        capture_output=True,text=True,timeout=90,env={"SSH_AUTH_SOCK":""})
+    if r.returncode != 0:
+        print(f"   ssh to {tgt} failed (rc={r.returncode})")
+    return r.stdout.strip()
 
 def ask(prompt, max_tokens=48):
     b=json.dumps({"model":M,"messages":[{"role":"user","content":prompt}],
@@ -101,8 +134,12 @@ if srv:
     mean=sum(srv)/len(srv); d_ok = mean>15; results.append(d_ok)
     print(f"   server eval      {mean:>8.1f} tok/s  {srv}  (expect >15)  {ok(d_ok)}")
 else:
-    print("   (no server timings captured)")
+    results.append(False)
+    print("   server eval          (none captured)  **FAIL** — could not read "
+          "eval time from the server, so decode is unverified")
 
 print("\n"+"="*66)
 print(f"   {sum(results)} / {len(results)} checks passed"
       + ("   ALL GOOD" if all(results) else "   SOME FAILED"))
+# Exit nonzero so this is usable in CI or a pre-merge gate, not just by eye.
+sys.exit(0 if all(results) else 1)
