@@ -366,3 +366,55 @@ class TestExtraArgs(unittest.TestCase):
         plain = ss.SweepConfig("B", 2, 524288, 24576)
         nomtp = ss.SweepConfig("B", 2, 524288, 24576, extra_args="--spec-type none")
         self.assertNotEqual(plain.label, nomtp.label)
+
+
+class TestWarmSampleSplit(unittest.TestCase):
+    """Codex P1: with 8 prefixes over 12 requests, requests 0-7 are first
+    visits and only 8-11 are revisits. Averaging 1-11 as the 'warm' sample
+    mixes seven cold prefills into it and reports cache_effective False even
+    when every revisit hit — corrupting the benchmark's headline verdict.
+    """
+
+    # The real Phase A numbers at the healthy 24576 pool.
+    HEALTHY = [24.75, 24.77, 24.81, 24.81, 24.81, 24.80, 24.83, 24.81,
+               2.11, 2.12, 2.15, 2.12]
+
+    def test_naive_average_would_hide_a_working_cache(self):
+        rest = sum(self.HEALTHY[1:]) / len(self.HEALTHY[1:])
+        self.assertLess(self.HEALTHY[0] / rest, 2.0,
+                        "this is the bug: naive split looks like no benefit")
+
+    def test_split_on_distinct_prefixes_sees_the_hits(self):
+        r = ss.summarize_cache_benefit(self.HEALTHY, distinct_prefixes=8)
+        self.assertTrue(r["cache_effective"])
+        self.assertAlmostEqual(r["warm_mean_s"], 2.13, places=1)
+        self.assertAlmostEqual(r["cold_mean_s"], 24.80, places=1)
+        self.assertGreater(r["speedup"], 10)
+
+    def test_thrashing_pool_still_reads_as_ineffective(self):
+        cold = [24.8] * 12
+        r = ss.summarize_cache_benefit(cold, distinct_prefixes=8)
+        self.assertFalse(r["cache_effective"])
+
+    def test_no_revisits_is_inconclusive(self):
+        r = ss.summarize_cache_benefit([24.8] * 8, distinct_prefixes=8)
+        self.assertIsNone(r["cache_effective"])
+
+
+class TestTokenCounting(unittest.TestCase):
+    """Codex P1: counting SSE events is not counting tokens. A delta carrying
+    two tokens, or one token split across deltas, makes both `tokens` and
+    `decode_tps` measurements of protocol chunking."""
+
+    def test_usage_is_preferred_over_event_count(self):
+        chunks = [{"choices": [{"delta": {"content": "ab"}}]},
+                  {"choices": [{"delta": {"content": "cd"}}]},
+                  {"choices": [{"delta": {}}], "usage": {"completion_tokens": 7}}]
+        self.assertEqual(ss.count_tokens(chunks, events=2), 7)
+
+    def test_falls_back_to_event_count_without_usage(self):
+        self.assertEqual(ss.count_tokens([{"choices": [{"delta": {}}]}], events=5), 5)
+
+    def test_zero_usage_is_not_mistaken_for_missing(self):
+        chunks = [{"usage": {"completion_tokens": 0}}]
+        self.assertEqual(ss.count_tokens(chunks, events=3), 0)

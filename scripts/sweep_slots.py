@@ -268,25 +268,48 @@ def extract_delta_text(chunk: dict) -> str:
     return (delta.get("reasoning_content") or "") + (delta.get("content") or "")
 
 
-def summarize_cache_benefit(ttfts: list[float]) -> dict:
-    """Compare the first request's TTFT against the rest.
+def summarize_cache_benefit(ttfts: list[float], distinct_prefixes: int = 1) -> dict:
+    """Compare first visits against revisits.
 
-    The first pays a full prefill by definition. If the rest also do, the pool
-    could not hold the entry between requests — which is the thrash already
-    visible in production, not a property of the model.
+    The split matters. With `distinct_prefixes` distinct prompts cycled over a
+    longer run, requests 0..distinct_prefixes-1 are first visits and pay a full
+    prefill BY CONSTRUCTION; only the rest can hit. Averaging everything after
+    request 0 mixes those cold prefills into the "warm" sample and reports a
+    working cache as ineffective — on the real Phase A numbers that turns a
+    genuine 11.7x into an apparent 1.5x.
     """
-    if len(ttfts) < 2:
-        return {"cache_effective": None, "first_s": ttfts[0] if ttfts else None,
-                "rest_mean_s": None, "speedup": None}
-    first = ttfts[0]
-    rest = sum(ttfts[1:]) / len(ttfts[1:])
-    speedup = (first / rest) if rest > 0 else float("inf")
+    cold = ttfts[:distinct_prefixes]
+    warm = ttfts[distinct_prefixes:]
+    if not cold or not warm:
+        return {"cache_effective": None,
+                "cold_mean_s": round(sum(cold) / len(cold), 2) if cold else None,
+                "warm_mean_s": None, "speedup": None,
+                "first_s": ttfts[0] if ttfts else None, "rest_mean_s": None}
+    cm = sum(cold) / len(cold)
+    wm = sum(warm) / len(warm)
+    speedup = (cm / wm) if wm > 0 else float("inf")
     return {
         "cache_effective": speedup >= 2.0,
-        "first_s": round(first, 2),
-        "rest_mean_s": round(rest, 2),
+        "cold_mean_s": round(cm, 2),
+        "warm_mean_s": round(wm, 2),
         "speedup": round(speedup, 2),
+        "first_s": round(ttfts[0], 2),
+        "rest_mean_s": round(wm, 2),
     }
+
+
+def count_tokens(chunks: list[dict], events: int) -> int:
+    """Generated-token count, preferring the stream's own usage figure.
+
+    Counting SSE events counts protocol chunking: a delta may carry several
+    tokens, or split one across deltas. That would make a complete response
+    look like the truncation this sweep exists to detect.
+    """
+    for c in reversed(chunks):
+        u = c.get("usage") or {}
+        if "completion_tokens" in u:
+            return int(u["completion_tokens"])
+    return events
 
 
 # --- Live driver ----------------------------------------------------------
@@ -302,16 +325,27 @@ def _api(host: str, port: int, path: str, body: dict | None = None, timeout: int
         return json.loads(r.read().decode())
 
 
-def _ssh(host: str, key: str, cmd: str) -> str:
+def _ssh(host: str, key: str, cmd: str, user: str = "") -> str:
+    """Run a command on the target host.
+
+    The user is a parameter rather than a hard-coded account, and a failure is
+    reported rather than swallowed: returning empty stdout on a bad user or key
+    made the report record null GTT values that looked like missing data instead
+    of a broken connection.
+    """
+    target = f"{user}@{host}" if user else host
     out = subprocess.run(
-        ["ssh", "-i", key, "-o", "BatchMode=yes", f"abanna@{host}", cmd],
+        ["ssh", "-i", key, "-o", "BatchMode=yes", target, cmd],
         capture_output=True, text=True, timeout=120, env={"SSH_AUTH_SOCK": ""},
     )
+    if out.returncode != 0:
+        print(f"  ssh to {target} failed (rc={out.returncode}): "
+              f"{out.stderr.strip().splitlines()[-1] if out.stderr.strip() else 'no stderr'}")
     return out.stdout
 
 
-def gtt_used_mib(host: str, key: str) -> int | None:
-    raw = _ssh(host, key, "cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1")
+def gtt_used_mib(host: str, key: str, user: str = "") -> int | None:
+    raw = _ssh(host, key, "cat /sys/class/drm/card*/device/mem_info_gtt_used 2>/dev/null | head -1", user)
     try:
         return int(raw.strip()) // (1024 * 1024)
     except (ValueError, AttributeError):
@@ -339,7 +373,7 @@ def apply_config(host: str, port: int, model: str, cfg: SweepConfig) -> tuple[bo
 
 def run_workload(
     host: str, port: int, model: str, prompts: list[str], max_tokens: int = 64,
-    concurrency: int = 1,
+    concurrency: int = 1, distinct_prefixes: int = 1,
 ) -> dict:
     """Send the prompts and measure TTFT plus decode rate for each.
 
@@ -354,6 +388,8 @@ def run_workload(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
             "stream": True,
+            # Authoritative token count; without it we can only count SSE events.
+            "stream_options": {"include_usage": True},
         }).encode()
         req = urllib.request.Request(
             f"http://{host}:{port}/api/v1/chat/completions",
@@ -363,6 +399,7 @@ def run_workload(
         t0 = time.perf_counter()
         ttft = None
         ntok = 0
+        chunks: list[dict] = []
         with urllib.request.urlopen(req, timeout=1800) as r:
             for raw in r:
                 line = raw.decode("utf-8", "replace").strip()
@@ -375,14 +412,16 @@ def run_workload(
                     chunk = json.loads(payload)
                 except json.JSONDecodeError:
                     continue
+                chunks.append(chunk)
                 if extract_delta_text(chunk):
                     if ttft is None:
                         ttft = time.perf_counter() - t0
                     ntok += 1
         total = time.perf_counter() - t0
-        decode = (ntok - 1) / (total - ttft) if ttft and total > ttft and ntok > 1 else 0.0
-        return {"ttft_s": ttft or total, "total_s": total, "tokens": ntok,
-                "decode_tps": round(decode, 2)}
+        tokens = count_tokens(chunks, ntok)
+        decode = (tokens - 1) / (total - ttft) if ttft and total > ttft and tokens > 1 else 0.0
+        return {"ttft_s": ttft or total, "total_s": total, "tokens": tokens,
+                "sse_events": ntok, "decode_tps": round(decode, 2)}
 
     if concurrency > 1:
         with _cf.ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -397,7 +436,7 @@ def run_workload(
         "ttft_first_s": round(ttfts[0], 2) if ttfts else None,
         "ttft_mean_s": round(sum(ttfts) / len(ttfts), 2) if ttfts else None,
         "decode_tps_mean": round(sum(decodes) / len(decodes), 2) if decodes else None,
-        "cache": summarize_cache_benefit(ttfts),
+        "cache": summarize_cache_benefit(ttfts, distinct_prefixes),
     }
 
 
@@ -407,6 +446,9 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--model", default=DEFAULT_MODEL)
     ap.add_argument("--ssh-key", default=".ssh/framework_fedora")
+    ap.add_argument("--ssh-user", default="",
+                    help="SSH user for the GTT probes. Empty uses your ssh config "
+                         "for the host rather than assuming an account name.")
     ap.add_argument("--cache-ram", default="8192,24576,49152",
                     help="Phase A pool sizes in MiB")
     ap.add_argument("--slots", default="1,2,3", help="Phase B slot counts")
@@ -434,6 +476,10 @@ def main() -> int:
     ap.add_argument("--phase", default="AB", choices=["A", "B", "AB"],
                     help="Which phase(s) to run. A = cache-ram at 1 slot, "
                          "B = slot count. Default runs both.")
+    ap.add_argument("--keep-last", action="store_true",
+                    help="Leave the last tested config applied. Default restores "
+                         "whatever was configured before the sweep, since every "
+                         "config is persisted with save_options.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the matrix and the memory estimates; touch nothing")
     ap.add_argument("--out", default="benchmark_results")
@@ -487,7 +533,8 @@ def main() -> int:
                 argv = " ".join(m.get("launch_command", []))
         print(f"Benchmarking the loaded config (no reload).\n  argv: {argv}\n")
         bench = run_workload(args.host, args.port, args.model, prompts,
-                             args.max_tokens, concurrency=1)
+                             args.max_tokens, concurrency=1,
+                             distinct_prefixes=args.distinct_prefixes)
         print(f"  TTFT first    : {bench['ttft_first_s']}s")
         print(f"  TTFT mean     : {bench['ttft_mean_s']}s")
         print(f"  decode tok/s  : {bench['decode_tps_mean']}")
@@ -497,17 +544,29 @@ def main() -> int:
         path = out / f"slot_baseline_{stamp}.json"
         path.write_text(json.dumps(
             {"generated": stamp, "model": args.model, "argv": argv,
-             "gtt_used_mib": gtt_used_mib(args.host, args.ssh_key),
+             "gtt_used_mib": gtt_used_mib(args.host, args.ssh_key, args.ssh_user),
              "prefix_tokens": args.prefix_tokens, "requests": args.requests,
              "bench": bench}, indent=2))
         print(f"\nWrote {path}")
         return 0
 
     print(f"\nEach step reloads {args.model}, interrupting in-flight requests.")
+
+    # Capture what was configured before the sweep. Every config below is
+    # persisted with save_options, so without restoring this the box is left on
+    # whatever happened to be tested last — which for a default sweep is the
+    # slot count this repo documents as a 2.5x throughput loss.
+    original = None
+    try:
+        original = _api(args.host, args.port, f"/models/{args.model}/options").get("saved")
+        print(f"  saved pre-sweep options for restore: {original}")
+    except (urllib.error.URLError, TimeoutError) as e:
+        print(f"  WARNING: could not read pre-sweep options ({e}); nothing to restore to")
+
     results = []
     for i, cfg in enumerate(matrix, 1):
         print(f"\n[{i}/{len(matrix)}] {cfg.label}")
-        before = gtt_used_mib(args.host, args.ssh_key)
+        before = gtt_used_mib(args.host, args.ssh_key, args.ssh_user)
         try:
             ok, why, argv = apply_config(args.host, args.port, args.model, cfg)
         except (urllib.error.URLError, TimeoutError) as e:
@@ -518,10 +577,11 @@ def main() -> int:
         if not ok:
             results.append({**asdict(cfg), "applied": False, "error": why, "argv": argv})
             continue
-        after = gtt_used_mib(args.host, args.ssh_key)
+        after = gtt_used_mib(args.host, args.ssh_key, args.ssh_user)
         conc = resolve_concurrency(cfg, args.concurrency)
         bench = run_workload(args.host, args.port, args.model, prompts,
-                             args.max_tokens, concurrency=conc)
+                             args.max_tokens, concurrency=conc,
+                             distinct_prefixes=args.distinct_prefixes)
         print(f"  load {conc}  GTT {after} MiB (est {estimate_gtt_gib(cfg.ctx_size, cfg.parallel, cfg.ctx_checkpoints)} GiB)"
               f"  TTFT {bench['ttft_first_s']}s -> {bench['cache']['rest_mean_s']}s"
               f"  decode {bench['decode_tps_mean']} tok/s")
@@ -532,6 +592,20 @@ def main() -> int:
             "concurrency": conc,
             "bench": bench,
         })
+
+    if original and not args.keep_last:
+        print(f"\nRestoring pre-sweep configuration: {original}")
+        try:
+            body = {"model_name": args.model, "merge_args": True, "save_options": True}
+            if original.get("ctx_size"):
+                body["ctx_size"] = int(original["ctx_size"])
+            _api(args.host, args.port, "/load", body)
+            print("  restored.")
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"  WARNING: restore FAILED ({e}). The box is still on the last "
+                  f"tested configuration — re-apply with `mise run lemonade:slots:1`.")
+    elif args.keep_last:
+        print("\n--keep-last: leaving the final tested configuration in place.")
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)

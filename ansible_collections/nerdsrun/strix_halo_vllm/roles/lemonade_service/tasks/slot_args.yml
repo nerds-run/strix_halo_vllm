@@ -100,6 +100,18 @@
 # flag, so emitting a flag twice yields a server that serves a different
 # configuration than it declares — silently, with no warning. Always read back
 # launch_command from /api/v1/health to confirm what actually shipped.
+# Empty dict when no key is configured, so the uri tasks stay unchanged on
+# deployments that do not set one.
+- name: "Build the API auth headers"
+  ansible.builtin.set_fact:
+    lemonade_slot_auth_headers: >-
+      {{ {'Authorization': 'Bearer ' ~ lemonade_api_key}
+         if (lemonade_api_key | default('') | length > 0) else {} }}
+  no_log: true
+  tags:
+    - lemonade
+    - lemonade_slots
+
 - name: "Render the llama-server argument overrides"
   ansible.builtin.set_fact:
     lemonade_slot_llamacpp_args: >-

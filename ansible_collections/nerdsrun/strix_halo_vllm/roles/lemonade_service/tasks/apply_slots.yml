@@ -14,11 +14,17 @@
     - lemonade
     - lemonade_slots
 
+# Every call below carries the bearer token when lemonade_api_key is set. With
+# a key configured (the documented protection for an untrusted LAN) an
+# unauthenticated /api/v1 request is rejected, so without this the whole
+# lemonade:slots:* path fails on exactly the deployments that took the security
+# advice.
 - name: "Validate the slot configuration without applying it"
   ansible.builtin.uri:
     url: >-
       http://127.0.0.1:{{ lemonade_port }}/api/v1/models/{{ lemonade_slot_target_model }}/options
     method: POST
+    headers: "{{ lemonade_slot_auth_headers }}"
     body_format: json
     # dry_run validates and does NOT persist, so this costs no eviction. It is
     # the one chance to catch a rejected ctx_size (Lemonade advertises
@@ -47,6 +53,7 @@
   ansible.builtin.uri:
     url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/load"
     method: POST
+    headers: "{{ lemonade_slot_auth_headers }}"
     body_format: json
     body: "{{ {'model_name': lemonade_slot_target_model,
                'ctx_size': lemonade_slot_ctx_size | int,
@@ -73,6 +80,7 @@
   ansible.builtin.uri:
     url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
     method: GET
+    headers: "{{ lemonade_slot_auth_headers }}"
     status_code: 200
   become: false
   register: lemonade_slot_health
@@ -122,9 +130,14 @@
       # The flag must be present exactly once, and carry our value. A second
       # occurrence means the merge lost the argument and the declared slot
       # count is a lie.
-      - (lemonade_slot_argv | regex_findall('--parallel')) | length == 1
-      - "'--parallel ' ~ lemonade_slot_parallel in lemonade_slot_argv"
-      - "'--ctx-size ' ~ lemonade_slot_ctx_size in lemonade_slot_argv"
+      #
+      # Matched on a WORD BOUNDARY, not as a substring: `'--parallel 1' in argv`
+      # is satisfied by `--parallel 16`, and `--ctx-size 262144` by
+      # `--ctx-size 2621440`, which would defeat this guard exactly when a
+      # catalog merge or a clamp produced such a value.
+      - (lemonade_slot_argv | regex_findall('--parallel\\b')) | length == 1
+      - lemonade_slot_argv is search('--parallel\\s+' ~ lemonade_slot_parallel ~ '(\\s|$)')
+      - lemonade_slot_argv is search('--ctx-size\\s+' ~ lemonade_slot_ctx_size ~ '(\\s|$)')
     fail_msg: >-
       Lemonade launched llama-server with an argv that does not match the
       requested profile '{{ lemonade_slot_profile }}'

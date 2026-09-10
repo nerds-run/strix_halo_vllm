@@ -170,10 +170,6 @@ run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade_slots.yml -i $INVE
 description = "Lemonade: 3 slot(s) x 262144 ctx (triple profile)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/lemonade_slots.yml -i $INVENTORY -e lemonade_slot_profile=triple"
 
-[tasks."deploy:llamacpp:glm5"]
-description = "Deploy llama.cpp — glm5 profile (GLM-5.3-Flash 320B/18B glm5next, ROCm, builds its own image from source)"
-run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/llamacpp.yml -i $INVENTORY -e llamacpp_model_profile=glm5"
-
 [tasks."deploy:all"]
 description = "Run full deployment (toolbox + service + all components)"
 run = "SSH_AUTH_SOCK= ansible-playbook $PLAYBOOK_DIR/site.yml -i $INVENTORY"
