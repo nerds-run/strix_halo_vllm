@@ -854,6 +854,12 @@ Hypotheses eliminated along the way, each by measurement: MTP, the benchmark cli
 
 **Still unexplained:** why generation stops with `finish_reason: stop` after two tokens rather than merely running slowly. Do not treat the mechanism for that as settled.
 
+### Re-checking these numbers
+
+`scripts/validate_lemonade.py` (`mise run lemonade:validate`) asserts every claim in this section against the live server — the launched flags, the memory footprint, the cache speedup, the append/prepend prefix behaviour, and decode read from `eval time` rather than from the client. It is read-only and does not reload the model. Run it after any config change or upgrade; if a check fails, this document is wrong.
+
+Note the cache speedup has two legitimate values and they measure different things: an **identical** prompt repeated is a full hit at ~0.2s (>100x), while a prefix **revisited after other entries have been touched** costs ~2.1s (11.7x). The tables above quote the revisit figure, which is the conservative one and the shape real traffic takes.
+
 ### Sizing slots: what a slot actually costs
 
 Slots **subdivide** llama-server's context rather than each receiving their own, so holding a full 262144-token window per request means requesting `parallel x 262144` in total. Lemonade accepts a context above the `max_context_window` it advertises — 786432 was accepted against an advertised 262144 — because each *sequence* still stays inside the model's native window.
