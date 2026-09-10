@@ -59,10 +59,17 @@ class SweepConfig:
     ctx_size: int
     cache_ram_mib: int
     ctx_checkpoints: int = 8
+    # Free-form flags appended verbatim, for diagnostics the sweep does not
+    # otherwise model (e.g. "--spec-type none" to take MTP out of the picture).
+    extra_args: str = ""
 
     @property
     def label(self) -> str:
-        return f"{self.phase}:np{self.parallel}:cache{self.cache_ram_mib}"
+        base = f"{self.phase}:np{self.parallel}:cache{self.cache_ram_mib}"
+        if self.extra_args:
+            slug = self.extra_args.replace("--", "").replace(" ", "-").strip("-")
+            return f"{base}:{slug}"
+        return base
 
     @property
     def llamacpp_args(self) -> str:
@@ -71,6 +78,7 @@ class SweepConfig:
             f"--parallel {self.parallel} "
             f"--ctx-checkpoints {self.ctx_checkpoints} "
             f"--cache-ram {self.cache_ram_mib}"
+            + (f" {self.extra_args}" if self.extra_args else "")
         )
 
 
@@ -94,11 +102,13 @@ def build_matrix(
     slot_values: list[int],
     best_cache_ram_mib: int | None = None,
     ctx_checkpoints: int = 8,
+    extra_args: str = "",
 ) -> list[SweepConfig]:
     """Phase A sweeps the cache pool at 1 slot; Phase B sweeps slots at the
     Phase A winner. Exactly one variable moves between consecutive runs."""
     matrix = [
-        SweepConfig("A", 1, CTX_PER_SLOT, c, ctx_checkpoints) for c in cache_ram_values
+        SweepConfig("A", 1, CTX_PER_SLOT, c, ctx_checkpoints, extra_args)
+        for c in cache_ram_values
     ]
     pinned = (
         best_cache_ram_mib
@@ -106,7 +116,8 @@ def build_matrix(
         else _largest_affordable_pool(cache_ram_values, slot_values, ctx_checkpoints)
     )
     matrix += [
-        SweepConfig("B", n, n * CTX_PER_SLOT, pinned, ctx_checkpoints) for n in slot_values
+        SweepConfig("B", n, n * CTX_PER_SLOT, pinned, ctx_checkpoints, extra_args)
+        for n in slot_values
     ]
     return matrix
 
@@ -413,6 +424,9 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--baseline-only", action="store_true",
                     help="Benchmark the CURRENTLY LOADED config and exit. No reload, no eviction.")
+    ap.add_argument("--extra-args", default="",
+                    help="Extra llama-server flags appended to every config, for "
+                         "diagnostics (e.g. \"--spec-type none\" to rule out MTP).")
     ap.add_argument("--concurrency", type=int, default=None,
                     help="Offered load, held constant across configs. Without it "
                          "each config is driven at its own slot count, which "
@@ -430,6 +444,7 @@ def main() -> int:
         [int(x) for x in args.slots.split(",")],
         args.best_cache_ram,
         args.ctx_checkpoints,
+        args.extra_args,
     )
 
     matrix = filter_phase(matrix, args.phase)

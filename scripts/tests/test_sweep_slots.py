@@ -341,3 +341,28 @@ class TestConcurrencyControl(unittest.TestCase):
     def test_override_of_one_is_honoured_not_treated_as_falsy(self):
         cfg = ss.SweepConfig("B", 3, 786432, 8192)
         self.assertEqual(ss.resolve_concurrency(cfg, 1), 1)
+
+
+class TestExtraArgs(unittest.TestCase):
+    """Diagnostics need to vary a flag the sweep does not otherwise model —
+    disabling speculative decoding, for instance, to find out whether a failure
+    belongs to the slot count or to MTP."""
+
+    def test_extra_args_are_appended(self):
+        cfg = ss.SweepConfig("B", 2, 524288, 24576, extra_args="--spec-type none")
+        self.assertIn("--spec-type none", cfg.llamacpp_args)
+
+    def test_modelled_flags_still_appear_once(self):
+        cfg = ss.SweepConfig("B", 2, 524288, 24576, extra_args="--spec-type none")
+        self.assertEqual(cfg.llamacpp_args.count("--parallel"), 1)
+        self.assertEqual(cfg.llamacpp_args.count("--cache-ram"), 1)
+
+    def test_default_is_empty_and_adds_nothing(self):
+        cfg = ss.SweepConfig("B", 2, 524288, 24576)
+        self.assertEqual(cfg.llamacpp_args.strip().count("--"), 3)
+
+    def test_label_records_the_variant(self):
+        """Two runs differing only in extra_args must not collide in a report."""
+        plain = ss.SweepConfig("B", 2, 524288, 24576)
+        nomtp = ss.SweepConfig("B", 2, 524288, 24576, extra_args="--spec-type none")
+        self.assertNotEqual(plain.label, nomtp.label)
