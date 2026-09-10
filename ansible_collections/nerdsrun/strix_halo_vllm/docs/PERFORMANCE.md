@@ -873,7 +873,7 @@ The estimate reads low by **+2.33 and +1.89 GiB** respectively — near-constant
 
 **Budget against ~85 GiB, not the 124 GiB GTT maximum.** `buff/cache` holds the 16.7 GB GGUF; pinning GTT past that evicts it and produces the same cliff recorded for `deepseek-v4` above. `lemonade_gtt_budget_gib` enforces this and refuses an over-budget profile rather than deploying it.
 
-**The pool and the slots are substitutes.** At 3 slots the 24576 MiB pool would total 92.7 GiB, over budget — so the `triple` profile drops its own pool to 8192. Given a cache hit is worth 11.7x on TTFT while a slot only removes queueing, that is very likely the wrong trade; `triple` exists for genuinely concurrency-bound workloads.
+**The pool and the slots are substitutes, and the pool wins outright.** At 3 slots the 24576 MiB pool would total 92.7 GiB, over budget, so the `triple` profile drops its own pool to 8192. That trade is now known to be a bad one in both directions: a cache hit is worth 11.7x on TTFT, while a second slot *costs* 2.5x aggregate throughput (see above). The `dual` and `triple` profiles exist so the measurement is reproducible and so the guard has something to refuse — not because either is recommended.
 
 ### Verify against the argv, never the flag you sent
 

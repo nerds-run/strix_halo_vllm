@@ -200,13 +200,19 @@ mise run lemonade:slots:3         # 3 slots x 262144 (786432 total)
 # full window per request. Refuses anything over lemonade_gtt_budget_gib and
 # verifies the result against the argv the server actually launched with.
 #
-# WARNING: 2 and 3 slots return TRUNCATED generations under concurrent load on
-# the current build — a silent correctness failure, not a slow one. Stay on
-# slots:1 unless you are reproducing that. See PERFORMANCE.md.
+# WARNING: MEASURED, a second slot is a 2.5x AGGREGATE THROUGHPUT LOSS on this
+# hardware, at twice the memory:
+#     1 slot   21.9 tok/s per request, ~21.9 aggregate, 42.3 GB used
+#     2 slots   4.4 tok/s per request,  ~8.8 aggregate, 83.8 GB used
+# Prefill is unaffected; only decode collapses, and not because of MTP
+# (--spec-type none measures the same). 49 of 65 layers are recurrent, so each
+# sequence carries its own state and batching cannot amortise a weight read
+# across sequences. Under load this degrades further and responses come back
+# truncated. Stay on slots:1. See PERFORMANCE.md for the full measurement.
 #
-# The tuning that actually paid off here was the prompt-cache pool, not the
-# slot count: lemonade_cache_ram_mib 8192 -> 24576 turns a repeated ~9.5K-token
-# prefix from a 24.8s prefill into 2.12s. That is the default now.
+# The tuning that actually paid off was the prompt-cache pool, not the slot
+# count: lemonade_cache_ram_mib 8192 -> 24576 turns a repeated ~9.5K-token
+# prefix from a 24.8s prefill into 2.12s (11.7x). That is the default now.
 
 # --- vLLM (ROCm) ---
 mise run deploy:toolbox           # Interactive toolbox

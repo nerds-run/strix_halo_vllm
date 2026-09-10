@@ -23,6 +23,7 @@ ansible_collections/nerdsrun/strix_halo_vllm/
 │   ├── service.yml        # Service-only (vLLM)
 │   ├── llamacpp.yml       # llama.cpp service (backend depends on profile)
 │   ├── lemonade.yml       # Lemonade Server (router) + repoints Open WebUI
+│   ├── lemonade_slots.yml # Apply a slot/context profile on demand (RELOADS the model)
 │   ├── verify.yml         # Verification only
 │   ├── uninstall.yml      # Complete teardown
 │   └── ui.yml             # Open WebUI management
