@@ -1,0 +1,15 @@
+---
+- name: "Compute {{ profile_name }}"
+  ansible.builtin.include_tasks: ../../../roles/lemonade_service/tasks/slot_args.yml
+  vars:
+    lemonade_slot_profile: "{{ profile_name }}"
+
+- name: "Assert {{ profile_name }} keeps the 24576 MiB measured winner"
+  ansible.builtin.assert:
+    that:
+      - lemonade_slot_cache_ram | int == 24576
+    fail_msg: >-
+      {{ profile_name }} should keep the measured pool of 24576 MiB;
+      got {{ lemonade_slot_cache_ram }}
+    success_msg: "{{ profile_name }} keeps the full pool"
+    quiet: true

@@ -105,6 +105,42 @@
         success_msg: "Memory model reproduces the measured baseline"
 
     # ---------------------------------------------------------------
+    # 4b. A profile may carry its own cache_ram_mib.
+    #
+    # Measured on hardware: a 24576 MiB pool turns every possible prefix hit
+    # from a miss into a 2.1s TTFT against 24.8s cold — 11.7x. That is now the
+    # global default. But the pool and the slots come out of the same unified
+    # memory, and at 3 slots 24576 no longer fits the budget. `triple`
+    # therefore carries a smaller pool of its own: the third slot is bought by
+    # giving the cache back. Without a per-profile override the only way to
+    # express that would be to make `triple` permanently undeployable.
+    # ---------------------------------------------------------------
+    - name: "Compute the triple profile with its own pool"
+      ansible.builtin.include_tasks: ../../roles/lemonade_service/tasks/slot_args.yml
+      vars:
+        lemonade_slot_profile: "triple"
+
+    - name: "Assert triple fits the budget by lowering its own pool"
+      ansible.builtin.assert:
+        that:
+          - lemonade_slot_cache_ram | int < 24576
+          - "'--cache-ram ' ~ (lemonade_slot_cache_ram | int) in lemonade_slot_llamacpp_args"
+          - (lemonade_slot_est_total_gib | float) <= (lemonade_gtt_budget_gib | float)
+        fail_msg: >-
+          triple must fit the budget with a reduced pool. Got pool
+          {{ lemonade_slot_cache_ram | default('unset') }},
+          total {{ lemonade_slot_est_total_gib | default('unset') }} GiB.
+        success_msg: >-
+          triple trades the pool down to {{ lemonade_slot_cache_ram }} MiB to fit
+        quiet: true
+
+    - name: "Assert single and dual keep the full measured pool"
+      ansible.builtin.include_tasks: tasks/assert_pool.yml
+      loop: ["single", "dual"]
+      loop_control:
+        loop_var: profile_name
+
+    # ---------------------------------------------------------------
     # 5. The budget guard must REFUSE an over-budget configuration.
     #    4 slots at a full window is ~100 GiB, past the ~85 GiB ceiling
     #    where buff/cache eviction triggers the documented throughput

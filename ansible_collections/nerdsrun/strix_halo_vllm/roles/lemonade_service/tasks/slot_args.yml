@@ -26,6 +26,13 @@
 
 - name: "Resolve the slot profile"
   ansible.builtin.set_fact:
+    # A profile may carry its own cache_ram_mib. The pool and the slots come
+    # out of the same unified memory, so at higher slot counts the measured
+    # 24576 MiB pool no longer fits — such a profile buys its extra slot by
+    # giving the cache back, and says so in its own comment.
+    lemonade_slot_cache_ram: >-
+      {{ lemonade_slot_profiles[lemonade_slot_profile].cache_ram_mib
+         | default(lemonade_cache_ram_mib) | int }}
     lemonade_slot_parallel: "{{ lemonade_slot_profiles[lemonade_slot_profile].parallel | int }}"
     lemonade_slot_ctx_size: >-
       {{ (lemonade_slot_profiles[lemonade_slot_profile].parallel | int)
@@ -57,7 +64,7 @@
     lemonade_slot_est_total_gib: >-
       {{ ((lemonade_slot_model_gib | float) + (lemonade_slot_kv_gib | float)
           + (lemonade_slot_ckpt_gib | float)
-          + ((lemonade_cache_ram_mib | int) / 1024)) | round(2) }}
+          + ((lemonade_slot_cache_ram | int) / 1024)) | round(2) }}
   tags:
     - lemonade
     - lemonade_slots
@@ -73,10 +80,10 @@
       {{ lemonade_slot_est_total_gib }} GiB
       (weights {{ lemonade_slot_model_gib }} + KV {{ lemonade_slot_kv_gib }}
       + checkpoints {{ lemonade_slot_ckpt_gib }}
-      + cache pool {{ (lemonade_cache_ram_mib | int / 1024) | round(2) }}),
+      + cache pool {{ (lemonade_slot_cache_ram | int / 1024) | round(2) }}),
       over the {{ lemonade_gtt_budget_gib }} GiB budget. Past this point GTT
       pinning evicts buff/cache and throughput falls off a cliff. Lower
-      lemonade_cache_ram_mib or lemonade_ctx_checkpoints, use a smaller slot
+      lemonade_cache_ram_mib (or the profile's own cache_ram_mib) or lemonade_ctx_checkpoints, use a smaller slot
       profile, or raise lemonade_gtt_budget_gib deliberately.
     success_msg: >-
       Slot profile '{{ lemonade_slot_profile }}': {{ lemonade_slot_parallel }}
@@ -98,7 +105,7 @@
     lemonade_slot_llamacpp_args: >-
       --parallel {{ lemonade_slot_parallel }}
       --ctx-checkpoints {{ lemonade_ctx_checkpoints }}
-      --cache-ram {{ lemonade_cache_ram_mib }}
+      --cache-ram {{ lemonade_slot_cache_ram }}
   tags:
     - lemonade
     - lemonade_slots

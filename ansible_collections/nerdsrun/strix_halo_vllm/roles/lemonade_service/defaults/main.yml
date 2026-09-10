@@ -208,6 +208,12 @@ lemonade_slot_profiles:
   triple:
     parallel: 3
     ctx_per_slot: 262144
+    # Bought by giving the cache back. Three slots need 68.7 GiB of GTT, and
+    # the measured 24576 MiB pool would put the total at 92.7 GiB — past the
+    # budget. A hit is worth 11.7x on TTFT (24.8s -> 2.12s) while a slot only
+    # removes queueing, so this is very likely the wrong trade for interactive
+    # or agentic work. It exists for genuinely concurrency-bound workloads.
+    cache_ram_mib: 8192
 
 # Recurrent-state checkpoints are kept PER SLOT and serialized fp32 into host
 # RAM, so this term scales with slot count, not with context. At the llama.cpp
@@ -222,7 +228,13 @@ lemonade_ctx_checkpoints: 8
 #   "srv alloc: - making room for prompt cache entry, removing oldest entry"
 # on essentially every request. 76 of 83 requests in a 48h sample paid a full
 # prefill as a result. This is a benchmark axis, not a settled value.
-lemonade_cache_ram_mib: 8192
+# MEASURED 2026-09-09 on 11.9.0/b10707, 1 slot, 8 distinct ~9.5K-token prefixes:
+#     8192 MiB -> 0 of 4 possible prefix hits, every request 24.8s
+#    24576 MiB -> 4 of 4 hits, 2.12s on a hit  (11.7x)
+#    49152 MiB -> 4 of 4 hits, 2.17s           (no gain, 24 GiB wasted)
+# The failure is a cliff, not a slope: below the working set nothing is
+# retained at all. Sized here to the winner.
+lemonade_cache_ram_mib: 24576
 
 # Ceiling for the memory guard, in GiB. NOT the 124 GiB GTT maximum: buff/cache
 # holds the 16.7 GB GGUF, and pinning GTT past roughly this point evicts it and
