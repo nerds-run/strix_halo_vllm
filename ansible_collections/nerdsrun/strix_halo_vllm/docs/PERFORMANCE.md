@@ -832,7 +832,33 @@ Measured with offered load held at 2 for both configs, six requests each, decode
 
 Prefill is unaffected (200-500 tok/s in both). Only decode collapses.
 
-**Speculative decoding is not the cause.** Repeating the two-slot run with `--spec-type none` gives 4.5 tok/s — indistinguishable from the 4.4 with MTP on. The penalty is inherent to running two sequences concurrently, and the most likely mechanism is the architecture itself: 49 of 65 layers are recurrent Gated DeltaNet, each sequence carries its own state, and that cannot amortise a weight read across sequences the way batched attention can. On a bandwidth-bound part, two sequences therefore cost roughly twice the traffic for the same work.
+**The hardware is not the cause — llama.cpp's in-process scheduler is.** Two *separate* `llama-server` processes on the same GPU, one slot each, both running MTP:
+
+| Approach | Per request | **Aggregate** | Truncation |
+|---|---:|---:|---|
+| 1 instance | 21.9 tok/s | 21.9 | none |
+| **2 processes, 1 slot each** | 11.3 / 11.0 | **22.3** | **none** |
+| **2 slots, one process** | 4.4 | **8.8** | 5 of 6 requests |
+
+Two processes divide the bandwidth and conserve the total, which is what a bandwidth-bound part should do. This hardware therefore sustains two concurrent sequences at full aggregate rate, and `--parallel 2` in a single process delivers **40% of it** while truncating.
+
+An earlier revision of this document blamed the architecture — 49 of 65 layers being recurrent, each sequence carrying its own state, so a weight read cannot be amortised across sequences. **That was wrong.** The two-process control disproves it: the same two sequences, the same recurrent model, the same GPU, reach 22.3 tok/s when they live in separate processes. The defect is in the in-process multi-sequence path.
+
+**Speculative decoding is not the cause either.** Repeating the two-slot run with `--spec-type none` gives 4.5 tok/s — indistinguishable from the 4.4 with MTP on.
+
+**Reproducing the control.** A bare `llama-server` launch silently loads the CPU backend — ~25 tok/s prefill instead of ~360, with `mem_info_gtt_used` never moving. The ROCm runtime must be on the library path:
+
+```bash
+D=.../llamacpp/rocm-stable/llama-b10707
+HIP=.../therock/gfx1151-7.14.0/lib
+LD_LIBRARY_PATH=$D:$HIP GGML_BACKEND_PATH=$D $D/llama-server \
+  -m <gguf> --ctx-size 131072 --port 8002 --parallel 1 -fit off -ngl 99 \
+  --jinja --spec-type draft-mtp
+```
+
+Confirm it reached the GPU with `rocm-smi --showpids` (expect two `llama-server` rows) or per-process `drm-total-gtt` in `/proc/<pid>/fdinfo/*`. The global GTT counter has no per-process attribution and cannot distinguish "allocated nothing" from "allocated but unattributed" — which cost several wrong conclusions here.
+
+**Two processes are not a throughput win.** The aggregate is the same ~22 tok/s as one instance, because the ceiling is the memory bus. What they buy is **isolation**: two independent queues, so a long generation cannot block a short request. The price is a duplicated copy of the weights — ~24 GiB here, reaching 78 GB used with 11 GB free, which is the practical limit on this box.
 
 **MTP's draft context scales per slot and is expensive.** Same two-slot config, measured: 83.8 GB used with MTP against 63.3 GB without — roughly **20 GB attributable to the draft context at two slots**. At one slot it is affordable and worth ~2x decode, which is why it stays enabled there.
 
