@@ -384,6 +384,27 @@
     - lemonade
     - lemonade_slots
 
+# Read first, so an unchanged deploy reports unchanged. Posting unconditionally
+# made every converge report changed, which destroys drift detection and any
+# idempotence check around this role.
+- name: "Read the currently saved recipe options"
+  ansible.builtin.uri:
+    url: >-
+      http://127.0.0.1:{{ lemonade_port }}/api/v1/models/{{ lemonade_slot_target_model }}/options
+    method: GET
+    headers: "{{ lemonade_slot_auth_headers }}"
+    status_code: [200, 404]
+  become: false
+  register: lemonade_service_opts_before
+  changed_when: false
+  failed_when: false
+  when:
+    - lemonade_enabled | bool
+    - lemonade_slot_target_model in (lemonade_models | default([]))
+  tags:
+    - lemonade
+    - lemonade_slots
+
 - name: "Persist per-model recipe options"
   ansible.builtin.uri:
     url: >-
@@ -397,10 +418,17 @@
     status_code: [200, 201]
   become: false
   register: lemonade_service_opts
-  changed_when: lemonade_service_opts.status in [200, 201]
+  changed_when: true
   when:
     - lemonade_enabled | bool
     - lemonade_slot_target_model in (lemonade_models | default([]))
+    # Only post when what is saved differs from what we want. `saved` carries
+    # exactly the fields this task submits, so comparing them is sufficient.
+    - >-
+      (lemonade_service_opts_before.json | default({}) | json_query('saved.ctx_size')
+       | default(0, true) | int) != (lemonade_slot_ctx_size | int)
+      or ((lemonade_service_opts_before.json | default({}) | json_query('saved.llamacpp_args')
+       | default('', true)) != (lemonade_slot_llamacpp_args | trim))
   tags:
     - lemonade
     - lemonade_slots
