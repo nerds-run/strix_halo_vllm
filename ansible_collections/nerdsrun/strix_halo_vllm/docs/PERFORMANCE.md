@@ -817,35 +817,42 @@ A number near zero means the pool fits the working set. A number approaching the
 
 **Beware the lifetime counters.** `GET /api/v1/stats` reported `cache_tokens_total / prompt_tokens_total` at 94.3% while the live workload was hitting 0.5%, because long multi-turn sessions reuse within themselves and dominate the cumulative figure. Diagnose with the per-request gauge or the TTFT spread, never the total. If first-request and mean TTFT are equal, the cache is doing nothing.
 
-### Slots: two of them return truncated output under concurrency
+### Slots: a second slot is a 2.5x throughput LOSS, not a win
 
-**Finding: `--parallel 2` is not usable on this deployment today. It is a correctness failure, not a slow one.**
+**Finding: concurrent decode is inherently ~5x slower per sequence on this model. Two slots do not add capacity; they subtract it.**
 
-Measured with offered load held at **2 for both configs**, so the only variable is the slot count. (Driving 1 slot at load 1 against 2 slots at load 2 would vary load and slots together and cannot attribute either.)
+Measured with offered load held at 2 for both configs, six requests each, decode rates read from `llama-server`'s own `eval time` lines rather than from the client:
 
 | | 1 slot | 2 slots |
 |---|---:|---:|
-| **Tokens returned** | **48/48, every request** | **1-13** (6 of 12 returned >1 token) |
-| TTFT cold | 42.7s | 46.7s |
-| TTFT warm | 6.36s | 3.47s |
-| decode | 20.56 tok/s | *invalid — measuring stubs* |
-| GTT measured | 36.72 GiB | 53.45 GiB |
+| Decode per request | **21.9 tok/s** | 4.4 tok/s |
+| **Aggregate** | **~21.9 tok/s** | **~8.8 tok/s** |
+| Memory used | 42.3 GB | 83.8 GB |
+| Free | 46.5 GB | 2.9 GB |
 
-The two-slot decode figure must not be quoted as throughput: the generations were truncated, so it is measuring how fast the server produces almost nothing.
+Prefill is unaffected (200-500 tok/s in both). Only decode collapses.
 
-**It is concurrency, not the slot count.** The same two-slot process, driven at load 1, returns the full 48 tokens at 21.16 tok/s with a 2.1s warm TTFT. Only simultaneous generation breaks.
+**Speculative decoding is not the cause.** Repeating the two-slot run with `--spec-type none` gives 4.5 tok/s — indistinguishable from the 4.4 with MTP on. The penalty is inherent to running two sequences concurrently, and the most likely mechanism is the architecture itself: 49 of 65 layers are recurrent Gated DeltaNet, each sequence carries its own state, and that cannot amortise a weight read across sequences the way batched attention can. On a bandwidth-bound part, two sequences therefore cost roughly twice the traffic for the same work.
 
-**There is no error.** `llama-server` logs `slot release ... truncated = 0` for every request on both slots. It believes it completed normally, which makes this exactly the kind of failure that a throughput benchmark alone would have reported as a performance regression.
+**MTP's draft context scales per slot and is expensive.** Same two-slot config, measured: 83.8 GB used with MTP against 63.3 GB without — roughly **20 GB attributable to the draft context at two slots**. At one slot it is affordable and worth ~2x decode, which is why it stays enabled there.
 
-**Speculative decoding is not the cause.** The obvious suspect was `--spec-type draft-mtp` with more than one active sequence, since MTP has only ever been validated on this architecture at `-np 1`. Re-running the identical workload with `--spec-type none` (verified present in the launched argv) truncates just the same:
+#### The truncation, and what it actually was
+
+Earlier revisions of this document described two slots as returning truncated output — a correctness failure. **That was wrong, and the correction is worth recording** because the wrong diagnosis survived several rounds of testing.
+
+Under load, two-slot runs returned 1-13 tokens where one slot returned the full 48, with `finish_reason: stop` reproduced through plain `curl`. The server logged `slot release ... truncated = 0` throughout. What the timings showed once they were finally read:
 
 ```
-tokens returned, 2 slots + load 2 + MTP OFF:  1 1 2 3 1 1 1 2 1 1 1 48
+task 27 | eval time =  1782.91 ms /  2 tokens →  0.56 tok/s
+task 24 | eval time = 11406.34 ms /  6 tokens →  0.44 tok/s
+task 37 | eval time =  6050.99 ms /  2 tokens →  0.17 tok/s
 ```
 
-**The benchmark client is not the cause either.** The 1-slot control ran at the same offered load of 2, through the same threads and the same streaming parser, and returned 48/48 on every request. The only variable between a working run and a broken one is `--parallel`.
+Decode at 0.17-0.56 tok/s against ~20 normal. The short responses are a **symptom of decode collapse under load**, not an independent bug — which is why they were intermittent, why 38 consecutive `curl` requests failed to reproduce them once the box was lightly loaded, and why they tracked memory pressure rather than any property of the prompts.
 
-So the defect is multi-slot concurrent generation itself on llama.cpp b10707 / ROCm / `qwen35`, independent of speculative decoding. [#27306](https://github.com/ggml-org/llama.cpp/issues/27306) is open against a related path on the same silicon but does not describe this. Worth an upstream report; until then `parallel_slots` above 1 should be treated as unusable here, which is why `single` is the default.
+Hypotheses eliminated along the way, each by measurement: MTP, the benchmark client, concurrent cold prefill, slot recycling under sustained load, and prompt-cache restores during concurrency. All were plausible; all were wrong. The lesson is that a throughput number and a correctness number look identical when the server produces almost nothing — always read `eval time` from the server before concluding anything about output.
+
+**Still unexplained:** why generation stops with `finish_reason: stop` after two tokens rather than merely running slowly. Do not treat the mechanism for that as settled.
 
 ### Sizing slots: what a slot actually costs
 
