@@ -844,6 +844,15 @@ Two processes divide the bandwidth and conserve the total, which is what a bandw
 
 An earlier revision of this document blamed the architecture — 49 of 65 layers being recurrent, each sequence carrying its own state, so a weight read cannot be amortised across sequences. **That was wrong.** The two-process control disproves it: the same two sequences, the same recurrent model, the same GPU, reach 22.3 tok/s when they live in separate processes. The defect is in the in-process multi-sequence path.
 
+**And it is specific to the recurrent architecture.** The same binary, GPU and driver, running a conventional MoE transformer of near-identical size (`Qwen3-Coder-30B-A3B`, 16.8 GB against 16.7 GB) with two concurrent requests:
+
+| Model | `-np 1` | `-np 2` | Truncation |
+|---|---:|---:|---|
+| Qwen3-Coder-30B-A3B (conventional) | 16.5 tok/s | **20.5 aggregate (+24%)** | none |
+| Qwen3.8-27B (`qwen35`, 49 of 65 layers recurrent) | 21.9 tok/s | **8.8 aggregate (-60%)** | 5 of 6 |
+
+Multi-slot behaves correctly on the conventional model — it is a net *gain* there, which is what it is supposed to be. The collapse and the truncation appear only on the hybrid arch, which localises the defect to the recurrent memory path rather than to slots, the backend or the hardware.
+
 **Speculative decoding is not the cause either.** Repeating the two-slot run with `--spec-type none` gives 4.5 tok/s — indistinguishable from the 4.4 with MTP on.
 
 **Reproducing the control.** A bare `llama-server` launch silently loads the CPU backend — ~25 tok/s prefill instead of ~360, with `mem_info_gtt_used` never moving. The ROCm runtime must be on the library path:
