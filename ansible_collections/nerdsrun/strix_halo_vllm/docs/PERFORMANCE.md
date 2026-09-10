@@ -741,7 +741,7 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 
 ---
 
-## Lemonade Server (11.8.0)
+## Lemonade Server (11.9.0)
 
 A second inference stack, deployed with `mise run deploy:lemonade`. Measured on the same box, build as pinned in `lemonade_service` defaults, ROCm via TheRock 7.14.0, amdgpu pinned to `high`.
 
@@ -761,6 +761,95 @@ The gain is not the ROCm backend on its own — **Lemonade turns on MTP speculat
 Two things follow. First, this is the same lever the `qwen38-fp4` profile uses, but reached without the ROCmFPX fork and without giving up vision. Second, acceptance here is markedly lower than the 0.93 that profile sees on code, so the multiple is correspondingly smaller — 1.4x rather than 2.4x. Acceptance is workload-dependent, and these figures came from short prose prompts.
 
 The decode range is real, not noise: 26.95 tok/s came from a 7,738-token prompt and 18.48 from a 9,139-token one, both from live UI traffic rather than synthetic prompts. Speculative throughput tracks draft acceptance, which is workload-dependent — the same caveat the `qwen38-fp4` profile carries.
+
+### The prompt-cache pool — an 11.7x TTFT lever that was switched off by default
+
+**Finding: `--cache-ram` at its 8192 MiB default retained nothing at all on this workload.**
+
+Measured on 11.9.0 / llama.cpp b10707 / ROCm, 1 slot at ctx 262144, `--ctx-checkpoints 8`. The workload is eight distinct ~9,500-token prefixes cycled over twelve requests, so requests 0-7 are first visits and 8-11 revisit a prefix that is still in the working set. Per-request TTFT, in order:
+
+```
+ 8192 MiB   24.76 24.84 24.80 24.78 24.79 24.79 24.81 24.82 24.83 24.83 24.82 24.84
+24576 MiB   24.75 24.77 24.81 24.81 24.81 24.80 24.83 24.81  2.11  2.12  2.15  2.12
+49152 MiB   24.74 24.76 24.90 25.45 25.61 25.68 25.72 25.74  2.18  2.17  2.18  2.17
+```
+
+| `--cache-ram` | Hits | Cold TTFT | Warm TTFT | Speedup |
+|---|---:|---:|---:|---:|
+| 8192 (llama.cpp default) | **0 of 4** | 24.81s | — | — |
+| **24576** | **4 of 4** | 24.80s | **2.12s** | **11.7x** |
+| 49152 | 4 of 4 | 25.32s | 2.17s | 11.6x |
+
+Three things follow.
+
+**The failure is a cliff, not a slope.** At 8192 every one of the twelve requests is a cold prefill; at 24576 every revisit hits. There is no partial-credit regime in between. That matches the arithmetic: cache entries measure 1.3-2.6 GiB on this model, so eight live prefixes are a ~12 GiB working set that an 8 GiB pool cannot hold, and the entry is always evicted before it is revisited. The server says so in its own log, on essentially every request:
+
+```
+srv alloc: - making room for prompt cache entry, removing oldest entry (size = 1471.291 MiB)
+```
+
+**Entries are large because the architecture is hybrid.** Only 16 of 65 layers carry KV, but a cache entry must also snapshot the recurrent state of the other 49. A pool sized by intuition from a conventional attention model is badly undersized here — the same property that makes long context cheap makes cached prefixes expensive.
+
+**48 GiB buys nothing over 24 GiB.** Warm TTFT is unchanged and cold is marginally worse. `lemonade_cache_ram_mib` is set to 24576; the remaining headroom is better spent elsewhere.
+
+Decode is unaffected across the sweep (21.04 / 21.41 / 21.55 tok/s), as expected — the pool is a prefill lever only.
+
+**Beware the lifetime counters.** `GET /api/v1/stats` reported `cache_tokens_total / prompt_tokens_total` at 94.3% while the live workload was hitting 0.5%, because long multi-turn sessions reuse within themselves and dominate the cumulative figure. Diagnose with the per-request gauge or the TTFT spread, never the total. If first-request and mean TTFT are equal, the cache is doing nothing.
+
+### Slots: two of them return truncated output under concurrency
+
+**Finding: `--parallel 2` is not usable on this deployment today. It is a correctness failure, not a slow one.**
+
+Measured with offered load held at **2 for both configs**, so the only variable is the slot count. (Driving 1 slot at load 1 against 2 slots at load 2 would vary load and slots together and cannot attribute either.)
+
+| | 1 slot | 2 slots |
+|---|---:|---:|
+| **Tokens returned** | **48/48, every request** | **1-13** (6 of 12 returned >1 token) |
+| TTFT cold | 42.7s | 46.7s |
+| TTFT warm | 6.36s | 3.47s |
+| decode | 20.56 tok/s | *invalid — measuring stubs* |
+| GTT measured | 36.72 GiB | 53.45 GiB |
+
+The two-slot decode figure must not be quoted as throughput: the generations were truncated, so it is measuring how fast the server produces almost nothing.
+
+**It is concurrency, not the slot count.** The same two-slot process, driven at load 1, returns the full 48 tokens at 21.16 tok/s with a 2.1s warm TTFT. Only simultaneous generation breaks.
+
+**There is no error.** `llama-server` logs `slot release ... truncated = 0` for every request on both slots. It believes it completed normally, which makes this exactly the kind of failure that a throughput benchmark alone would have reported as a performance regression.
+
+Prime suspect is `--spec-type draft-mtp` with more than one active sequence — MTP has only ever been validated on this architecture at `-np 1`, and [#27306](https://github.com/ggml-org/llama.cpp/issues/27306) is open against a related MTP path on the same silicon.
+
+### Sizing slots: what a slot actually costs
+
+Slots **subdivide** llama-server's context rather than each receiving their own, so holding a full 262144-token window per request means requesting `parallel x 262144` in total. Lemonade accepts a context above the `max_context_window` it advertises — 786432 was accepted against an advertised 262144 — because each *sequence* still stays inside the model's native window.
+
+Two memory terms scale differently, and conflating them hides which one bit:
+
+- **KV scales with total context.** From the GGUF header (`arch qwen35`, 16 of 65 layers carrying KV, `head_count_kv` 4, `key_length` = `value_length` = 256): `16 x 4 x 512 x 2 B` = **64 KiB per token**, so 16.0 GiB at 262144.
+- **Recurrent-state checkpoints scale with SLOT COUNT.** One is ~149.6 MiB here, and llama.cpp's default of 32 is ~4.7 GiB *per slot* ([#27211](https://github.com/ggml-org/llama.cpp/issues/27211)). The profiles pin 8.
+
+| Slots | Total ctx | KV | Ckpts @8 | Est. GTT | Measured |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 262144 | 16.0 | 1.2 | 34.4 | **36.72** |
+| 2 | 524288 | 32.0 | 2.3 | 51.6 | **53.45** |
+| 3 | 786432 | 48.0 | 3.5 | 68.7 | — |
+
+The estimate reads low by **+2.33 and +1.89 GiB** respectively — near-constant, which is the predicted shape for the one term the model omits: the compute buffer, driven by ubatch rather than by slots or context.
+
+**Budget against ~85 GiB, not the 124 GiB GTT maximum.** `buff/cache` holds the 16.7 GB GGUF; pinning GTT past that evicts it and produces the same cliff recorded for `deepseek-v4` above. `lemonade_gtt_budget_gib` enforces this and refuses an over-budget profile rather than deploying it.
+
+**The pool and the slots are substitutes.** At 3 slots the 24576 MiB pool would total 92.7 GiB, over budget — so the `triple` profile drops its own pool to 8192. Given a cache hit is worth 11.7x on TTFT while a slot only removes queueing, that is very likely the wrong trade; `triple` exists for genuinely concurrency-bound workloads.
+
+### Verify against the argv, never the flag you sent
+
+Lemonade merges submitted arguments with the catalog's. Measured behaviour is **key-based and alphabetically sorted**: an overriding `--parallel 2` replaces the catalog's `--parallel 1` and appears exactly once, `--spec-type none` replaces `draft-mtp`, and `--spec-type draft-mtp` otherwise survives — so overriding slots does not silently cost the speculative-decoding speedup.
+
+That is measured, not guaranteed. llama.cpp takes the *last* occurrence of a repeated flag, so a merge that concatenated instead would quietly serve a configuration nobody asked for. `apply_slots.yml` asserts against `launch_command` on every apply:
+
+```bash
+curl -s http://<host>:13305/api/v1/health | jq -r '.all_models_loaded[].launch_command | join(" ")'
+```
+
+`POST /v1/models/{id}/options` with `dry_run: true` validates a configuration without persisting it and without evicting the running model — the only pre-flight that costs nothing.
 
 ### DeepSeek-V4-Flash — ds4 vs llama.cpp/ROCm, and why ds4 was removed
 

@@ -192,6 +192,22 @@ mise run deploy:lemonade          # Qwen3.8-27B (18.5-27 tok/s, vision + MTP) an
                                   # both on llama.cpp/ROCm. Mounts ~/models, so only Qwen is downloaded.
                                   # Stops llamacpp-server first: only one stack can hold the GPU
 
+# --- Lemonade slot / context profiles (on demand — each one RELOADS the model) ---
+mise run lemonade:slots:1         # 1 slot x 262144. The recommended config.
+mise run lemonade:slots:2         # 2 slots x 262144 (524288 total)
+mise run lemonade:slots:3         # 3 slots x 262144 (786432 total)
+# Slots SUBDIVIDE context, so each profile raises --ctx-size in step to keep a
+# full window per request. Refuses anything over lemonade_gtt_budget_gib and
+# verifies the result against the argv the server actually launched with.
+#
+# WARNING: 2 and 3 slots return TRUNCATED generations under concurrent load on
+# the current build — a silent correctness failure, not a slow one. Stay on
+# slots:1 unless you are reproducing that. See PERFORMANCE.md.
+#
+# The tuning that actually paid off here was the prompt-cache pool, not the
+# slot count: lemonade_cache_ram_mib 8192 -> 24576 turns a repeated ~9.5K-token
+# prefix from a 24.8s prefill into 2.12s. That is the default now.
+
 # --- vLLM (ROCm) ---
 mise run deploy:toolbox           # Interactive toolbox
 mise run deploy:service           # Persistent systemd service
