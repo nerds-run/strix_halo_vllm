@@ -741,7 +741,7 @@ All numbers on AMD Ryzen AI Max+ 395, 128 GB LPDDR5x-8000, Fedora 43.
 
 ---
 
-## Lemonade Server (11.8.0)
+## Lemonade Server (11.9.0)
 
 A second inference stack, deployed with `mise run deploy:lemonade`. Measured on the same box, build as pinned in `lemonade_service` defaults, ROCm via TheRock 7.14.0, amdgpu pinned to `high`.
 
@@ -761,6 +761,148 @@ The gain is not the ROCm backend on its own — **Lemonade turns on MTP speculat
 Two things follow. First, this is the same lever the `qwen38-fp4` profile uses, but reached without the ROCmFPX fork and without giving up vision. Second, acceptance here is markedly lower than the 0.93 that profile sees on code, so the multiple is correspondingly smaller — 1.4x rather than 2.4x. Acceptance is workload-dependent, and these figures came from short prose prompts.
 
 The decode range is real, not noise: 26.95 tok/s came from a 7,738-token prompt and 18.48 from a 9,139-token one, both from live UI traffic rather than synthetic prompts. Speculative throughput tracks draft acceptance, which is workload-dependent — the same caveat the `qwen38-fp4` profile carries.
+
+### The prompt-cache pool — an 11.7x TTFT lever that was switched off by default
+
+**Finding: `--cache-ram` at its 8192 MiB default retained nothing at all on this workload.**
+
+Measured on 11.9.0 / llama.cpp b10707 / ROCm, 1 slot at ctx 262144, `--ctx-checkpoints 8`. The workload is eight distinct ~9,500-token prefixes cycled over twelve requests, so requests 0-7 are first visits and 8-11 revisit a prefix that is still in the working set. Per-request TTFT, in order:
+
+```
+ 8192 MiB   24.76 24.84 24.80 24.78 24.79 24.79 24.81 24.82 24.83 24.83 24.82 24.84
+24576 MiB   24.75 24.77 24.81 24.81 24.81 24.80 24.83 24.81  2.11  2.12  2.15  2.12
+49152 MiB   24.74 24.76 24.90 25.45 25.61 25.68 25.72 25.74  2.18  2.17  2.18  2.17
+```
+
+| `--cache-ram` | Hits | Cold TTFT | Warm TTFT | Speedup |
+|---|---:|---:|---:|---:|
+| 8192 (llama.cpp default) | **0 of 4** | 24.81s | — | — |
+| **24576** | **4 of 4** | 24.80s | **2.12s** | **11.7x** |
+| 49152 | 4 of 4 | 25.32s | 2.17s | 11.6x |
+
+Three things follow.
+
+**The failure is a cliff, not a slope.** At 8192 every one of the twelve requests is a cold prefill; at 24576 every revisit hits. There is no partial-credit regime in between. That matches the arithmetic: cache entries measure 1.3-2.6 GiB on this model, so eight live prefixes are a ~12 GiB working set that an 8 GiB pool cannot hold, and the entry is always evicted before it is revisited. The server says so in its own log, on essentially every request:
+
+```
+srv alloc: - making room for prompt cache entry, removing oldest entry (size = 1471.291 MiB)
+```
+
+**Entries are large because the architecture is hybrid.** Only 16 of 65 layers carry KV, but a cache entry must also snapshot the recurrent state of the other 49. A pool sized by intuition from a conventional attention model is badly undersized here — the same property that makes long context cheap makes cached prefixes expensive.
+
+**48 GiB buys nothing over 24 GiB.** Warm TTFT is unchanged and cold is marginally worse. `lemonade_cache_ram_mib` is set to 24576; the remaining headroom is better spent elsewhere.
+
+Decode is unaffected across the sweep (21.04 / 21.41 / 21.55 tok/s), as expected — the pool is a prefill lever only.
+
+**Sizing the pool against real traffic, not the benchmark.** The synthetic workload above deliberately overflows the pool; the question for a deployed box is what its own traffic needs. Four days of production traffic on this host, before any of this tuning:
+
+```
+83 requests
+62 evictions                 <- 75% of requests evicted an entry at the 8192 default
+entry sizes 1315-1460 MiB
+prompt sizes  9311 9462 9463 9466 9472 9473 9504 9566 9584 9597 9630 9769 9846
+              (plus occasional ~26K, which produce ~2.5 GiB entries)
+```
+
+Two things follow. The prompts are near-identical but never identical — a conversation growing, or one document with varying questions — so they share a long prefix and are precisely what prefix caching exists for; a 75% eviction rate at the default confirms the pool was the binding constraint. But the working set is *small*: at ~1.4 GiB per entry, 24576 MiB holds roughly 17 live contexts, against traffic that is one dominant ~9.5K workload plus occasional long ones. **Raising the pool further buys capacity this box would not use**, which is the same conclusion the 49152 sweep reached from the other direction.
+
+This is also the measurement that settles whether to trade context for cache. A 262144 window costs 16 GiB of KV while the largest prompt observed here was ~26K, so halving the window would free 8 GiB — but with 17 entries already sufficient there is nothing to spend it on. Re-run this count before assuming otherwise on a different workload:
+
+```bash
+journalctl --user -u "lemonade*" --no-pager -o cat --since "-7d" \
+  | grep -ac "making room for prompt cache entry"
+```
+
+A number near zero means the pool fits the working set. A number approaching the request count means it does not.
+
+**Beware the lifetime counters.** `GET /api/v1/stats` reported `cache_tokens_total / prompt_tokens_total` at 94.3% while the live workload was hitting 0.5%, because long multi-turn sessions reuse within themselves and dominate the cumulative figure. Diagnose with the per-request gauge or the TTFT spread, never the total. If first-request and mean TTFT are equal, the cache is doing nothing.
+
+### Slots: a second slot is a 2.5x throughput LOSS, not a win
+
+**Finding: concurrent decode is inherently ~5x slower per sequence on this model. Two slots do not add capacity; they subtract it.**
+
+Measured with offered load held at 2 for both configs, six requests each, decode rates read from `llama-server`'s own `eval time` lines rather than from the client:
+
+| | 1 slot | 2 slots |
+|---|---:|---:|
+| Decode per request | **21.9 tok/s** | 4.4 tok/s |
+| **Aggregate** | **~21.9 tok/s** | **~8.8 tok/s** |
+| Memory used | 42.3 GB | 83.8 GB |
+| Free | 46.5 GB | 2.9 GB |
+
+Prefill is unaffected (200-500 tok/s in both). Only decode collapses.
+
+**Speculative decoding is not the cause.** Repeating the two-slot run with `--spec-type none` gives 4.5 tok/s — indistinguishable from the 4.4 with MTP on. The penalty is inherent to running two sequences concurrently, and the most likely mechanism is the architecture itself: 49 of 65 layers are recurrent Gated DeltaNet, each sequence carries its own state, and that cannot amortise a weight read across sequences the way batched attention can. On a bandwidth-bound part, two sequences therefore cost roughly twice the traffic for the same work.
+
+**MTP's draft context scales per slot and is expensive.** Same two-slot config, measured: 83.8 GB used with MTP against 63.3 GB without — roughly **20 GB attributable to the draft context at two slots**. At one slot it is affordable and worth ~2x decode, which is why it stays enabled there.
+
+#### The truncation, and what it actually was
+
+Earlier revisions of this document described two slots as returning truncated output — a correctness failure. **That was wrong, and the correction is worth recording** because the wrong diagnosis survived several rounds of testing.
+
+Under load, two-slot runs returned 1-13 tokens where one slot returned the full 48, with `finish_reason: stop` reproduced through plain `curl`. The server logged `slot release ... truncated = 0` throughout. What the timings showed once they were finally read:
+
+```
+task 27 | eval time =  1782.91 ms /  2 tokens →  0.56 tok/s
+task 24 | eval time = 11406.34 ms /  6 tokens →  0.44 tok/s
+task 37 | eval time =  6050.99 ms /  2 tokens →  0.17 tok/s
+```
+
+Decode at 0.17-0.56 tok/s against ~20 normal.
+
+**Both failures are real, and this took two wrong turns to establish.** The first write-up called the short responses a correctness bug without reading the decode timings. The correction then over-shot and called them merely a symptom — partly because the workload of the time asked the model to "summarise in five words", so a short answer was indistinguishable from compliance and could not evidence anything.
+
+Re-run with a task that demands a detailed analysis, where a healthy run consumes the full `max_tokens`:
+
+| | tokens returned per request (max_tokens 200) | truncated |
+|---|---|---:|
+| 1 slot, load 2 | `200 200 200 200 200 200` | **0 / 6** |
+| 2 slots, load 2 | `2 3 10 2 2 200` | **5 / 6** |
+
+A model asked for a thorough analysis and returning two tokens is not obeying the instruction. So at two slots this deployment both **collapses in decode** and **terminates generation early**, and the two are separate observations. Whether the truncation is caused by the slow decode or is independent of it is **not established** — do not present either as the cause of the other.
+
+Hypotheses eliminated along the way, each by measurement: MTP, the benchmark client, concurrent cold prefill, slot recycling under sustained load, and prompt-cache restores during concurrency. All were plausible; all were wrong. The lesson is that a throughput number and a correctness number look identical when the server produces almost nothing — always read `eval time` from the server before concluding anything about output.
+
+**Still unexplained:** why generation stops with `finish_reason: stop` after two tokens rather than merely running slowly. Do not treat the mechanism for that as settled.
+
+### Re-checking these numbers
+
+`scripts/validate_lemonade.py` (`mise run lemonade:validate`) asserts every claim in this section against the live server — the launched flags, the memory footprint, the cache speedup, the append/prepend prefix behaviour, and decode read from `eval time` rather than from the client. It is read-only and does not reload the model. Run it after any config change or upgrade; if a check fails, this document is wrong.
+
+Note the cache speedup has two legitimate values and they measure different things: an **identical** prompt repeated is a full hit at ~0.2s (>100x), while a prefix **revisited after other entries have been touched** costs ~2.1s (11.7x). The tables above quote the revisit figure, which is the conservative one and the shape real traffic takes.
+
+### Sizing slots: what a slot actually costs
+
+Slots **subdivide** llama-server's context rather than each receiving their own, so holding a full 262144-token window per request means requesting `parallel x 262144` in total. Lemonade accepts a context above the `max_context_window` it advertises — 786432 was accepted against an advertised 262144 — because each *sequence* still stays inside the model's native window.
+
+Two memory terms scale differently, and conflating them hides which one bit:
+
+- **KV scales with total context.** From the GGUF header (`arch qwen35`, 16 of 65 layers carrying KV, `head_count_kv` 4, `key_length` = `value_length` = 256): `16 x 4 x 512 x 2 B` = **64 KiB per token**, so 16.0 GiB at 262144.
+- **Recurrent-state checkpoints scale with SLOT COUNT.** One is ~149.6 MiB here, and llama.cpp's default of 32 is ~4.7 GiB *per slot* ([#27211](https://github.com/ggml-org/llama.cpp/issues/27211)). The profiles pin 8.
+
+| Slots | Total ctx | KV | Ckpts @8 | Est. GTT | Measured |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 262144 | 16.0 | 1.2 | 34.4 | **36.72** |
+| 2 | 524288 | 32.0 | 2.3 | 51.6 | **53.45** |
+| 3 | 786432 | 48.0 | 3.5 | 68.7 | — |
+
+The estimate reads low by **+2.33 and +1.89 GiB** respectively — near-constant, which is the predicted shape for the one term the model omits: the compute buffer, driven by ubatch rather than by slots or context.
+
+**Budget against ~85 GiB, not the 124 GiB GTT maximum.** `buff/cache` holds the 16.7 GB GGUF; pinning GTT past that evicts it and produces the same cliff recorded for `deepseek-v4` above. `lemonade_gtt_budget_gib` enforces this and refuses an over-budget profile rather than deploying it.
+
+**The pool and the slots are substitutes, and the pool wins outright.** At 3 slots the 24576 MiB pool would total 92.7 GiB, over budget, so the `triple` profile drops its own pool to 8192. That trade is now known to be a bad one in both directions: a cache hit is worth 11.7x on TTFT, while a second slot *costs* 2.5x aggregate throughput (see above). The `dual` and `triple` profiles exist so the measurement is reproducible and so the guard has something to refuse — not because either is recommended.
+
+### Verify against the argv, never the flag you sent
+
+Lemonade merges submitted arguments with the catalog's. Measured behaviour is **key-based and alphabetically sorted**: an overriding `--parallel 2` replaces the catalog's `--parallel 1` and appears exactly once, `--spec-type none` replaces `draft-mtp`, and `--spec-type draft-mtp` otherwise survives — so overriding slots does not silently cost the speculative-decoding speedup.
+
+That is measured, not guaranteed. llama.cpp takes the *last* occurrence of a repeated flag, so a merge that concatenated instead would quietly serve a configuration nobody asked for. `apply_slots.yml` asserts against `launch_command` on every apply:
+
+```bash
+curl -s http://<host>:13305/api/v1/health | jq -r '.all_models_loaded[].launch_command | join(" ")'
+```
+
+`POST /v1/models/{id}/options` with `dry_run: true` validates a configuration without persisting it and without evicting the running model — the only pre-flight that costs nothing.
 
 ### DeepSeek-V4-Flash — ds4 vs llama.cpp/ROCm, and why ds4 was removed
 

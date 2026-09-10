@@ -1,0 +1,20 @@
+---
+# Recompute slot_args for one profile and stash the result under `collected`,
+# so a single assert task can compare every profile at once. An include in a
+# loop leaves only the last iteration's facts behind, hence this indirection.
+- name: "Compute slot args for {{ profile_name }}"
+  ansible.builtin.include_tasks: ../../../roles/lemonade_service/tasks/slot_args.yml
+  vars:
+    lemonade_slot_profile: "{{ profile_name }}"
+
+- name: "Stash results for {{ profile_name }}"
+  ansible.builtin.set_fact:
+    collected: >-
+      {{ collected | default({}) | combine({
+           profile_name: {
+             'parallel': lemonade_slot_parallel | int,
+             'ctx_size': lemonade_slot_ctx_size | int,
+             'args': lemonade_slot_llamacpp_args | trim,
+             'est_gib': lemonade_slot_est_gib | float
+           }
+         }) }}

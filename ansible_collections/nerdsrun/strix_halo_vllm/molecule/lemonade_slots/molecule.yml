@@ -1,0 +1,26 @@
+---
+dependency:
+  name: galaxy
+  enabled: false
+driver:
+  name: default
+platforms:
+  - name: localhost
+    managed: false
+prerun: false
+provisioner:
+  name: ansible
+  options:
+    skip-tags: hardware_required
+  inventory:
+    hosts:
+      all:
+        hosts:
+          localhost:
+            ansible_connection: local
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  playbooks:
+    converge: converge.yml
+    verify: verify.yml
+verifier:
+  name: ansible

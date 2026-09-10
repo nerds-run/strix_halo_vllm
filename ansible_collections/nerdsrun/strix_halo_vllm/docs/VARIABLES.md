@@ -112,8 +112,8 @@ Lemonade is a multi-model **router**, not a single-model server: one Quadlet uni
 | Variable | Type | Default | Description |
 |---|---|---|---|
 | `lemonade_enabled` | bool | `true` | Deploy and start the service |
-| `lemonade_version` | string | `"11.8.0"` | Upstream version, used only in unit descriptions and output — the image digest is what actually pins it |
-| `lemonade_image` | string | `ghcr.io/lemonade-sdk/lemonade-server@sha256:12a81cc2...` | Container image, **pinned by digest**. Both `latest` and `vX.Y.Z` move. There is no rocm/vulkan image variant: backend binaries are fetched at run time, so the image is GPU-agnostic |
+| `lemonade_version` | string | `"11.9.0"` | Upstream version, used only in unit descriptions and output — the image digest is what actually pins it |
+| `lemonade_image` | string | `ghcr.io/lemonade-sdk/lemonade-server@sha256:7c780707...` | Container image, **pinned by digest**. Both `latest` and `vX.Y.Z` move. There is no rocm/vulkan image variant: backend binaries are fetched at run time, so the image is GPU-agnostic |
 | `lemonade_container_name` | string | `"lemonade-server"` | Quadlet unit and container name |
 | `lemonade_host` | string | `"0.0.0.0"` | Bind address passed to `lemond`. Must be `0.0.0.0` for `PublishPort` to reach it. Note that in 11.8.0 `--host` became an *ephemeral* override that no longer persists to `config.json` |
 | `lemonade_port` | int | `13305` | Host port published to the container's 13305 |
@@ -133,6 +133,16 @@ Lemonade is a multi-model **router**, not a single-model server: one Quadlet uni
 | `lemonade_stop_conflicting_services` | list | `['llamacpp-server']` | User units stopped (and `reset-failed`) before Lemonade takes the GPU. systemd cannot express `Conflicts=` here, so the guard lives in the play |
 | `lemonade_gtt_drain_timeout` | int | `120` | Seconds to poll `mem_info_gtt_used` after stopping a conflicting unit. The driver frees GTT when the process exits, not when systemd returns |
 | `firewall_open_lemonade_port` | bool | `false` | Open `lemonade_port/tcp` in firewalld |
+| `lemonade_slot_profile` | string | `"single"` | Which entry of `lemonade_slot_profiles` to apply. Applied on demand by `lemonade_slots.yml`, never by a routine converge — it reloads the model. **Leave this on `single`**: a second slot measures a 2.5x aggregate throughput loss at twice the memory |
+| `lemonade_slot_profiles` | dict | `single/dual/triple` at 1/2/3 slots | Each declares `parallel` and `ctx_per_slot`. Slots **subdivide** context, so the role asks llama-server for `parallel x ctx_per_slot` in total to hold a full window per request |
+| `lemonade_ctx_checkpoints` | int | `8` | `--ctx-checkpoints`. Recurrent-state snapshots kept **per slot**, so this term scales with slot count, not context. llama.cpp's default of 32 is ~4.7 GiB per slot on this geometry ([#27211](https://github.com/ggml-org/llama.cpp/issues/27211)). Lower means more recompute on slot rollback |
+| `lemonade_cache_ram_mib` | int | `24576` | `--cache-ram`, the in-memory prompt-cache pool. **llama.cpp's own default of 8192 retains nothing on this hardware** — entries cost ~167 KiB per prompt token, so 8 GiB holds under six contexts and evicts before any is revisited. Measured: 8192 → 0 of 4 possible hits; 24576 → 4 of 4 at 2.12s against 24.8s cold (11.7x); 49152 → no further gain. See the cache section in `PERFORMANCE.md` |
+| `lemonade_gtt_budget_gib` | float | `85` | Memory ceiling the slot guard enforces. **Not** the 124 GiB GTT maximum: `buff/cache` holds the GGUF, and pinning past this evicts it and triggers a throughput cliff |
+| `lemonade_slot_model_gib` | float | `17.22` | Weights + mmproj of the target model, for the memory estimate. Re-derive when pointing at other weights |
+| `lemonade_slot_kv_kib_per_token` | int | `64` | KV per token. Read from the GGUF header: 16 of 65 layers carry KV, `head_count_kv` 4, `key_length` = `value_length` = 256 |
+| `lemonade_slot_ckpt_mib` | float | `149.6` | Size of one recurrent-state checkpoint on this geometry |
+| `lemonade_slot_target_model` | string | `"Qwen3.8-27B-GGUF"` | Catalog name the slot profile is applied to |
+| `lemonade_slot_load_timeout` | int | `600` | Seconds allowed for the reload that applies a profile |
 
 
 ### `extra_models_dir` — sharing the GGUF tree instead of copying it

@@ -1,0 +1,125 @@
+---
+# Compute the llama-server slot/context configuration for one Lemonade model.
+#
+# Pure var computation — no container, no network — so it is exercised directly
+# by molecule/lemonade_slots on localhost in CI. tasks/main.yml includes it and
+# submits the result to POST /api/v1/models/{id}/options.
+#
+# Sets:
+#   lemonade_slot_parallel        slot count
+#   lemonade_slot_ctx_size        TOTAL context (parallel x ctx_per_slot)
+#   lemonade_slot_est_gib         estimated GTT: weights + KV + checkpoints
+#   lemonade_slot_est_total_gib   est_gib + the host-RAM prompt-cache pool
+#   lemonade_slot_llamacpp_args   the args string to merge with the catalog's
+
+- name: "Assert the requested slot profile exists"
+  ansible.builtin.assert:
+    that:
+      - lemonade_slot_profile in lemonade_slot_profiles
+    fail_msg: >-
+      Unknown lemonade_slot_profile '{{ lemonade_slot_profile }}'.
+      Available: {{ lemonade_slot_profiles.keys() | list | join(', ') }}
+    quiet: true
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Resolve the slot profile"
+  ansible.builtin.set_fact:
+    # A profile may carry its own cache_ram_mib. The pool and the slots come
+    # out of the same unified memory, so at higher slot counts the measured
+    # 24576 MiB pool no longer fits — such a profile buys its extra slot by
+    # giving the cache back, and says so in its own comment.
+    lemonade_slot_cache_ram: >-
+      {{ lemonade_slot_profiles[lemonade_slot_profile].cache_ram_mib
+         | default(lemonade_cache_ram_mib) | int }}
+    lemonade_slot_parallel: "{{ lemonade_slot_profiles[lemonade_slot_profile].parallel | int }}"
+    lemonade_slot_ctx_size: >-
+      {{ (lemonade_slot_profiles[lemonade_slot_profile].parallel | int)
+         * (lemonade_slot_profiles[lemonade_slot_profile].ctx_per_slot | int) }}
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# KV scales with TOTAL context; checkpoints scale with SLOT COUNT. Keeping the
+# two terms separate is what makes the guard honest — a 4-slot config is
+# expensive for both reasons, and collapsing them hides which one bit.
+- name: "Estimate the memory footprint"
+  ansible.builtin.set_fact:
+    lemonade_slot_kv_gib: >-
+      {{ ((lemonade_slot_ctx_size | int) * (lemonade_slot_kv_kib_per_token | float)
+          / 1048576) | round(2) }}
+    lemonade_slot_ckpt_gib: >-
+      {{ ((lemonade_slot_parallel | int) * (lemonade_ctx_checkpoints | int)
+          * (lemonade_slot_ckpt_mib | float) / 1024) | round(2) }}
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Total the memory estimate"
+  ansible.builtin.set_fact:
+    lemonade_slot_est_gib: >-
+      {{ ((lemonade_slot_model_gib | float) + (lemonade_slot_kv_gib | float)
+          + (lemonade_slot_ckpt_gib | float)) | round(2) }}
+    lemonade_slot_est_total_gib: >-
+      {{ ((lemonade_slot_model_gib | float) + (lemonade_slot_kv_gib | float)
+          + (lemonade_slot_ckpt_gib | float)
+          + ((lemonade_slot_cache_ram | int) / 1024)
+          + (lemonade_slot_runtime_overhead_gib | float)) | round(2) }}
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# The prompt-cache pool is host RAM rather than GTT, but this is a unified
+# memory part: both come out of the same 128 GB. The guard is on the total.
+- name: "Assert the configuration fits the memory budget"
+  ansible.builtin.assert:
+    that:
+      - (lemonade_slot_est_total_gib | float) <= (lemonade_gtt_budget_gib | float)
+    fail_msg: >-
+      Slot profile '{{ lemonade_slot_profile }}' needs about
+      {{ lemonade_slot_est_total_gib }} GiB
+      (weights {{ lemonade_slot_model_gib }} + KV {{ lemonade_slot_kv_gib }}
+      + checkpoints {{ lemonade_slot_ckpt_gib }}
+      + cache pool {{ (lemonade_slot_cache_ram | int / 1024) | round(2) }}
+      + measured runtime overhead {{ lemonade_slot_runtime_overhead_gib }}),
+      over the {{ lemonade_gtt_budget_gib }} GiB budget. Past this point GTT
+      pinning evicts buff/cache and throughput falls off a cliff. Lower
+      lemonade_cache_ram_mib (or the profile's own cache_ram_mib) or lemonade_ctx_checkpoints, use a smaller slot
+      profile, or raise lemonade_gtt_budget_gib deliberately.
+    success_msg: >-
+      Slot profile '{{ lemonade_slot_profile }}': {{ lemonade_slot_parallel }}
+      slot(s) x {{ lemonade_slot_profiles[lemonade_slot_profile].ctx_per_slot }}
+      = {{ lemonade_slot_ctx_size }} total context,
+      ~{{ lemonade_slot_est_total_gib }} GiB of {{ lemonade_gtt_budget_gib }}
+    quiet: true
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# Each flag appears exactly ONCE. Lemonade merges this with the catalog's own
+# args (merge_args: true) and llama.cpp takes the LAST occurrence of a repeated
+# flag, so emitting a flag twice yields a server that serves a different
+# configuration than it declares — silently, with no warning. Always read back
+# launch_command from /api/v1/health to confirm what actually shipped.
+# Empty dict when no key is configured, so the uri tasks stay unchanged on
+# deployments that do not set one.
+- name: "Build the API auth headers"
+  ansible.builtin.set_fact:
+    lemonade_slot_auth_headers: >-
+      {{ {'Authorization': 'Bearer ' ~ lemonade_api_key}
+         if (lemonade_api_key | default('') | length > 0) else {} }}
+  no_log: true
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Render the llama-server argument overrides"
+  ansible.builtin.set_fact:
+    lemonade_slot_llamacpp_args: >-
+      --parallel {{ lemonade_slot_parallel }}
+      --ctx-checkpoints {{ lemonade_ctx_checkpoints }}
+      --cache-ram {{ lemonade_slot_cache_ram }}
+  tags:
+    - lemonade
+    - lemonade_slots

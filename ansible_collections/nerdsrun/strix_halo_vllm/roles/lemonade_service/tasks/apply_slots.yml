@@ -1,0 +1,153 @@
+---
+# Apply a slot/context profile to one Lemonade-managed model.
+#
+# Uses POST /api/v1/models/{id}/options (added in Lemonade 11.7.0), which
+# persists per-model recipe options WITHOUT re-pulling the weights — a re-pull
+# would mean re-downloading ~17 GB to change one integer.
+#
+# EVICTION WARNING: new options only take effect when the model next loads, so
+# this reloads it. Anything mid-request against the old process is interrupted.
+
+- name: "Compute the slot configuration"
+  ansible.builtin.include_tasks: slot_args.yml
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# Every call below carries the bearer token when lemonade_api_key is set. With
+# a key configured (the documented protection for an untrusted LAN) an
+# unauthenticated /api/v1 request is rejected, so without this the whole
+# lemonade:slots:* path fails on exactly the deployments that took the security
+# advice.
+- name: "Validate the slot configuration without applying it"
+  ansible.builtin.uri:
+    url: >-
+      http://127.0.0.1:{{ lemonade_port }}/api/v1/models/{{ lemonade_slot_target_model }}/options
+    method: POST
+    headers: "{{ lemonade_slot_auth_headers }}"
+    body_format: json
+    # dry_run validates and does NOT persist, so this costs no eviction. It is
+    # the one chance to catch a rejected ctx_size (Lemonade advertises
+    # max_context_window 262144 for this model, and we ask for a multiple of it)
+    # before the model is torn down.
+    body: "{{ {'ctx_size': lemonade_slot_ctx_size | int,
+               'llamacpp_args': lemonade_slot_llamacpp_args | trim,
+               'merge_args': true,
+               'dry_run': true} }}"
+  become: false
+  register: lemonade_slot_dryrun
+  changed_when: false
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# One atomic call rather than "save options, then reload". /v1/load takes the
+# recipe options directly, so a failure here cannot leave persisted options
+# that only surface on some later load — which is exactly the confusing
+# half-applied state the two-step version could produce.
+#
+# EVICTION: this tears down and relaunches llama-server. Anything mid-request
+# against the old process is interrupted.
+- name: "Load the model with the slot configuration"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/load"
+    method: POST
+    headers: "{{ lemonade_slot_auth_headers }}"
+    body_format: json
+    body: "{{ {'model_name': lemonade_slot_target_model,
+               'ctx_size': lemonade_slot_ctx_size | int,
+               'llamacpp_args': lemonade_slot_llamacpp_args | trim,
+               'merge_args': true,
+               'save_options': true} }}"
+    timeout: "{{ lemonade_slot_load_timeout | int }}"
+  become: false
+  register: lemonade_slot_load
+  changed_when: lemonade_slot_load.status == 200
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# THE READBACK GUARD.
+#
+# Never trust the flag we submitted. Lemonade merges our args with the
+# catalog's, the catalog already emits `--parallel 1`, and llama.cpp takes the
+# LAST occurrence of a repeated flag — so a merge that orders them the wrong
+# way yields a server quietly running a different slot count than we asked for.
+# The only authority is the argv the server was actually launched with.
+- name: "Read back the launched command"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ lemonade_port }}/api/v1/health"
+    method: GET
+    headers: "{{ lemonade_slot_auth_headers }}"
+    status_code: 200
+  become: false
+  register: lemonade_slot_health
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Extract the rendered argv for the target model"
+  ansible.builtin.set_fact:
+    lemonade_slot_argv: >-
+      {{ (lemonade_slot_health.json.all_models_loaded
+          | selectattr('model_name', 'equalto', lemonade_slot_target_model)
+          | map(attribute='launch_command') | first | default([]))
+         | join(' ') }}
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# Distinguish a model that never came up from one that came up wrong. An
+# unknown flag makes llama-server refuse to start, and without this the argv
+# comparison below would report a mismatch and hide the real cause.
+- name: "Assert the model actually loaded"
+  ansible.builtin.assert:
+    that:
+      - lemonade_slot_health.json.all_models_loaded | default([]) | length > 0
+      - >-
+        lemonade_slot_health.json.all_models_loaded
+        | selectattr('model_name', 'equalto', lemonade_slot_target_model)
+        | selectattr('backend_health', 'equalto', 'ready') | list | length > 0
+    fail_msg: >-
+      {{ lemonade_slot_target_model }} did not come up ready after applying
+      profile '{{ lemonade_slot_profile }}'. A flag llama-server does not
+      recognise will refuse the launch outright — check the args
+      '{{ lemonade_slot_llamacpp_args | trim }}' against this build before
+      reading the argv comparison below.
+    success_msg: "Model reloaded and reports backend_health=ready"
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Assert the server actually launched with the requested slot count"
+  ansible.builtin.assert:
+    that:
+      # The flag must be present exactly once, and carry our value. A second
+      # occurrence means the merge lost the argument and the declared slot
+      # count is a lie.
+      #
+      # Matched on a WORD BOUNDARY, not as a substring: `'--parallel 1' in argv`
+      # is satisfied by `--parallel 16`, and `--ctx-size 262144` by
+      # `--ctx-size 2621440`, which would defeat this guard exactly when a
+      # catalog merge or a clamp produced such a value.
+      - (lemonade_slot_argv | regex_findall('--parallel\\b')) | length == 1
+      - lemonade_slot_argv is search('--parallel\\s+' ~ lemonade_slot_parallel ~ '(\\s|$)')
+      - lemonade_slot_argv is search('--ctx-size\\s+' ~ lemonade_slot_ctx_size ~ '(\\s|$)')
+    fail_msg: >-
+      Lemonade launched llama-server with an argv that does not match the
+      requested profile '{{ lemonade_slot_profile }}'
+      ({{ lemonade_slot_parallel }} slots, ctx {{ lemonade_slot_ctx_size }}).
+      Rendered argv: {{ lemonade_slot_argv }}
+    success_msg: >-
+      Verified live: {{ lemonade_slot_parallel }} slot(s),
+      ctx {{ lemonade_slot_ctx_size }}
+      ({{ lemonade_slot_ctx_size | int // (lemonade_slot_parallel | int) }} per request)
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots

@@ -1,0 +1,198 @@
+---
+# Test spec for the Lemonade slot-profile feature.
+#
+# The unit under test is roles/lemonade_service/tasks/slot_args.yml: given a
+# slot profile and the model's memory geometry, it must compute the llama-server
+# context size, the merged llamacpp_args, and a memory estimate — and refuse a
+# configuration that would exceed the GTT budget.
+#
+# None of this needs a live container: it is pure var computation, so it runs
+# on localhost in CI alongside the rest of the suite.
+- name: Verify
+  hosts: all
+  gather_facts: false
+  vars_files:
+    - ../../roles/lemonade_service/defaults/main.yml
+  vars:
+    # Qwen3.8-27B UD-Q4_K_XL geometry, parsed from the GGUF header on the
+    # live host (arch qwen35, 65 blocks, 16 attention layers, head_count_kv 4,
+    # key_length = value_length = 256):
+    #   16 layers x 4 kv_heads x (256 + 256) x 2 B = 65536 B = 64 KiB/token
+    # Weights 16746 MiB + mmproj 885 MiB = 17.22 GiB.
+    test_model_geometry:
+      lemonade_slot_model_gib: 17.22
+      lemonade_slot_kv_kib_per_token: 64
+      lemonade_slot_ckpt_mib: 149.6
+  tasks:
+
+    # ---------------------------------------------------------------
+    # 1. Each profile yields the right slot count and total context.
+    #    Slots SUBDIVIDE ctx_size, so holding a full 262144-token window
+    #    per request means asking for parallel x 262144 in total.
+    # ---------------------------------------------------------------
+    - name: "Compute args for every slot profile"
+      ansible.builtin.include_tasks: tasks/collect_profile.yml
+      loop: "{{ ['single', 'dual', 'triple'] }}"
+      loop_control:
+        loop_var: profile_name
+
+    - name: "Assert slot count and context size per profile"
+      ansible.builtin.assert:
+        that:
+          - collected['single'].parallel | int == 1
+          - collected['single'].ctx_size | int == 262144
+          - collected['dual'].parallel | int == 2
+          - collected['dual'].ctx_size | int == 524288
+          - collected['triple'].parallel | int == 3
+          - collected['triple'].ctx_size | int == 786432
+        fail_msg: >-
+          Slot profiles must map to parallel x 262144 total context.
+          Got: {{ collected }}
+        success_msg: "Slot profiles map to the correct total context"
+
+    # ---------------------------------------------------------------
+    # 2. The rendered args must carry the tuning flags we rely on.
+    # ---------------------------------------------------------------
+    - name: "Assert rendered args carry parallel, checkpoints and cache-ram"
+      ansible.builtin.assert:
+        that:
+          - "'--parallel 2' in collected['dual'].args"
+          - "'--ctx-checkpoints' in collected['dual'].args"
+          - "'--cache-ram' in collected['dual'].args"
+        fail_msg: "Rendered args missing a required flag: {{ collected['dual'].args }}"
+        success_msg: "Rendered args carry the required tuning flags"
+
+    # ---------------------------------------------------------------
+    # 3. THE SILENT-OVERRIDE GUARD.
+    #    Lemonade merges our args with the catalog's, and the catalog
+    #    already emits `--parallel 1`. llama.cpp takes the LAST occurrence,
+    #    so a merged string containing the flag twice is a config that
+    #    serves a different slot count than it declares — the exact trap
+    #    documented at three profiles in llamacpp_service. Our args must
+    #    contain the flag exactly once.
+    # ---------------------------------------------------------------
+    - name: "Assert --parallel appears exactly once in our args"
+      ansible.builtin.assert:
+        that:
+          - collected['dual'].args is search('--parallel')
+          - (collected['dual'].args | regex_findall('--parallel')) | length == 1
+        fail_msg: >-
+          --parallel must appear exactly once in the args we submit, or the
+          merged command line silently serves a different slot count.
+          Got: {{ collected['dual'].args }}
+        success_msg: "--parallel appears exactly once"
+
+    # ---------------------------------------------------------------
+    # 4. Memory estimate must reproduce the measured baseline.
+    #    Live host at 1 slot / 262144 / --ctx-checkpoints 32 measured
+    #    36.75 GiB of GTT. The model has no compute-buffer term, so it is
+    #    expected to read slightly high; 36-40 GiB is the accepted band.
+    # ---------------------------------------------------------------
+    - name: "Compute the baseline estimate at ctx-checkpoints 32"
+      ansible.builtin.include_tasks: ../../roles/lemonade_service/tasks/slot_args.yml
+      vars:
+        lemonade_slot_profile: "single"
+        lemonade_ctx_checkpoints: 32
+
+    - name: "Assert the estimate brackets the measured 36.75 GiB"
+      ansible.builtin.assert:
+        that:
+          - lemonade_slot_est_gib | float >= 36.0
+          - lemonade_slot_est_gib | float <= 40.0
+        fail_msg: >-
+          Estimate {{ lemonade_slot_est_gib }} GiB does not bracket the
+          36.75 GiB measured on hardware at 1 slot / 262144 / ckpt 32.
+        success_msg: "Memory model reproduces the measured baseline"
+
+    # ---------------------------------------------------------------
+    # 4b. A profile may carry its own cache_ram_mib.
+    #
+    # Measured on hardware: a 24576 MiB pool turns every possible prefix hit
+    # from a miss into a 2.1s TTFT against 24.8s cold — 11.7x. That is now the
+    # global default. But the pool and the slots come out of the same unified
+    # memory, and at 3 slots 24576 no longer fits the budget. `triple`
+    # therefore carries a smaller pool of its own: the third slot is bought by
+    # giving the cache back. Without a per-profile override the only way to
+    # express that would be to make `triple` permanently undeployable.
+    # ---------------------------------------------------------------
+    - name: "Compute the triple profile with its own pool"
+      ansible.builtin.include_tasks: ../../roles/lemonade_service/tasks/slot_args.yml
+      vars:
+        lemonade_slot_profile: "triple"
+
+    - name: "Assert triple fits the budget by lowering its own pool"
+      ansible.builtin.assert:
+        that:
+          - lemonade_slot_cache_ram | int < 24576
+          - "'--cache-ram ' ~ (lemonade_slot_cache_ram | int) in lemonade_slot_llamacpp_args"
+          - (lemonade_slot_est_total_gib | float) <= (lemonade_gtt_budget_gib | float)
+        fail_msg: >-
+          triple must fit the budget with a reduced pool. Got pool
+          {{ lemonade_slot_cache_ram | default('unset') }},
+          total {{ lemonade_slot_est_total_gib | default('unset') }} GiB.
+        success_msg: >-
+          triple trades the pool down to {{ lemonade_slot_cache_ram }} MiB to fit
+        quiet: true
+
+    - name: "Assert single and dual keep the full measured pool"
+      ansible.builtin.include_tasks: tasks/assert_pool.yml
+      loop: ["single", "dual"]
+      loop_control:
+        loop_var: profile_name
+
+    # ---------------------------------------------------------------
+    # 5. The budget guard must REFUSE an over-budget configuration.
+    #    4 slots at a full window is ~100 GiB, past the ~85 GiB ceiling
+    #    where buff/cache eviction triggers the documented throughput
+    #    cliff. The role must fail rather than deploy it.
+    # ---------------------------------------------------------------
+    - name: "Attempt an over-budget slot configuration"
+      block:
+        - name: "Request 4 full-window slots (must fail)"
+          ansible.builtin.include_tasks: ../../roles/lemonade_service/tasks/slot_args.yml
+          vars:
+            lemonade_slot_profile: "quad_overbudget"
+            lemonade_slot_profiles:
+              quad_overbudget:
+                parallel: 4
+                ctx_per_slot: 262144
+        - name: "Over-budget config was accepted"
+          ansible.builtin.set_fact:
+            overbudget_rejected: false
+      rescue:
+        - name: "Over-budget config was correctly rejected"
+          ansible.builtin.set_fact:
+            overbudget_rejected: true
+
+    - name: "Assert the budget guard rejected it"
+      ansible.builtin.assert:
+        that:
+          - overbudget_rejected | bool
+        fail_msg: >-
+          A 4-slot full-window config (~100 GiB) must be rejected against the
+          {{ lemonade_gtt_budget_gib | default(85) }} GiB budget, not deployed.
+        success_msg: "Budget guard rejects over-budget slot configurations"
+
+    # ---------------------------------------------------------------
+    # 6. An unknown profile name must fail loudly, not silently default.
+    # ---------------------------------------------------------------
+    - name: "Attempt an unknown slot profile"
+      block:
+        - name: "Request a profile that does not exist (must fail)"
+          ansible.builtin.include_tasks: ../../roles/lemonade_service/tasks/slot_args.yml
+          vars:
+            lemonade_slot_profile: "does_not_exist"
+        - name: "Unknown profile was accepted"
+          ansible.builtin.set_fact:
+            unknown_rejected: false
+      rescue:
+        - name: "Unknown profile was correctly rejected"
+          ansible.builtin.set_fact:
+            unknown_rejected: true
+
+    - name: "Assert the unknown profile was rejected"
+      ansible.builtin.assert:
+        that:
+          - unknown_rejected | bool
+        fail_msg: "An unknown slot profile must fail loudly, not silently default"
+        success_msg: "Unknown slot profiles are rejected"

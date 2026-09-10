@@ -629,6 +629,47 @@ To switch stacks by hand:
 systemctl --user stop lemonade-server
 ```
 
+### Every request pays a full prefill, even repeats of the same prompt
+
+The prompt cache is almost certainly working; the pool is almost certainly too small. On this hardware a cache entry costs about **167 KiB per prompt token** — roughly 2.6x the raw f16 KV, because a hybrid model must snapshot the recurrent state of its 49 linear-attention layers alongside the KV. A ~9.5K-token prompt is therefore a ~1.4 GiB entry, and llama.cpp's default `--cache-ram 8192` holds fewer than six of them.
+
+The failure is a **cliff, not a slope**. Below the working set nothing survives to be revisited, so the hit rate is zero rather than merely poor.
+
+Diagnose in this order:
+
+1. **TTFT spread.** Send the same long prompt twice. If the first and second are equal, the cache is doing nothing. A working cache shows a large first value and a small second (measured here: 24.8s → 2.12s).
+2. **Per-request gauge**, not the totals:
+   ```bash
+   curl -s http://<host>:13305/api/v1/stats | jq '{cache_tokens, prompt_tokens}'
+   ```
+   `cache_tokens` near zero against a large `prompt_tokens` is the cliff.
+3. **Eviction count** over a window that contains real traffic:
+   ```bash
+   journalctl --user -u "lemonade*" --no-pager -o cat --since "-7d" \
+     | grep -ac "making room for prompt cache entry"
+   ```
+   A count approaching the request count means the pool cannot hold the working set.
+
+Fix by raising `lemonade_cache_ram_mib`. 24576 was the measured winner here; 49152 bought nothing further.
+
+**Two traps.** The lifetime counters (`cache_tokens_total / prompt_tokens_total`) read 94.3% on this box while the live workload was at 0.5%, because long multi-turn sessions reuse within themselves and dominate the cumulative figure. And a prompt that varies at its **start** — a timestamp or session id in a system prompt — defeats the cache no matter how large the pool: appending to a prompt keeps the cache (2.25s), prepending six characters destroys it (25.23s).
+
+### Responses come back truncated, or stop after one or two tokens
+
+Read the server's own decode timing before concluding anything about output quality:
+
+```bash
+podman logs --since 10m lemonade-server 2>&1 | grep -a "eval time" | grep -av "prompt eval"
+```
+
+A collapsed decode and a correctness bug are **indistinguishable from the client**, because a server producing almost nothing looks like a server producing garbage. On this box the truncation seen at `--parallel 2` was decode running at **0.17–0.56 tok/s against ~20 normal**, with prefill perfectly healthy at 200–500 tok/s. It was a throughput collapse, not corrupted output, and it was chased through five wrong hypotheses before the timings were read.
+
+If decode is slow rather than the output being wrong:
+
+- **Check the slot count.** A second slot is a 2.5x aggregate throughput loss on this hardware (21.9 → 8.8 tok/s) at twice the memory, because 49 of 65 layers are recurrent and each sequence carries its own state. Return to `mise run lemonade:slots:1`.
+- **Check free memory.** `free -m` during load. The two-slot config reached 83.8 GB used with 2.9 GB free; one slot sits at 42.3 GB.
+- **It is not MTP.** `--spec-type none` measured the same 4.5 tok/s at two slots. MTP does cost ~20 GB of draft context at two slots, but it is not the throughput problem.
+
 ### The server looks hung — connections time out and nothing responds
 
 Check whether it is *busy* rather than hung. Lemonade runs `max_loaded_models: 1`, so a single long generation serializes everything behind it, and on `ds4` at ~12 tok/s a genuinely long answer (a page of code, say) takes **tens of minutes**. Meanwhile every other client — including `lemonade load` — sits in the queue and eventually times out.

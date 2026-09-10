@@ -364,6 +364,48 @@
     - lemonade
 
 # ------------------------------------------------------------------
+# 8b. Apply per-model recipe options
+# ------------------------------------------------------------------
+# Without this the deployed pool is whatever Lemonade's catalog says, which is
+# llama.cpp's 8192 MiB default — and that retains NOTHING on this hardware
+# (measured: 0 of 4 possible prefix hits, every request paying a full 24.8s
+# prefill). The 24576 MiB default and the 11.7x it buys would otherwise only
+# take effect if an operator happened to run `mise run lemonade:slots:1` as a
+# second, undocumented step.
+#
+# Options are PERSISTED, not loaded. They take effect the next time the model
+# loads, which a routine converge already causes whenever the config changed —
+# so this never evicts a running model as a side effect of a deploy. Use the
+# lemonade_slots.yml playbook when an immediate reload is wanted.
+- name: "Compute the slot and cache configuration"
+  ansible.builtin.include_tasks: slot_args.yml
+  when: lemonade_enabled | bool
+  tags:
+    - lemonade
+    - lemonade_slots
+
+- name: "Persist per-model recipe options"
+  ansible.builtin.uri:
+    url: >-
+      http://127.0.0.1:{{ lemonade_port }}/api/v1/models/{{ lemonade_slot_target_model }}/options
+    method: POST
+    headers: "{{ lemonade_slot_auth_headers }}"
+    body_format: json
+    body: "{{ {'ctx_size': lemonade_slot_ctx_size | int,
+               'llamacpp_args': lemonade_slot_llamacpp_args | trim,
+               'merge_args': true} }}"
+    status_code: [200, 201]
+  become: false
+  register: lemonade_service_opts
+  changed_when: lemonade_service_opts.status in [200, 201]
+  when:
+    - lemonade_enabled | bool
+    - lemonade_slot_target_model in (lemonade_models | default([]))
+  tags:
+    - lemonade
+    - lemonade_slots
+
+# ------------------------------------------------------------------
 # 9. Firewall
 # ------------------------------------------------------------------
 - name: Open Lemonade port in firewall
