@@ -848,7 +848,18 @@ task 24 | eval time = 11406.34 ms /  6 tokens →  0.44 tok/s
 task 37 | eval time =  6050.99 ms /  2 tokens →  0.17 tok/s
 ```
 
-Decode at 0.17-0.56 tok/s against ~20 normal. The short responses are a **symptom of decode collapse under load**, not an independent bug — which is why they were intermittent, why 38 consecutive `curl` requests failed to reproduce them once the box was lightly loaded, and why they tracked memory pressure rather than any property of the prompts.
+Decode at 0.17-0.56 tok/s against ~20 normal.
+
+**Both failures are real, and this took two wrong turns to establish.** The first write-up called the short responses a correctness bug without reading the decode timings. The correction then over-shot and called them merely a symptom — partly because the workload of the time asked the model to "summarise in five words", so a short answer was indistinguishable from compliance and could not evidence anything.
+
+Re-run with a task that demands a detailed analysis, where a healthy run consumes the full `max_tokens`:
+
+| | tokens returned per request (max_tokens 200) | truncated |
+|---|---|---:|
+| 1 slot, load 2 | `200 200 200 200 200 200` | **0 / 6** |
+| 2 slots, load 2 | `2 3 10 2 2 200` | **5 / 6** |
+
+A model asked for a thorough analysis and returning two tokens is not obeying the instruction. So at two slots this deployment both **collapses in decode** and **terminates generation early**, and the two are separate observations. Whether the truncation is caused by the slow decode or is independent of it is **not established** — do not present either as the cause of the other.
 
 Hypotheses eliminated along the way, each by measurement: MTP, the benchmark client, concurrent cold prefill, slot recycling under sustained load, and prompt-cache restores during concurrency. All were plausible; all were wrong. The lesson is that a throughput number and a correctness number look identical when the server produces almost nothing — always read `eval time` from the server before concluding anything about output.
 

@@ -207,8 +207,9 @@ mise run lemonade:slots:3         # 3 slots x 262144 (786432 total)
 # Prefill is unaffected; only decode collapses, and not because of MTP
 # (--spec-type none measures the same). 49 of 65 layers are recurrent, so each
 # sequence carries its own state and batching cannot amortise a weight read
-# across sequences. Under load this degrades further and responses come back
-# truncated. Stay on slots:1. See PERFORMANCE.md for the full measurement.
+# across sequences. It ALSO terminates generation early: on a task demanding a
+# detailed answer, 1 slot returned the full 200 tokens on 6 of 6 requests while
+# 2 slots returned 2-10 tokens on 5 of 6. Stay on slots:1. See PERFORMANCE.md.
 #
 # The tuning that actually paid off was the prompt-cache pool, not the slot
 # count: lemonade_cache_ram_mib 8192 -> 24576 turns a repeated ~9.5K-token
