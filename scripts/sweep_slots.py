@@ -669,11 +669,29 @@ def main() -> int:
     if original and not args.keep_last:
         print(f"\nRestoring pre-sweep configuration: {original}")
         try:
-            body = {"model_name": args.model, "merge_args": True, "save_options": True}
+            body = {"model_name": args.model, "save_options": True,
+                    "merge_args": bool(original.get("merge_args", True))}
             if original.get("ctx_size"):
                 body["ctx_size"] = int(original["ctx_size"])
+            # llamacpp_args MUST be restored too. Restoring ctx_size alone drops
+            # --cache-ram and --ctx-checkpoints back to the catalog defaults —
+            # i.e. it silently undoes the pool sizing this repo exists to apply.
+            if original.get("llamacpp_args"):
+                body["llamacpp_args"] = original["llamacpp_args"]
             _api(args.host, args.port, "/load", body)
-            print("  restored.")
+            # Never trust the restore either: read back what actually launched.
+            hz = _api(args.host, args.port, "/health")
+            argv_back = ""
+            for mm in hz.get("all_models_loaded", []):
+                if mm.get("model_name") == args.model:
+                    argv_back = " ".join(mm.get("launch_command", []))
+            missing = [f for f in ("--cache-ram", "--ctx-checkpoints", "--parallel")
+                       if f in (original.get("llamacpp_args") or "") and f not in argv_back]
+            if missing:
+                print(f"  WARNING: restore did not reinstate {missing}. "
+                      f"Re-apply with `mise run lemonade:slots:1`.")
+            else:
+                print("  restored and verified against the launched argv.")
         except (urllib.error.URLError, TimeoutError) as e:
             print(f"  WARNING: restore FAILED ({e}). The box is still on the last "
                   f"tested configuration — re-apply with `mise run lemonade:slots:1`.")
