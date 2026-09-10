@@ -128,6 +128,12 @@ def _largest_affordable_pool(
     return max(affordable) if affordable else min(cache_ram_values)
 
 
+def filter_phase(matrix: list[SweepConfig], phase: str) -> list[SweepConfig]:
+    """Keep only the requested phase. Phases are approved and run separately,
+    so a Phase A run must not quietly reload the box three more times."""
+    return [c for c in matrix if c.phase in phase.upper()]
+
+
 def verify_argv(argv: str, parallel: int, ctx_size: int) -> tuple[bool, str]:
     """Check the argv llama-server was actually launched with.
 
@@ -395,6 +401,9 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=64)
     ap.add_argument("--baseline-only", action="store_true",
                     help="Benchmark the CURRENTLY LOADED config and exit. No reload, no eviction.")
+    ap.add_argument("--phase", default="AB", choices=["A", "B", "AB"],
+                    help="Which phase(s) to run. A = cache-ram at 1 slot, "
+                         "B = slot count. Default runs both.")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the matrix and the memory estimates; touch nothing")
     ap.add_argument("--out", default="benchmark_results")
@@ -406,6 +415,8 @@ def main() -> int:
         args.best_cache_ram,
         args.ctx_checkpoints,
     )
+
+    matrix = filter_phase(matrix, args.phase)
 
     print(f"{'phase':<6}{'slots':>6}{'ctx':>10}{'window':>9}{'cache':>8}{'est GTT':>10}{'+pool':>9}")
     print("-" * 60)

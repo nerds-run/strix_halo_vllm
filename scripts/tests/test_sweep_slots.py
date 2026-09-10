@@ -301,3 +301,21 @@ class TestWorkingSetExceedsPool(unittest.TestCase):
         self.assertFalse(ss.pool_will_thrash(distinct_prefixes=4, cache_ram_mib=8192))
         self.assertTrue(ss.pool_will_thrash(distinct_prefixes=8, cache_ram_mib=8192))
         self.assertFalse(ss.pool_will_thrash(distinct_prefixes=8, cache_ram_mib=49152))
+
+
+class TestPhaseFilter(unittest.TestCase):
+    """Phases are approved separately, so they have to be runnable separately
+    without the other phase's configs sneaking in."""
+
+    def test_filter_a_keeps_only_phase_a(self):
+        m = ss.build_matrix([8192, 24576], [1, 2])
+        self.assertTrue(all(c.phase == "A" for c in ss.filter_phase(m, "A")))
+        self.assertEqual(len(ss.filter_phase(m, "A")), 2)
+
+    def test_filter_b_keeps_only_phase_b(self):
+        m = ss.build_matrix([8192, 24576], [1, 2])
+        self.assertTrue(all(c.phase == "B" for c in ss.filter_phase(m, "B")))
+
+    def test_ab_keeps_everything(self):
+        m = ss.build_matrix([8192, 24576], [1, 2])
+        self.assertEqual(len(ss.filter_phase(m, "AB")), len(m))
