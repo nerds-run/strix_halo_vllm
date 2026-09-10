@@ -418,3 +418,79 @@ class TestTokenCounting(unittest.TestCase):
     def test_zero_usage_is_not_mistaken_for_missing(self):
         chunks = [{"usage": {"completion_tokens": 0}}]
         self.assertEqual(ss.count_tokens(chunks, events=3), 0)
+
+
+class TestWorkloadForcesLongOutput(unittest.TestCase):
+    """Codex P1: the workload asked for "{i+3} words", i.e. 3-14 words. A model
+    answering in 2-13 tokens was COMPLYING, not truncating — so completion
+    length could never distinguish premature termination from instruction
+    following. The task must be one that consumes max_tokens when healthy.
+    """
+
+    def test_prompt_demands_a_long_answer(self):
+        p = ss.build_prefix_reuse_workload(1000, 1)[0]
+        tail = p[-400:].lower()
+        self.assertNotIn("five words", tail)
+        self.assertFalse(any(f"in {n} words" in tail for n in range(3, 20)),
+                         f"prompt still caps the answer length: {tail[-150:]}")
+        self.assertTrue(any(w in tail for w in ("detailed", "at length", "thorough")),
+                        f"prompt does not demand a long answer: {tail[-150:]}")
+
+    def test_truncation_is_judged_against_max_tokens(self):
+        self.assertTrue(ss.looks_truncated(tokens=3, max_tokens=200))
+        self.assertFalse(ss.looks_truncated(tokens=200, max_tokens=200))
+        self.assertFalse(ss.looks_truncated(tokens=196, max_tokens=200))
+
+    def test_finish_reason_length_is_never_truncation(self):
+        self.assertFalse(ss.looks_truncated(tokens=5, max_tokens=200,
+                                            finish_reason="length"))
+
+
+class TestVerifyArgvCoversEverySweptArg(unittest.TestCase):
+    """Codex P1: verify_argv only checked parallel and ctx-size, so a merge that
+    kept the catalog's --cache-ram 8192 or dropped --ctx-checkpoints still
+    reported ok — which would invalidate the entire Phase A cache comparison
+    while its own guard said success."""
+
+    BASE = ("llama-server -m m.gguf --ctx-size 262144 --port 8001 "
+            "--parallel 1 --ctx-checkpoints 8 --cache-ram 24576")
+
+    def test_accepts_a_fully_matching_argv(self):
+        cfg = ss.SweepConfig("A", 1, 262144, 24576, 8)
+        ok, why = ss.verify_argv(self.BASE, cfg=cfg)
+        self.assertTrue(ok, why)
+
+    def test_rejects_a_merge_that_kept_the_catalog_pool(self):
+        argv = self.BASE.replace("--cache-ram 24576", "--cache-ram 8192")
+        cfg = ss.SweepConfig("A", 1, 262144, 24576, 8)
+        ok, why = ss.verify_argv(argv, cfg=cfg)
+        self.assertFalse(ok)
+        self.assertIn("cache-ram", why)
+
+    def test_rejects_a_dropped_checkpoint_flag(self):
+        argv = self.BASE.replace(" --ctx-checkpoints 8", "")
+        cfg = ss.SweepConfig("A", 1, 262144, 24576, 8)
+        ok, why = ss.verify_argv(argv, cfg=cfg)
+        self.assertFalse(ok)
+        self.assertIn("ctx-checkpoints", why)
+
+    def test_rejects_an_ignored_diagnostic_flag(self):
+        cfg = ss.SweepConfig("B", 1, 262144, 24576, 8, extra_args="--spec-type none")
+        ok, why = ss.verify_argv(self.BASE, cfg=cfg)
+        self.assertFalse(ok)
+        self.assertIn("spec-type", why)
+
+
+class TestPhaseBUsesTheMeasuredWinner(unittest.TestCase):
+    """Codex P1: with default lists the 3-slot budget admits only 8192, so Phase
+    B silently benchmarked every slot count under the thrashing pool rather than
+    'at the Phase A winner'."""
+
+    def test_refuses_to_guess_a_pool_for_phase_b(self):
+        with self.assertRaises(ValueError):
+            ss.build_matrix([8192, 24576, 49152], [1, 2, 3], require_winner=True)
+
+    def test_accepts_an_explicit_winner(self):
+        m = ss.build_matrix([8192], [1, 2], best_cache_ram_mib=24576,
+                            require_winner=True)
+        self.assertTrue(all(c.cache_ram_mib == 24576 for c in m if c.phase == "B"))

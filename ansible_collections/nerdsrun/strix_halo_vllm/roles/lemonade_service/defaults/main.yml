@@ -15,8 +15,12 @@ lemonade_container_name: lemonade-server
 # `vX.Y.Z` tags both move; a silent image move already cost this fleet 33% of
 # a profile's decode once. This digest is the linux/amd64 manifest of v11.9.0.
 #
-# 11.9.0 brings three things that matter here: llama.cpp b10723 (adds Qwen3-Next
-# support, and our Qwen3.8-27B is arch `qwen35` — the Qwen3-Next family), the
+# 11.9.0 brings three things that matter here: a llama.cpp bump — the release
+# notes say b10723, but the build this digest actually ships and that every
+# measurement here was taken on is b10707, so do not expect anything the notes
+# attribute to b10723 without checking. (Neither adds Qwen3-Next
+# support for THIS model: `qwen35` and `qwen3next` are separate architectures in
+# the binary, so that headline does not apply to these weights at all.) The
 # fixed 120s prefill timeout becoming a 600s configurable `global_timeout`
 # (26K-token prompts already take ~86s before any slot contention), and the
 # `llamacpp-hrx` backend.
@@ -246,6 +250,14 @@ lemonade_cache_ram_mib: 24576
 # triggers the documented throughput cliff (deepseek-v4 measured 120 of 125 GB
 # resident, buff/cache collapsed to ~1 GB, decode 3.88 tok/s against ~20-27).
 lemonade_gtt_budget_gib: 85
+
+# Runtime GTT the estimate does not model — chiefly the compute buffer, which is
+# driven by ubatch rather than by slots or context. Measured as the gap between
+# prediction and hardware: +2.33 GiB at 1 slot and +1.89 GiB at 2, i.e. roughly
+# constant, which is the shape a per-ubatch term should have. Reserved so a
+# configuration cannot pass the guard at 84.7 GiB and then exceed the ceiling
+# the guard exists to protect.
+lemonade_slot_runtime_overhead_gib: 2.5
 
 # Memory geometry of the model the slot profile applies to. Parsed from the
 # GGUF header on hardware (arch qwen35, block_count 65, head_count_kv 4,

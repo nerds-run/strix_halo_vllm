@@ -103,6 +103,7 @@ def build_matrix(
     best_cache_ram_mib: int | None = None,
     ctx_checkpoints: int = 8,
     extra_args: str = "",
+    require_winner: bool = False,
 ) -> list[SweepConfig]:
     """Phase A sweeps the cache pool at 1 slot; Phase B sweeps slots at the
     Phase A winner. Exactly one variable moves between consecutive runs."""
@@ -110,6 +111,15 @@ def build_matrix(
         SweepConfig("A", 1, CTX_PER_SLOT, c, ctx_checkpoints, extra_args)
         for c in cache_ram_values
     ]
+    if best_cache_ram_mib is None and require_winner:
+        # Substituting "the largest pool that fits" is not "the Phase A winner".
+        # With the default lists the 3-slot budget admits only 8192, so Phase B
+        # would benchmark every slot count under the thrashing pool while
+        # claiming to test at the winner.
+        raise ValueError(
+            "Phase B needs the pool Phase A actually won with. Pass "
+            "--best-cache-ram <MiB>, or run --phase A first and feed its result in."
+        )
     pinned = (
         best_cache_ram_mib
         if best_cache_ram_mib is not None
@@ -157,12 +167,27 @@ def filter_phase(matrix: list[SweepConfig], phase: str) -> list[SweepConfig]:
     return [c for c in matrix if c.phase in phase.upper()]
 
 
-def verify_argv(argv: str, parallel: int, ctx_size: int) -> tuple[bool, str]:
+def verify_argv(argv: str, parallel: int | None = None, ctx_size: int | None = None,
+                cfg: "SweepConfig | None" = None) -> tuple[bool, str]:
     """Check the argv llama-server was actually launched with.
 
-    Order matters: a duplicated flag is reported as such rather than as a value
-    mismatch, because the two have different causes and different fixes.
+    Checks EVERY argument the sweep varies, not just the slot count: a merge
+    that quietly kept the catalog's --cache-ram, dropped --ctx-checkpoints, or
+    ignored a diagnostic flag would otherwise record results under a
+    configuration that never launched — invalidating a whole phase while this
+    guard reported success.
+
+    Values are matched on a word boundary, so `--parallel 1` is not satisfied
+    by `--parallel 16`.
     """
+    if cfg is not None:
+        parallel = cfg.parallel
+        ctx_size = cfg.ctx_size
+    expect: list[tuple[str, object]] = [("parallel", parallel), ("ctx-size", ctx_size)]
+    if cfg is not None:
+        expect += [("cache-ram", cfg.cache_ram_mib),
+                   ("ctx-checkpoints", cfg.ctx_checkpoints)]
+
     occurrences = len(re.findall(r"--parallel\b", argv))
     if occurrences == 0:
         return False, "--parallel absent from the launched argv"
@@ -171,15 +196,28 @@ def verify_argv(argv: str, parallel: int, ctx_size: int) -> tuple[bool, str]:
             f"--parallel appears {occurrences} times; it must appear exactly once "
             "or llama.cpp silently takes the last occurrence"
         )
-    if not re.search(rf"--parallel\s+{parallel}\b", argv):
-        got = re.search(r"--parallel\s+(\d+)", argv)
-        return False, f"--parallel is {got.group(1) if got else '?'}, expected {parallel}"
-    if not re.search(rf"--ctx-size\s+{ctx_size}\b", argv):
-        got = re.search(r"--ctx-size\s+(\d+)", argv)
-        return False, (
-            f"--ctx-size is {got.group(1) if got else '?'}, expected {ctx_size} "
-            "(Lemonade may have clamped it to the model's max_context_window)"
-        )
+
+    for flag, want in expect:
+        if want is None:
+            continue
+        if not re.search(rf"--{re.escape(flag)}\s+{want}(\s|$)", argv):
+            got = re.search(rf"--{re.escape(flag)}\s+(\S+)", argv)
+            return False, (
+                f"--{flag} is {got.group(1) if got else 'ABSENT'}, expected {want}"
+                + (" (Lemonade may have clamped it)" if flag == "ctx-size" else "")
+            )
+
+    # Diagnostic flags are appended verbatim; each must survive the merge.
+    if cfg is not None and cfg.extra_args:
+        toks = cfg.extra_args.split()
+        for i, t in enumerate(toks):
+            if not t.startswith("--"):
+                continue
+            val = toks[i + 1] if i + 1 < len(toks) and not toks[i + 1].startswith("--") else None
+            pat = rf"{re.escape(t)}\s+{re.escape(val)}(\s|$)" if val else rf"{re.escape(t)}\b"
+            if not re.search(pat, argv):
+                return False, f"{t} from --extra-args did not survive the merge"
+
     return True, "argv matches the requested configuration"
 
 
@@ -241,7 +279,8 @@ def build_prefix_reuse_workload(
     ]
     return [
         f"{prefixes[i % distinct_prefixes]}"
-        f"\n\nQuestion {i}: summarise the document above in {i + 3} words."
+        f"\n\nQuestion {i}: Write a detailed, thorough analysis of the tradeoffs "
+        f"described above. Cover memory, bandwidth and latency at length."
         for i in range(n_requests)
     ]
 
@@ -296,6 +335,20 @@ def summarize_cache_benefit(ttfts: list[float], distinct_prefixes: int = 1) -> d
         "first_s": round(ttfts[0], 2),
         "rest_mean_s": round(wm, 2),
     }
+
+
+def looks_truncated(tokens: int, max_tokens: int, finish_reason: str | None = None) -> bool:
+    """Whether a completion stopped early, judged against what was ASKED FOR.
+
+    Counting short answers as truncation only works if the task cannot be
+    answered briefly. An earlier version of this workload asked for "five
+    words" and then treated a five-word answer as evidence of premature
+    termination — the model was complying. `finish_reason: length` means the
+    cap was reached and is never truncation.
+    """
+    if finish_reason == "length":
+        return False
+    return tokens < max_tokens * 0.8
 
 
 def count_tokens(chunks: list[dict], events: int) -> int:
@@ -367,7 +420,7 @@ def apply_config(host: str, port: int, model: str, cfg: SweepConfig) -> tuple[bo
         if m.get("model_name") == model:
             argv = " ".join(m.get("launch_command", []))
             break
-    ok, why = verify_argv(argv, cfg.parallel, cfg.ctx_size)
+    ok, why = verify_argv(argv, cfg=cfg)
     return ok, why, argv
 
 
@@ -491,6 +544,7 @@ def main() -> int:
         args.best_cache_ram,
         args.ctx_checkpoints,
         args.extra_args,
+        require_winner=("B" in args.phase.upper() and not args.dry_run),
     )
 
     matrix = filter_phase(matrix, args.phase)
@@ -528,12 +582,26 @@ def main() -> int:
         # so nothing is evicted — this is the "before" number.
         health = _api(args.host, args.port, "/health")
         argv = ""
+        ready = False
         for m in health.get("all_models_loaded", []):
             if m.get("model_name") == args.model:
                 argv = " ".join(m.get("launch_command", []))
-        print(f"Benchmarking the loaded config (no reload).\n  argv: {argv}\n")
+                ready = m.get("backend_health") == "ready"
+        if not ready:
+            # Without this the chat request below makes Lemonade's router load
+            # the model — evicting whatever was loaded and breaking the promise
+            # that this path measures the running configuration untouched.
+            loaded = [m.get("model_name") for m in health.get("all_models_loaded", [])]
+            print(f"REFUSING: --baseline-only measures the CURRENTLY LOADED model, "
+                  f"but {args.model!r} is not loaded and ready (loaded: {loaded or 'none'}).\n"
+                  f"Load it first, then re-run — proceeding would trigger a load "
+                  f"and evict whatever is running.")
+            return 2
+        conc = args.concurrency if args.concurrency is not None else 1
+        print(f"Benchmarking the loaded config (no reload), offered load {conc}.\n"
+              f"  argv: {argv}\n")
         bench = run_workload(args.host, args.port, args.model, prompts,
-                             args.max_tokens, concurrency=1,
+                             args.max_tokens, concurrency=conc,
                              distinct_prefixes=args.distinct_prefixes)
         print(f"  TTFT first    : {bench['ttft_first_s']}s")
         print(f"  TTFT mean     : {bench['ttft_mean_s']}s")
@@ -545,7 +613,12 @@ def main() -> int:
         path.write_text(json.dumps(
             {"generated": stamp, "model": args.model, "argv": argv,
              "gtt_used_mib": gtt_used_mib(args.host, args.ssh_key, args.ssh_user),
-             "prefix_tokens": args.prefix_tokens, "requests": args.requests,
+             "workload": {"prefix_tokens": args.prefix_tokens,
+                          "distinct_prefixes": args.distinct_prefixes,
+                          "requests": args.requests,
+                          "max_tokens": args.max_tokens,
+                          "concurrency": args.concurrency,
+                          "extra_args": args.extra_args},
              "bench": bench}, indent=2))
         print(f"\nWrote {path}")
         return 0
@@ -611,7 +684,14 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = out / f"slot_sweep_{stamp}.json"
-    path.write_text(json.dumps({"generated": stamp, "model": args.model, "runs": results}, indent=2))
+    path.write_text(json.dumps({"generated": stamp, "model": args.model,
+                                "workload": {"prefix_tokens": args.prefix_tokens,
+                          "distinct_prefixes": args.distinct_prefixes,
+                          "requests": args.requests,
+                          "max_tokens": args.max_tokens,
+                          "concurrency": args.concurrency,
+                          "extra_args": args.extra_args},
+                                "runs": results}, indent=2))
     print(f"\nWrote {path}")
     return 0
 

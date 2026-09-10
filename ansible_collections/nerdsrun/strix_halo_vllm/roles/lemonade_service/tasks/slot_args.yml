@@ -64,7 +64,8 @@
     lemonade_slot_est_total_gib: >-
       {{ ((lemonade_slot_model_gib | float) + (lemonade_slot_kv_gib | float)
           + (lemonade_slot_ckpt_gib | float)
-          + ((lemonade_slot_cache_ram | int) / 1024)) | round(2) }}
+          + ((lemonade_slot_cache_ram | int) / 1024)
+          + (lemonade_slot_runtime_overhead_gib | float)) | round(2) }}
   tags:
     - lemonade
     - lemonade_slots
@@ -80,7 +81,8 @@
       {{ lemonade_slot_est_total_gib }} GiB
       (weights {{ lemonade_slot_model_gib }} + KV {{ lemonade_slot_kv_gib }}
       + checkpoints {{ lemonade_slot_ckpt_gib }}
-      + cache pool {{ (lemonade_slot_cache_ram | int / 1024) | round(2) }}),
+      + cache pool {{ (lemonade_slot_cache_ram | int / 1024) | round(2) }}
+      + measured runtime overhead {{ lemonade_slot_runtime_overhead_gib }}),
       over the {{ lemonade_gtt_budget_gib }} GiB budget. Past this point GTT
       pinning evicts buff/cache and throughput falls off a cliff. Lower
       lemonade_cache_ram_mib (or the profile's own cache_ram_mib) or lemonade_ctx_checkpoints, use a smaller slot
