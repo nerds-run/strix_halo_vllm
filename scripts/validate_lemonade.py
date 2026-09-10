@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Validate the shipped configuration against every number the docs claim."""
+"""Validate the shipped Lemonade configuration against the numbers in the docs.
+
+Every claim in the Lemonade section of docs/PERFORMANCE.md is checked against
+the live box: the flags actually launched, the memory footprint, the prompt
+cache speedup, the append-keeps / prepend-busts prefix behaviour, and decode
+read from llama-server's own eval-time lines rather than from this client.
+
+Run after any config change, and after any Lemonade or llama.cpp upgrade:
+
+    mise run lemonade:validate
+
+Read-only: it sends a handful of requests and never reloads the model.
+If a check fails, the docs are wrong rather than the box.
+"""
 import json, subprocess, time, urllib.request, random, string
 H, P, M = "192.168.68.60", 13305, "Qwen3.8-27B-GGUF"
 KEY = "/home/abanna/Development/nerdsrun/amdllmv/.ssh/framework_fedora"
