@@ -794,6 +794,27 @@ srv alloc: - making room for prompt cache entry, removing oldest entry (size = 1
 
 Decode is unaffected across the sweep (21.04 / 21.41 / 21.55 tok/s), as expected — the pool is a prefill lever only.
 
+**Sizing the pool against real traffic, not the benchmark.** The synthetic workload above deliberately overflows the pool; the question for a deployed box is what its own traffic needs. Four days of production traffic on this host, before any of this tuning:
+
+```
+83 requests
+62 evictions                 <- 75% of requests evicted an entry at the 8192 default
+entry sizes 1315-1460 MiB
+prompt sizes  9311 9462 9463 9466 9472 9473 9504 9566 9584 9597 9630 9769 9846
+              (plus occasional ~26K, which produce ~2.5 GiB entries)
+```
+
+Two things follow. The prompts are near-identical but never identical — a conversation growing, or one document with varying questions — so they share a long prefix and are precisely what prefix caching exists for; a 75% eviction rate at the default confirms the pool was the binding constraint. But the working set is *small*: at ~1.4 GiB per entry, 24576 MiB holds roughly 17 live contexts, against traffic that is one dominant ~9.5K workload plus occasional long ones. **Raising the pool further buys capacity this box would not use**, which is the same conclusion the 49152 sweep reached from the other direction.
+
+This is also the measurement that settles whether to trade context for cache. A 262144 window costs 16 GiB of KV while the largest prompt observed here was ~26K, so halving the window would free 8 GiB — but with 17 entries already sufficient there is nothing to spend it on. Re-run this count before assuming otherwise on a different workload:
+
+```bash
+journalctl --user -u "lemonade*" --no-pager -o cat --since "-7d" \
+  | grep -ac "making room for prompt cache entry"
+```
+
+A number near zero means the pool fits the working set. A number approaching the request count means it does not.
+
 **Beware the lifetime counters.** `GET /api/v1/stats` reported `cache_tokens_total / prompt_tokens_total` at 94.3% while the live workload was hitting 0.5%, because long multi-turn sessions reuse within themselves and dominate the cumulative figure. Diagnose with the per-request gauge or the TTFT spread, never the total. If first-request and mean TTFT are equal, the cache is doing nothing.
 
 ### Slots: two of them return truncated output under concurrency
