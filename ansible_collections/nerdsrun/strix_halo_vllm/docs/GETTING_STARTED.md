@@ -206,8 +206,10 @@ mise run lemonade:slots:3         # 3 slots x 262144 (786432 total)
 #     2 slots   4.4 tok/s per request,  ~8.8 aggregate, 83.8 GB used
 # Prefill is unaffected; only decode collapses, and not because of MTP
 # (--spec-type none measures the same). 49 of 65 layers are recurrent, so each
-# sequence carries its own state and batching cannot amortise a weight read
-# across sequences. It ALSO terminates generation early: on a task demanding a
+# sequence carries its own state -- BUT that is not the cause: two SEPARATE
+# llama-server processes reach the full 22.3 tok/s aggregate on the same GPU,
+# so the defect is llama.cpp's in-process multi-sequence scheduler rather than
+# the hardware or the model. It ALSO terminates generation early: on a task demanding a
 # detailed answer, 1 slot returned the full 200 tokens on 6 of 6 requests while
 # 2 slots returned 2-10 tokens on 5 of 6. Stay on slots:1. See PERFORMANCE.md.
 #
