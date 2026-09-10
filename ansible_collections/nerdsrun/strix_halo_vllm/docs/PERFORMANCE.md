@@ -816,7 +816,15 @@ The two-slot decode figure must not be quoted as throughput: the generations wer
 
 **There is no error.** `llama-server` logs `slot release ... truncated = 0` for every request on both slots. It believes it completed normally, which makes this exactly the kind of failure that a throughput benchmark alone would have reported as a performance regression.
 
-Prime suspect is `--spec-type draft-mtp` with more than one active sequence — MTP has only ever been validated on this architecture at `-np 1`, and [#27306](https://github.com/ggml-org/llama.cpp/issues/27306) is open against a related MTP path on the same silicon.
+**Speculative decoding is not the cause.** The obvious suspect was `--spec-type draft-mtp` with more than one active sequence, since MTP has only ever been validated on this architecture at `-np 1`. Re-running the identical workload with `--spec-type none` (verified present in the launched argv) truncates just the same:
+
+```
+tokens returned, 2 slots + load 2 + MTP OFF:  1 1 2 3 1 1 1 2 1 1 1 48
+```
+
+**The benchmark client is not the cause either.** The 1-slot control ran at the same offered load of 2, through the same threads and the same streaming parser, and returned 48/48 on every request. The only variable between a working run and a broken one is `--parallel`.
+
+So the defect is multi-slot concurrent generation itself on llama.cpp b10707 / ROCm / `qwen35`, independent of speculative decoding. [#27306](https://github.com/ggml-org/llama.cpp/issues/27306) is open against a related path on the same silicon but does not describe this. Worth an upstream report; until then `parallel_slots` above 1 should be treated as unusable here, which is why `single` is the default.
 
 ### Sizing slots: what a slot actually costs
 
